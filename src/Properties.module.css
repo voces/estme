@@ -1,0 +1,204 @@
+.properties {
+  padding: 4px;
+  font-size: 12px;
+  overflow: hidden;
+}
+
+.empty {
+  color: #666;
+  text-align: center;
+  padding: 16px 8px;
+}
+
+.section {
+  margin-bottom: 12px;
+}
+
+.sectionTitle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  color: #aaa;
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #333;
+}
+
+.sectionTitle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.row label {
+  min-width: 16px;
+  color: #888;
+}
+
+.row input[type="number"] {
+  flex: 1;
+  min-width: 0;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 3px;
+  color: #fff;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-family: monospace;
+  -moz-appearance: textfield;
+}
+
+.row input[type="number"]::-webkit-outer-spin-button,
+.row input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.row input[type="number"]:focus {
+  outline: none;
+  border-color: #4488ff;
+}
+
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.checkboxRow input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.checkboxRow label {
+  color: #ccc;
+  cursor: pointer;
+}
+
+.value {
+  color: #888;
+  font-family: monospace;
+  font-size: 11px;
+}
+
+.hint {
+  color: #666;
+  font-size: 10px;
+  font-style: italic;
+  margin-bottom: 4px;
+}
+
+.colorRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.colorRow label {
+  min-width: 40px;
+  color: #888;
+}
+
+.colorInput {
+  width: 32px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid #444;
+  border-radius: 3px;
+  background: #2a2a2a;
+  cursor: pointer;
+}
+
+.colorInput::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+.colorInput::-webkit-color-swatch {
+  border: none;
+  border-radius: 2px;
+}
+
+.colorValue {
+  flex: 1;
+  font-family: monospace;
+  font-size: 11px;
+  color: #888;
+}
+
+.clearButton {
+  background: #3a3a3a;
+  border: 1px solid #444;
+  border-radius: 3px;
+  color: #888;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.clearButton:hover {
+  background: #4a4a4a;
+  color: #ccc;
+}
+
+.snapRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  padding: 4px 6px;
+  background: #2a2a2a;
+  border-radius: 3px;
+}
+
+.snapInfo {
+  font-size: 11px;
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unsnapButton {
+  background: #4a3030;
+  border: 1px solid #664444;
+  border-radius: 3px;
+  color: #cc8888;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.unsnapButton:hover {
+  background: #5a4040;
+  color: #ffaaaa;
+}
+
+.unsnapAllButton {
+  width: 100%;
+  background: #4a3030;
+  border: 1px solid #664444;
+  border-radius: 3px;
+  color: #cc8888;
+  font-size: 10px;
+  padding: 4px 8px;
+  margin-top: 4px;
+  cursor: pointer;
+}
+
+.unsnapAllButton:hover {
+  background: #5a4040;
+  color: #ffaaaa;
+}

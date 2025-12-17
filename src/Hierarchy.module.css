@@ -1,0 +1,156 @@
+.hierarchy {
+  font-size: 12px;
+  overflow: hidden;
+}
+
+.title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  color: #aaa;
+  padding: 4px;
+  border-bottom: 1px solid #333;
+}
+
+.titleButtons {
+  display: flex;
+  gap: 4px;
+}
+
+.groupButton {
+  background: #3a3a3a;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: #ccc;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.groupButton:hover:not(:disabled) {
+  background: #4a4a4a;
+  color: #fff;
+}
+
+.groupButton:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+}
+
+.empty {
+  color: #666;
+  text-align: center;
+  padding: 16px 8px;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  cursor: pointer;
+  border-bottom: 1px solid #2a2a2a;
+  user-select: none;
+}
+
+.item:hover {
+  background: #2a2a2a;
+}
+
+.item.selected {
+  background: #3a4a5a;
+}
+
+.item.partialSelected {
+  background: #2a3a4a;
+}
+
+.toggle {
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: #888;
+}
+
+.toggle:hover {
+  color: #ccc;
+}
+
+.toggle.hidden {
+  color: #555;
+}
+
+.toggle.locked {
+  color: #f80;
+}
+
+.colorSwatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 2px;
+  border: 1px solid #555;
+  flex-shrink: 0;
+}
+
+.name {
+  color: #ccc;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nameInput {
+  flex: 1;
+  min-width: 0;
+  background: #1a1a1a;
+  border: 1px solid #555;
+  border-radius: 2px;
+  color: #fff;
+  font-size: inherit;
+  padding: 1px 4px;
+  outline: none;
+}
+
+.nameInput:focus {
+  border-color: #4488ff;
+}
+
+.collapseToggle {
+  background: none;
+  border: none;
+  padding: 0;
+  width: 14px;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1;
+  color: #888;
+  flex-shrink: 0;
+}
+
+.collapseToggle:hover {
+  color: #ccc;
+}
+
+.collapseToggleSpacer {
+  width: 14px;
+  flex-shrink: 0;
+}
+
+.groupItem {
+  background: #252525;
+}
+
+.groupIcon {
+  font-size: 12px;
+  flex-shrink: 0;
+}

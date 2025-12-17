@@ -1,0 +1,54 @@
+.app {
+  display: grid;
+  grid-template-columns: 40px 1fr 200px; /* Overridden by inline style */
+  grid-template-rows: auto 1fr auto;
+  width: 100vw;
+  height: 100vh;
+}
+
+
+.left {
+  background: #202020;
+  border-right: 1px solid #333;
+}
+
+.canvas {
+  overflow: hidden;
+}
+
+.right {
+  display: flex;
+  background: #202020;
+  border-left: 1px solid #333;
+  overflow: hidden;
+}
+
+.resizeHandle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+}
+
+.resizeHandle:hover {
+  background: #4488ff;
+}
+
+.rightContent {
+  flex: 1;
+  min-width: 0;
+  padding: 0.25rem;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.footer {
+  grid-column: 1 / -1;
+  padding: 0.25rem 0.75rem;
+  background: #252525;
+  border-top: 1px solid #333;
+  font-family: monospace;
+  font-size: 12px;
+  color: #888;
+}
