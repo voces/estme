@@ -12,6 +12,8 @@ export const Header = () => {
   const canDelete = selection.pathIds.length > 0 || selection.points.length > 0;
   const canCopy = selection.pathIds.length > 0 || selection.points.some((p) => p.handleType === "anchor");
   const canPaste = clipboard !== null && clipboard.type === "paths";
+  const hasSelection = selection.pathIds.length > 0 || selection.points.length > 0;
+  const hasPaths = paths.length > 0;
 
   // Check if split is possible (2 non-adjacent anchors on same closed path)
   const canSplit = (() => {
@@ -50,6 +52,25 @@ export const Header = () => {
           title="Redo (Ctrl+Shift+Z)"
         >
           {"\u21AA"}
+        </button>
+      </div>
+      <div className={styles.separator} />
+      <div className={styles.buttonGroup}>
+        <button
+          className={`${styles.button} ${!hasPaths ? styles.disabled : ""}`}
+          onClick={() => store.selectAll()}
+          disabled={!hasPaths}
+          title="Select All (Ctrl+A)"
+        >
+          {"\u2610"}
+        </button>
+        <button
+          className={`${styles.button} ${!hasSelection ? styles.disabled : ""}`}
+          onClick={() => store.clearSelection()}
+          disabled={!hasSelection}
+          title="Deselect All (Alt+A)"
+        >
+          {"\u2612"}
         </button>
       </div>
       <div className={styles.separator} />

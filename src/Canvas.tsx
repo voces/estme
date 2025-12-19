@@ -1,7 +1,9 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import paper from "paper";
 import { HandleType, HoveredEdge, HoveredPoint, store, useStore } from "./store/index.ts";
 import { defaultAnchorMeta, lineSegment, Path, Point } from "./types.ts";
+import { createBlobPath, addBlobToPaths, subtractBlobFromPaths, getBlobPreviewOutline } from "./pathBool.ts";
 import {
   MouseButton,
   isUndo,
@@ -12,8 +14,10 @@ import {
   isEscape,
   isDelete,
   isSelectAll,
+  isDeselectAll,
   isSelectTool,
   isLineTool,
+  isBlobTool,
   isGroup,
   isUngroup,
   isTextInput,
@@ -350,6 +354,8 @@ function createPathMesh(path: Path): THREE.Mesh | null {
     const material = new THREE.MeshBasicMaterial({
       vertexColors: true,
       side: THREE.DoubleSide,
+      transparent: path.opacity < 1,
+      opacity: path.opacity,
     });
     return new THREE.Mesh(result.geometry, material);
   }
@@ -361,6 +367,8 @@ function createPathMesh(path: Path): THREE.Mesh | null {
   const material = new THREE.MeshBasicMaterial({
     color: path.fill,
     side: THREE.DoubleSide,
+    transparent: path.opacity < 1,
+    opacity: path.opacity,
   });
   return new THREE.Mesh(geometry, material);
 }
@@ -394,6 +402,7 @@ export const Canvas = () => {
       gridLines: THREE.LineSegments | null;
       hoveredEdgeLine: THREE.Line | null;
       hoveredPathOutline: THREE.Line | null;
+      blobPreviewMesh: THREE.Mesh | null;
       updateGrid: () => void;
       updatePointScales: () => void;
       zoom: number;
@@ -409,8 +418,15 @@ export const Canvas = () => {
   const selection = useStore((s) => s.selection);
   const tool = useStore((s) => s.tool);
   const fillColor = useStore((s) => s.fillColor);
+  const fillOpacity = useStore((s) => s.fillOpacity);
   const showAllPoints = useStore((s) => s.showAllPoints);
   const showAllControlPoints = useStore((s) => s.showAllControlPoints);
+  const blobRadius = useStore((s) => s.blobRadius);
+
+  // Blob preview state - updated during blob drawing
+  const [blobPreviewPoints, setBlobPreviewPoints] = useState<Point[]>([]);
+  const setBlobPreviewPointsRef = useRef(setBlobPreviewPoints);
+  setBlobPreviewPointsRef.current = setBlobPreviewPoints;
 
   // Helper to check if a point is selected
   const isPointSelected = (
@@ -488,6 +504,13 @@ export const Canvas = () => {
             );
             currentMesh.geometry = result.geometry;
             oldGeometry.dispose();
+            // Update opacity if changed
+            const mat = currentMesh.material as THREE.MeshBasicMaterial;
+            if (mat.opacity !== path.opacity) {
+              mat.opacity = path.opacity;
+              mat.transparent = path.opacity < 1;
+              mat.needsUpdate = true;
+            }
           }
         } else {
           // Update standard geometry
@@ -495,10 +518,15 @@ export const Canvas = () => {
           if (newGeometry) {
             currentMesh.geometry = newGeometry;
             oldGeometry.dispose();
-            // Update material color if changed
+            // Update material color and opacity if changed
             const mat = currentMesh.material as THREE.MeshBasicMaterial;
             if (mat.color.getHexString() !== path.fill.slice(1).toLowerCase()) {
               mat.color.set(path.fill);
+            }
+            if (mat.opacity !== path.opacity) {
+              mat.opacity = path.opacity;
+              mat.transparent = path.opacity < 1;
+              mat.needsUpdate = true;
             }
           }
         }
@@ -794,6 +822,7 @@ export const Canvas = () => {
           anchorMeta: [],
           closed: false,
           fill: fillColor,
+          opacity: fillOpacity,
           visible: true,
           locked: false,
         };
@@ -804,7 +833,7 @@ export const Canvas = () => {
         }
       }
     }
-  }, [currentPath, hoverPoint, fillColor]);
+  }, [currentPath, hoverPoint, fillColor, fillOpacity]);
 
   // Render hovered edge highlight
   useEffect(() => {
@@ -884,6 +913,67 @@ export const Canvas = () => {
     }
   }, [hoveredPathId, hoveredPoint, hoveredEdge, paths, tool]);
 
+  // Render blob preview while drawing (render outline from Paper.js boolean operations)
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+
+    // Remove old blob preview (could be a mesh or a group)
+    if (state.blobPreviewMesh) {
+      state.scene.remove(state.blobPreviewMesh);
+      // Dispose of geometry/material if it's a mesh
+      if ((state.blobPreviewMesh as THREE.Mesh).geometry) {
+        (state.blobPreviewMesh as THREE.Mesh).geometry.dispose();
+      }
+      if ((state.blobPreviewMesh as THREE.Mesh).material) {
+        ((state.blobPreviewMesh as THREE.Mesh).material as THREE.Material).dispose();
+      }
+      // If it's a group, dispose children
+      if (state.blobPreviewMesh instanceof THREE.Group) {
+        for (const child of state.blobPreviewMesh.children) {
+          if ((child as THREE.Line).geometry) (child as THREE.Line).geometry.dispose();
+          if ((child as THREE.Line).material) ((child as THREE.Line).material as THREE.Material).dispose();
+        }
+      }
+      state.blobPreviewMesh = null;
+    }
+
+    // Create blob preview if we have points
+    if (blobPreviewPoints.length > 0 && tool === "blob") {
+      // Get the actual blob outline from Paper.js
+      const outlines = getBlobPreviewOutline(blobPreviewPoints, blobRadius);
+
+      if (outlines.length > 0) {
+        // Render as line loops (outlines only)
+        const group = new THREE.Group();
+
+        for (const outline of outlines) {
+          if (outline.length < 3) continue;
+
+          const points: THREE.Vector3[] = [];
+          for (const pt of outline) {
+            points.push(new THREE.Vector3(pt.x, pt.y, 0.1));
+          }
+          // Close the loop
+          points.push(points[0].clone());
+
+          const geometry = new THREE.BufferGeometry().setFromPoints(points);
+          const material = new THREE.LineBasicMaterial({
+            color: new THREE.Color(fillColor),
+            transparent: true,
+            opacity: fillOpacity,
+          });
+
+          const line = new THREE.Line(geometry, material);
+          group.add(line);
+        }
+
+        state.blobPreviewMesh = group as unknown as THREE.Mesh;
+        state.scene.add(group);
+      }
+    }
+  }, [blobPreviewPoints, blobRadius, fillColor, fillOpacity, tool]);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -927,6 +1017,7 @@ export const Canvas = () => {
       gridLines: null,
       hoveredEdgeLine: null,
       hoveredPathOutline: null,
+      blobPreviewMesh: null,
       zoom: 1,
       updateGrid: () => {}, // Placeholder, will be set after function is defined
       updatePointScales: () => {}, // Placeholder, will be set after function is defined
@@ -1110,6 +1201,12 @@ export const Canvas = () => {
     let snappedToTarget: SnapPoint | null = null; // Track which point we snapped to (for creating connection)
     // Track snap targets during path drawing: map from point index to snap target info
     let drawingSnapTargets: Map<number, { pathId: string; segmentIndex: number }> = new Map();
+    // Blob tool state
+    let isBlobbing = false;
+    let blobPoints: Point[] = [];
+    let blobMode: "add" | "subtract" | "create" = "create"; // Mode determined at start of stroke
+    let blobTargetPathIds: string[] = []; // Paths to modify (for add/subtract modes)
+    let lastBlobTime = 0; // Timestamp of last blob point for velocity calculation
 
     // Helper to find nearest control handle (respects active state)
     const findNearestHandle = (
@@ -1161,6 +1258,86 @@ export const Canvas = () => {
       if (e.button === MouseButton.MIDDLE) {
         isPanning = true;
         panStart = screenToWorld(e, container, state.camera);
+        e.preventDefault();
+        return;
+      }
+
+      // Blob tool handling
+      if (tool === "blob" && e.button === MouseButton.LEFT) {
+        const clickPoint = screenToWorld(e, container, state.camera);
+        const { paths, selection, blobRadius } = store.getState();
+
+        isBlobbing = true;
+        blobPoints = [clickPoint];
+        lastBlobTime = performance.now();
+        setBlobPreviewPointsRef.current([clickPoint]);
+
+        // Determine mode based on selection and click position
+        const selectedPaths = selection.pathIds
+          .map((id) => paths.find((p) => p.id === id))
+          .filter((p): p is Path => p !== undefined && p.visible && !p.locked);
+
+        if (selectedPaths.length === 0) {
+          // No selection - create new path
+          blobMode = "create";
+          blobTargetPathIds = [];
+        } else {
+          // Check if click is over any selected path
+          let clickedOnSelected = false;
+          for (const path of selectedPaths) {
+            // Simple point-in-polygon check using Paper.js
+            const paperPath = new paper.Path();
+            for (const seg of path.segments) {
+              paperPath.add(new paper.Segment(
+                new paper.Point(seg.p0.x, seg.p0.y),
+                undefined,
+                new paper.Point(seg.c0.x - seg.p0.x, seg.c0.y - seg.p0.y)
+              ));
+            }
+            if (path.closed) {
+              paperPath.closed = true;
+              // Set the incoming handle of the first point
+              const lastSeg = path.segments[path.segments.length - 1];
+              paperPath.firstSegment.handleIn = new paper.Point(
+                lastSeg.c1.x - path.segments[0].p0.x,
+                lastSeg.c1.y - path.segments[0].p0.y
+              );
+            }
+            // Fix handles for all segments
+            for (let i = 0; i < path.segments.length; i++) {
+              const seg = path.segments[i];
+              const nextIdx = (i + 1) % path.segments.length;
+              if (i < path.segments.length - 1 || path.closed) {
+                paperPath.segments[i].handleOut = new paper.Point(
+                  seg.c0.x - seg.p0.x, seg.c0.y - seg.p0.y
+                );
+                paperPath.segments[nextIdx].handleIn = new paper.Point(
+                  seg.c1.x - path.segments[nextIdx].p0.x,
+                  seg.c1.y - path.segments[nextIdx].p0.y
+                );
+              }
+            }
+
+            // Check if point is inside or within blob radius of the path
+            const testPoint = new paper.Point(clickPoint.x, clickPoint.y);
+            if (paperPath.contains(testPoint) || paperPath.getNearestPoint(testPoint).getDistance(testPoint) <= blobRadius) {
+              clickedOnSelected = true;
+            }
+            paperPath.remove();
+            if (clickedOnSelected) break;
+          }
+
+          if (clickedOnSelected) {
+            // Started on a selected path - add mode
+            blobMode = "add";
+            blobTargetPathIds = selectedPaths.map((p) => p.id);
+          } else {
+            // Started outside selected paths - subtract mode (eraser)
+            blobMode = "subtract";
+            blobTargetPathIds = selectedPaths.map((p) => p.id);
+          }
+        }
+
         e.preventDefault();
         return;
       }
@@ -1528,6 +1705,36 @@ export const Canvas = () => {
         return;
       }
 
+      // Handle blob tool dragging
+      if (isBlobbing) {
+        const point = screenToWorld(e, container, state.camera);
+        const { blobRadius } = store.getState();
+        const now = performance.now();
+
+        // Only add point if it's far enough from the last point (reduces redundant circles)
+        const lastPoint = blobPoints[blobPoints.length - 1];
+        const dist = Math.sqrt(
+          (point.x - lastPoint.x) ** 2 + (point.y - lastPoint.y) ** 2
+        );
+
+        // Calculate velocity-based minimum distance
+        // Slow movements = smaller min distance for precision
+        // Fast movements = larger min distance for performance
+        const dt = Math.max(1, now - lastBlobTime); // ms since last point
+        const velocity = dist / dt; // world units per ms
+        // Scale from 0.05 (slow) to 1.0 (fast) of radius based on velocity
+        // velocity of ~0.01 is slow, ~0.1+ is fast
+        const velocityFactor = Math.min(1, Math.max(0.05, velocity * 10));
+        const minDist = blobRadius * velocityFactor * 0.5;
+
+        if (dist >= minDist) {
+          blobPoints.push(point);
+          lastBlobTime = now;
+          setBlobPreviewPointsRef.current([...blobPoints]);
+        }
+        return;
+      }
+
       // Handle box selection
       if (isBoxSelecting && boxSelectStart) {
         const currentPoint = screenToWorld(e, container, state.camera);
@@ -1697,6 +1904,76 @@ export const Canvas = () => {
       if (isPanning) {
         isPanning = false;
         panStart = null;
+        return;
+      }
+
+      // End blob tool
+      if (isBlobbing) {
+        const { paths, blobRadius, blobSimplify, fillColor, fillOpacity } = store.getState();
+
+        if (blobPoints.length > 0) {
+          if (blobMode === "create") {
+            // Create new path from blob
+            const resultPaths = createBlobPath(
+              blobPoints,
+              blobRadius,
+              blobSimplify,
+              fillColor,
+              fillOpacity,
+              () => store.getNextPathName()
+            );
+            for (const path of resultPaths) {
+              store.finishPath(path);
+            }
+            // Select the new paths
+            if (resultPaths.length > 0) {
+              store.selectPaths(resultPaths.map((p) => p.id));
+            }
+          } else if (blobMode === "add") {
+            // Add blob to selected paths
+            const targetPaths = blobTargetPathIds
+              .map((id) => paths.find((p) => p.id === id))
+              .filter((p): p is Path => p !== undefined);
+
+            if (targetPaths.length > 0) {
+              const resultPaths = addBlobToPaths(
+                targetPaths,
+                blobPoints,
+                blobRadius,
+                blobSimplify,
+                () => store.getNextPathName()
+              );
+              if (resultPaths.length > 0) {
+                // Use booleanOp command for undo/redo
+                store.executeBlobOp(targetPaths, resultPaths);
+              }
+            }
+          } else if (blobMode === "subtract") {
+            // Subtract blob from selected paths
+            const targetPaths = blobTargetPathIds
+              .map((id) => paths.find((p) => p.id === id))
+              .filter((p): p is Path => p !== undefined);
+
+            if (targetPaths.length > 0) {
+              const resultPaths = subtractBlobFromPaths(
+                targetPaths,
+                blobPoints,
+                blobRadius,
+                blobSimplify,
+                () => store.getNextPathName()
+              );
+              // Use booleanOp command for undo/redo (may result in fewer paths)
+              store.executeBlobOp(targetPaths, resultPaths);
+            }
+          }
+        }
+
+        // Reset blob state
+        isBlobbing = false;
+        blobPoints = [];
+        blobMode = "create";
+        blobTargetPathIds = [];
+        setBlobPreviewPointsRef.current([]);
         return;
       }
 
@@ -1953,7 +2230,7 @@ export const Canvas = () => {
             ),
           );
 
-          const currentFillColor = store.getState().fillColor;
+          const { fillColor: currentFillColor, fillOpacity: currentFillOpacity } = store.getState();
           const pathId = store.getState().currentPathId!;
           const path: Path = {
             id: pathId,
@@ -1963,6 +2240,7 @@ export const Canvas = () => {
             anchorMeta: segments.map(() => ({ ...defaultAnchorMeta(), color: currentFillColor })),
             closed: true,
             fill: currentFillColor,
+            opacity: currentFillOpacity,
             visible: true,
             locked: false,
           };
@@ -2021,7 +2299,7 @@ export const Canvas = () => {
           lineSegment(currentPath[currentPath.length - 1], currentPath[0]),
         );
 
-        const currentFillColor = store.getState().fillColor;
+        const { fillColor: currentFillColor, fillOpacity: currentFillOpacity } = store.getState();
         const path: Path = {
           id: currentPathId,
           name: store.getNextPathName(),
@@ -2030,6 +2308,7 @@ export const Canvas = () => {
           anchorMeta: segments.map(() => ({ ...defaultAnchorMeta(), color: currentFillColor })),
           closed: true,
           fill: currentFillColor,
+          opacity: currentFillOpacity,
           visible: true,
           locked: false,
         };
@@ -2244,6 +2523,11 @@ export const Canvas = () => {
           store.selectAll();
         }
       }
+      // Ctrl+Shift+A for deselect all
+      if (isDeselectAll(e)) {
+        e.preventDefault();
+        store.clearSelection();
+      }
       // V for select tool
       if (isSelectTool(e)) {
         store.setTool("select");
@@ -2251,6 +2535,10 @@ export const Canvas = () => {
       // P for line tool
       if (isLineTool(e)) {
         store.setTool("line");
+      }
+      // B for blob tool
+      if (isBlobTool(e)) {
+        store.setTool("blob");
       }
       // G for group selection
       if (isGroup(e)) {

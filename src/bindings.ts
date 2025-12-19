@@ -13,6 +13,7 @@ export const Keys = {
   // Tools
   SELECT_TOOL: "v",
   LINE_TOOL: "p",
+  BLOB_TOOL: "b",
 
   // Edit
   UNDO: "z",
@@ -26,6 +27,7 @@ export const Keys = {
 
   // Selection
   SELECT_ALL: "a",
+  DESELECT_ALL: "a", // Ctrl+Shift+A
   ESCAPE: "Escape",
 
   // Groups
@@ -81,6 +83,7 @@ export const KeyboardBindings = {
   // Selection
   selection: {
     selectAll: { key: Keys.SELECT_ALL, ctrl: true, description: "Select all paths" },
+    deselectAll: { key: Keys.DESELECT_ALL, alt: true, description: "Deselect all" },
     escape: { key: Keys.ESCAPE, description: "Clear selection / Cancel current path" },
   },
 
@@ -160,6 +163,11 @@ export function isSelectAll(e: KeyboardEvent): boolean {
   return matchesKey(e, Keys.SELECT_ALL, { ctrl: true });
 }
 
+/** Check if event is deselect all (Alt+A) */
+export function isDeselectAll(e: KeyboardEvent): boolean {
+  return matchesKey(e, Keys.DESELECT_ALL, { alt: true });
+}
+
 /** Check if event is delete */
 export function isDelete(e: KeyboardEvent): boolean {
   return e.key === Keys.DELETE || e.key === Keys.BACKSPACE;
@@ -178,6 +186,11 @@ export function isSelectTool(e: KeyboardEvent): boolean {
 /** Check if event is line tool */
 export function isLineTool(e: KeyboardEvent): boolean {
   return e.key.toLowerCase() === Keys.LINE_TOOL && !e.ctrlKey;
+}
+
+/** Check if event is blob tool */
+export function isBlobTool(e: KeyboardEvent): boolean {
+  return e.key.toLowerCase() === Keys.BLOB_TOOL && !e.ctrlKey;
 }
 
 /** Check if event is group (G without modifiers) */

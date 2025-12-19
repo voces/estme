@@ -48,6 +48,9 @@ const initialState: EditorState = {
   hoveredPathId: null,
   selection: emptySelection,
   fillColor: "#ffffff",
+  fillOpacity: 1,
+  blobRadius: 0.3,
+  blobSimplify: 0.002,
   showAllPoints: loadShowAllPoints(),
   showAllControlPoints: loadShowAllControlPoints(),
   undoStack: [],
@@ -133,6 +136,14 @@ export const store = {
   },
   setFillColor: (fillColor: string) => {
     state = { ...state, fillColor };
+    notify();
+  },
+  setBlobRadius: (blobRadius: number) => {
+    state = { ...state, blobRadius };
+    notify();
+  },
+  setBlobSimplify: (blobSimplify: number) => {
+    state = { ...state, blobSimplify };
     notify();
   },
   toggleShowAllPoints: () => {
@@ -402,6 +413,11 @@ export const store = {
     } else {
       state = { ...state, selection: { pathIds: [id], points: [] } };
     }
+    notify();
+  },
+  selectPaths: (ids: string[]) => {
+    // Select multiple paths (replace current selection)
+    state = { ...state, selection: { pathIds: ids, points: [] } };
     notify();
   },
   selectAll: () => {
@@ -1628,6 +1644,14 @@ export const store = {
     if (!path || path.fill === fill) return;
     executeCommand({ type: "setPathFill", id: pathId, prevFill: path.fill, newFill: fill });
   },
+  setPathOpacity: (pathId: string, opacity: number) => {
+    const path = state.paths.find((p) => p.id === pathId);
+    if (!path || path.opacity === opacity) return;
+    executeCommand({ type: "setPathOpacity", id: pathId, prevOpacity: path.opacity, newOpacity: opacity });
+    // Store this opacity for new paths
+    state = { ...state, fillOpacity: opacity };
+    notify();
+  },
   setPathVisible: (pathId: string, visible: boolean) => {
     const path = state.paths.find((p) => p.id === pathId);
     if (!path || path.visible === visible) return;
@@ -2135,6 +2159,20 @@ export const store = {
 
   // Get the pending boolean operation
   getPendingBooleanOp: () => state.pendingBooleanOp,
+
+  // Execute a blob operation (add/subtract) - used by blob tool
+  executeBlobOp: (originalPaths: Path[], resultPaths: Path[]) => {
+    // Clean up snap connections for original paths
+    for (const path of originalPaths) {
+      store.cleanupConnectionsForPath(path.id);
+    }
+    executeCommand({ type: "booleanOp", originalPaths, resultPaths, operation: "unite" });
+    // Select the result paths
+    if (resultPaths.length > 0) {
+      state = { ...state, selection: { pathIds: resultPaths.map((p) => p.id), points: [] } };
+      notify();
+    }
+  },
 
   // Unite multiple paths (2+) - or enter drawing mode if no intersection
   unitePaths: () => {

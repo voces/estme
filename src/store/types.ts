@@ -31,6 +31,7 @@ export type Command =
   | { type: "setMirror"; id: string; anchorIndex: number; prevMeta: AnchorMeta; newMeta: AnchorMeta; prevC0: Point; newC0: Point; prevC1: Point; newC1: Point }
   | { type: "deleteAnchor"; id: string; anchorIndex: number; prevPath: Path }
   | { type: "setPathFill"; id: string; prevFill: string; newFill: string }
+  | { type: "setPathOpacity"; id: string; prevOpacity: number; newOpacity: number }
   | { type: "insertAnchor"; id: string; segmentIndex: number; t: number; prevPath: Path }
   | { type: "setPathVisible"; id: string; visible: boolean }
   | { type: "setPathLocked"; id: string; locked: boolean }
@@ -95,6 +96,9 @@ export type EditorState = {
   hoveredPathId: string | null;
   selection: Selection;
   fillColor: string;
+  fillOpacity: number;
+  blobRadius: number;
+  blobSimplify: number;
   showAllPoints: boolean;
   showAllControlPoints: boolean;
   undoStack: Command[];

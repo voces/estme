@@ -26,6 +26,7 @@ export type Path = {
   anchorMeta: AnchorMeta[]; // Per-anchor metadata, same length as segments
   closed: boolean;
   fill: string;
+  opacity: number; // 0-1 range
   visible: boolean;
   locked: boolean;
 };
@@ -37,7 +38,7 @@ export type Group = {
   collapsed: boolean; // UI state for hierarchy expand/collapse
 };
 
-export type Tool = "select" | "line";
+export type Tool = "select" | "line" | "blob";
 
 export type HandleType = "anchor" | "c0" | "c1";
 

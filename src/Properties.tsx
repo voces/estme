@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { store, useStore, PointSelection, Selection } from "./store/index.ts";
 import { Path, Point, PointReference, HandleType } from "./types.ts";
 import {
@@ -56,6 +56,88 @@ function NumberInput({ value, onChange, step, decimals = 3 }: {
         }
       }}
     />
+  );
+}
+
+// Number input with drag-to-adjust behavior (like a scrubber/slider)
+function DraggableNumberInput({ value, onChange, min, max, step = 1, decimals = 0, suffix = "" }: {
+  value: number;
+  onChange: (value: number) => void;
+  min: number;
+  max: number;
+  step?: number;
+  decimals?: number;
+  suffix?: string;
+}) {
+  const [localValue, setLocalValue] = useState(formatNumber(value, decimals));
+  const [isFocused, setIsFocused] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const dragStartRef = useRef<{ x: number; startValue: number } | null>(null);
+
+  // Update local value when external value changes (but not while focused/dragging)
+  useEffect(() => {
+    if (!isFocused && !isDragging) {
+      setLocalValue(formatNumber(value, decimals));
+    }
+  }, [value, decimals, isFocused, isDragging]);
+
+  const clamp = (v: number) => Math.max(min, Math.min(max, v));
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    // Only start drag on left click, not when clicking into input to type
+    if (e.button !== 0) return;
+
+    dragStartRef.current = { x: e.clientX, startValue: value };
+    setIsDragging(true);
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      if (!dragStartRef.current) return;
+      const delta = moveEvent.clientX - dragStartRef.current.x;
+      // Sensitivity: 1 pixel = step amount
+      const newValue = clamp(dragStartRef.current.startValue + delta * step);
+      setLocalValue(formatNumber(newValue, decimals));
+      onChange(newValue);
+    };
+
+    const handleMouseUp = () => {
+      setIsDragging(false);
+      dragStartRef.current = null;
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+  };
+
+  return (
+    <div className={styles.draggableInput} style={{ cursor: isDragging ? "ew-resize" : "ew-resize" }}>
+      <input
+        type="number"
+        step={step}
+        min={min}
+        max={max}
+        value={localValue}
+        onChange={(e) => {
+          setLocalValue(e.target.value);
+          const num = parseFloat(e.target.value);
+          if (!isNaN(num)) {
+            onChange(clamp(num));
+          }
+        }}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => {
+          setIsFocused(false);
+          const num = parseFloat(localValue);
+          if (!isNaN(num)) {
+            setLocalValue(formatNumber(clamp(num), decimals));
+          }
+        }}
+        onMouseDown={handleMouseDown}
+        style={{ cursor: "ew-resize" }}
+      />
+      {suffix && <span className={styles.unit}>{suffix}</span>}
+    </div>
   );
 }
 
@@ -281,6 +363,18 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
             onChange={(e) => handleColorChange(e.target.value)}
           />
           <span className={styles.colorValue}>{avgColor}</span>
+        </div>
+        <div className={styles.row}>
+          <label>Opacity</label>
+          <DraggableNumberInput
+            value={Math.round(path.opacity * 100)}
+            min={0}
+            max={100}
+            step={1}
+            decimals={0}
+            suffix="%"
+            onChange={(v) => store.setPathOpacity(path.id, v / 100)}
+          />
         </div>
       </div>
 

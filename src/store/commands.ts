@@ -459,6 +459,15 @@ export function applyCommand(
         ),
       };
     }
+    case "setPathOpacity": {
+      const opacity = isUndo ? cmd.prevOpacity : cmd.newOpacity;
+      return {
+        ...state,
+        paths: state.paths.map((p) =>
+          p.id === cmd.id ? { ...p, opacity } : p
+        ),
+      };
+    }
     case "setPathVisible": {
       const visible = isUndo ? !cmd.visible : cmd.visible;
       return {
