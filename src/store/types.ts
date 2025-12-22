@@ -1,5 +1,12 @@
-import { AnchorMeta, Group, HandleType, Path, Point, PointReference, SnapConnection, Tool } from "../types.ts";
+import { AnchorMeta, Group, HandleType, Path, PathTransform, Point, PointReference, SnapConnection, Tool } from "../types.ts";
 import { BooleanOperation } from "../pathBool.ts";
+import { AnimationClip, PartAnimation } from "../animation.ts";
+
+// Selected keyframe in timeline (a unified keyframe at a time)
+export type SelectedKeyframe = {
+  pathId: string;
+  time: number;
+} | null;
 
 // Re-export HandleType for convenience
 export type { HandleType } from "../types.ts";
@@ -24,6 +31,7 @@ export type Command =
   | { type: "selectPath"; prevId: string | null; newId: string | null }
   | { type: "translatePath"; id: string; dx: number; dy: number }
   | { type: "rotatePath"; id: string; angle: number; center: Point }
+  | { type: "scalePath"; id: string; scale: number; center: Point }
   | { type: "movePoint"; id: string; pointIndex: number; dx: number; dy: number }
   | { type: "moveHandle"; id: string; segmentIndex: number; handleType: HandleType; dx: number; dy: number }
   | { type: "setAnchorMeta"; id: string; anchorIndex: number; prevMeta: AnchorMeta; newMeta: AnchorMeta }
@@ -35,6 +43,7 @@ export type Command =
   | { type: "insertAnchor"; id: string; segmentIndex: number; t: number; prevPath: Path }
   | { type: "setPathVisible"; id: string; visible: boolean }
   | { type: "setPathLocked"; id: string; locked: boolean }
+  | { type: "setPathPlayerMask"; id: string; playerMask: boolean }
   | { type: "setPathName"; id: string; prevName: string; newName: string }
   | { type: "splitPath"; originalPath: Path; newPath1: Path; newPath2: Path }
   | { type: "joinPaths"; originalPaths: Path[]; newPath: Path }
@@ -46,15 +55,32 @@ export type Command =
   | { type: "setGroupName"; id: string; prevName: string; newName: string }
   | { type: "setGroupCollapsed"; id: string; collapsed: boolean }
   | { type: "moveToGroup"; itemId: string; itemType: "path" | "group"; prevParentId: string | null; newParentId: string | null }
+  // Reorder commands (for z-order / hierarchy position)
+  | { type: "reorderItem"; itemId: string; itemType: "path" | "group"; prevIndex: number; newIndex: number }
+  | { type: "reorderPaths"; prevPathIds: string[]; newPathIds: string[] }
   // Snap connection commands
   | { type: "addSnapConnection"; connection: SnapConnection }
   | { type: "removeSnapConnection"; connection: SnapConnection }
-  | { type: "updateSnapConnection"; prevConnection: SnapConnection; newConnection: SnapConnection };
+  | { type: "updateSnapConnection"; prevConnection: SnapConnection; newConnection: SnapConnection }
+  // Animation commands
+  | { type: "addAnimationClip"; clip: AnimationClip }
+  | { type: "deleteAnimationClip"; clip: AnimationClip }
+  | { type: "updateAnimationClip"; prevClip: AnimationClip; newClip: AnimationClip }
+  // Unified keyframe commands - operates on entire PartAnimation array
+  | { type: "setPartAnimation"; clipId: string; partId: string; prevAnimation: PartAnimation; newAnimation: PartAnimation }
+  // Path transform commands
+  | { type: "setPathTransform"; id: string; prevTransform: PathTransform; newTransform: PathTransform }
+  // Transform point commands
+  | { type: "setTransformPoint"; itemId: string; itemType: "path" | "group"; prevPoint: Point | null; newPoint: Point | null }
+  // Bake transform commands
+  | { type: "bakeTransform"; id: string; prevPath: Path };
 
 // Clipboard content - can hold full paths or individual anchors
 export type ClipboardContent = {
   type: "paths";
   paths: Path[];
+  sourceIds: string[]; // Original path IDs (for inserting after source)
+  sourceNames: string[]; // Original path names (for naming copies)
 } | {
   type: "anchors";
   // Store anchor data with relative positions from clipboard center
@@ -84,7 +110,23 @@ export type PendingBooleanOp = {
   targetPathIds: string[]; // The selected paths to apply the operation against
 } | null;
 
+// Instance rendering properties (not part of document data, stored in localStorage)
+export type InstanceProperties = {
+  opacity: number; // 0-1, instance-level opacity multiplier
+  vertexColor: string; // Hex color, multiplied with per-vertex colors
+  accentColor: string; // Hex color for player-masked vertices
+  minimapMask: boolean; // When true, render as solid accent color silhouette
+};
+
 export type EditorState = {
+  // Whether the initial document is still loading
+  isLoadingDocument: boolean;
+  // Document ID (unique identifier for this document)
+  documentId: string | null;
+  // Document name (used for save filename)
+  documentName: string;
+  // Whether this document has unsaved changes
+  isDirty: boolean;
   tool: Tool;
   paths: Path[];
   groups: Group[];
@@ -101,6 +143,7 @@ export type EditorState = {
   blobSimplify: number;
   showAllPoints: boolean;
   showAllControlPoints: boolean;
+  showTransformPoints: boolean;
   undoStack: Command[];
   redoStack: Command[];
   // Status bar info
@@ -116,6 +159,18 @@ export type EditorState = {
   snapConnections: SnapConnection[];
   // Pending boolean operation (when drawing a new path to apply against selection)
   pendingBooleanOp: PendingBooleanOp;
+  // Animation clips
+  animationClips: AnimationClip[];
+  // Currently selected animation clip ID (for editing)
+  currentClipId: string | null;
+  // Current playback time in the timeline (seconds)
+  playbackTime: number;
+  // Is animation playing?
+  isPlaying: boolean;
+  // Selected keyframe in timeline (for editing in Properties panel)
+  selectedKeyframe: SelectedKeyframe;
+  // Instance rendering properties (not part of document, stored separately in localStorage)
+  instanceProperties: InstanceProperties;
 };
 
 export const emptySelection: Selection = { pathIds: [], points: [] };

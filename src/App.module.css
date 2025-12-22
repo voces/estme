@@ -1,7 +1,7 @@
 .app {
   display: grid;
   grid-template-columns: 40px 1fr 200px; /* Overridden by inline style */
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto auto; /* menubar, header, main, timeline, footer */
   width: 100vw;
   height: 100vh;
 }
@@ -37,10 +37,30 @@
 .rightContent {
   flex: 1;
   min-width: 0;
-  padding: 0.25rem;
-  overflow: hidden;
+  padding: 0.25rem 0.25rem 0.25rem 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+
+.timeline {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.timelineResizeHandle {
+  height: 4px;
+  cursor: row-resize;
+  background: #252525;
+  border-top: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.timelineResizeHandle:hover {
+  background: #4488ff;
 }
 
 .footer {

@@ -4,6 +4,7 @@ import {
   lerpColor,
   makeStraightControlPoints,
   rotatePoint,
+  scalePointAround,
   splitBezierAt,
 } from "../geometry.ts";
 import { Command, EditorState, emptySelection, HandleType } from "./types.ts";
@@ -208,6 +209,52 @@ export function applyCommand(
               if (connPath && connPath.segments[connPoint.segmentIndex]) {
                 const oldPos = connPath.segments[connPoint.segmentIndex].p0;
                 const newPos = rotatePoint(oldPos, cmd.center, angle);
+                const dx = newPos.x - oldPos.x;
+                const dy = newPos.y - oldPos.y;
+                newPaths = movePointInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, dx, dy);
+              }
+            }
+          }
+        }
+      }
+
+      return { ...state, paths: newPaths };
+    }
+    case "scalePath": {
+      // For undo, we need to scale by 1/scale
+      const scale = isUndo ? 1 / cmd.scale : cmd.scale;
+
+      const path = state.paths.find((p) => p.id === cmd.id);
+      if (!path) return state;
+
+      // First, scale the main path
+      let newPaths = state.paths.map((p) => {
+        if (p.id !== cmd.id) return p;
+        return {
+          ...p,
+          segments: p.segments.map((seg) => ({
+            p0: scalePointAround(seg.p0, cmd.center, scale),
+            c0: scalePointAround(seg.c0, cmd.center, scale),
+            c1: scalePointAround(seg.c1, cmd.center, scale),
+            p1: scalePointAround(seg.p1, cmd.center, scale),
+          })),
+        };
+      });
+
+      // Then, scale all connected points on OTHER paths around the same center
+      const movedPoints = new Set<string>();
+      for (let i = 0; i < path.segments.length; i++) {
+        const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
+        for (const connPoint of connectedPoints) {
+          if (connPoint.pathId !== cmd.id) {
+            const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+            if (!movedPoints.has(key)) {
+              movedPoints.add(key);
+              // Get the current position and scale it
+              const connPath = newPaths.find((p) => p.id === connPoint.pathId);
+              if (connPath && connPath.segments[connPoint.segmentIndex]) {
+                const oldPos = connPath.segments[connPoint.segmentIndex].p0;
+                const newPos = scalePointAround(oldPos, cmd.center, scale);
                 const dx = newPos.x - oldPos.x;
                 const dy = newPos.y - oldPos.y;
                 newPaths = movePointInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, dx, dy);
@@ -486,6 +533,15 @@ export function applyCommand(
         ),
       };
     }
+    case "setPathPlayerMask": {
+      const playerMask = isUndo ? !cmd.playerMask : cmd.playerMask;
+      return {
+        ...state,
+        paths: state.paths.map((p) =>
+          p.id === cmd.id ? { ...p, playerMask } : p
+        ),
+      };
+    }
     case "setPathName": {
       const name = isUndo ? cmd.prevName : cmd.newName;
       return {
@@ -704,6 +760,28 @@ export function applyCommand(
         };
       }
     }
+    case "reorderItem": {
+      const fromIndex = isUndo ? cmd.newIndex : cmd.prevIndex;
+      const toIndex = isUndo ? cmd.prevIndex : cmd.newIndex;
+      if (cmd.itemType === "path") {
+        const newPaths = [...state.paths];
+        const [item] = newPaths.splice(fromIndex, 1);
+        newPaths.splice(toIndex, 0, item);
+        return { ...state, paths: newPaths };
+      } else {
+        const newGroups = [...state.groups];
+        const [item] = newGroups.splice(fromIndex, 1);
+        newGroups.splice(toIndex, 0, item);
+        return { ...state, groups: newGroups };
+      }
+    }
+    case "reorderPaths": {
+      // Reorder paths array to match the specified order
+      const targetOrder = isUndo ? cmd.prevPathIds : cmd.newPathIds;
+      const pathById = new Map(state.paths.map((p) => [p.id, p]));
+      const newPaths = targetOrder.map((id) => pathById.get(id)!).filter(Boolean);
+      return { ...state, paths: newPaths };
+    }
     // Snap connection commands
     case "addSnapConnection": {
       if (isUndo) {
@@ -739,6 +817,101 @@ export function applyCommand(
           c.id === connection.id ? connection : c
         ),
       };
+    }
+    // Animation commands
+    case "addAnimationClip": {
+      if (isUndo) {
+        return {
+          ...state,
+          animationClips: state.animationClips.filter((c) => c.id !== cmd.clip.id),
+        };
+      } else {
+        return {
+          ...state,
+          animationClips: [...state.animationClips, cmd.clip],
+        };
+      }
+    }
+    case "deleteAnimationClip": {
+      if (isUndo) {
+        return {
+          ...state,
+          animationClips: [...state.animationClips, cmd.clip],
+        };
+      } else {
+        return {
+          ...state,
+          animationClips: state.animationClips.filter((c) => c.id !== cmd.clip.id),
+        };
+      }
+    }
+    case "updateAnimationClip": {
+      const clip = isUndo ? cmd.prevClip : cmd.newClip;
+      return {
+        ...state,
+        animationClips: state.animationClips.map((c) =>
+          c.id === clip.id ? clip : c
+        ),
+      };
+    }
+    case "setPartAnimation": {
+      const animation = isUndo ? cmd.prevAnimation : cmd.newAnimation;
+      return {
+        ...state,
+        animationClips: state.animationClips.map((c) => {
+          if (c.id !== cmd.clipId) return c;
+          return {
+            ...c,
+            parts: {
+              ...c.parts,
+              [cmd.partId]: animation,
+            },
+          };
+        }),
+      };
+    }
+    case "setPathTransform": {
+      const transform = isUndo ? cmd.prevTransform : cmd.newTransform;
+      return {
+        ...state,
+        paths: state.paths.map((p) =>
+          p.id === cmd.id ? { ...p, transform } : p
+        ),
+      };
+    }
+    case "setTransformPoint": {
+      const transformPoint = isUndo ? cmd.prevPoint : cmd.newPoint;
+      if (cmd.itemType === "path") {
+        return {
+          ...state,
+          paths: state.paths.map((p) =>
+            p.id === cmd.itemId ? { ...p, transformPoint } : p
+          ),
+        };
+      } else {
+        return {
+          ...state,
+          groups: state.groups.map((g) =>
+            g.id === cmd.itemId ? { ...g, transformPoint } : g
+          ),
+        };
+      }
+    }
+    case "bakeTransform": {
+      if (isUndo) {
+        // Restore the original path entirely
+        return {
+          ...state,
+          paths: state.paths.map((p) =>
+            p.id === cmd.id ? cmd.prevPath : p
+          ),
+        };
+      } else {
+        // Bake is applied immediately when the command is created,
+        // so we just need to ensure the current state is preserved
+        // (the bake operation should have already modified the path)
+        return state;
+      }
     }
   }
 }

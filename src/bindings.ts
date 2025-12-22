@@ -43,6 +43,7 @@ export const Keys = {
   // View toggles (plain keys)
   TOGGLE_ANCHORS: ".",
   TOGGLE_CONTROLS: ",",
+  TOGGLE_TRANSFORM_POINTS: "/",
 } as const;
 
 // =============================================================================

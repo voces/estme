@@ -1,8 +1,9 @@
 import { useCallback, useSyncExternalStore } from "react";
-import { AnchorMeta, CubicSegment, Group, lineSegment, Path, Point, PointReference, SnapConnection, Tool } from "../types.ts";
+import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, Point, PointReference, SnapConnection, Tool } from "../types.ts";
 import { booleanOperation, canBooleanOp, uniteMultiplePaths } from "../pathBool.ts";
-import { isSegmentStraight, makeStraightControlPoints, rotatePoint } from "../geometry.ts";
+import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, getPathTransformPoint, getSelectionTransformPoint } from "../geometry.ts";
 import { applyCommand } from "./commands.ts";
+import { generateId, setCurrentDocumentId } from "../storage.ts";
 import {
   Command,
   EditorState,
@@ -10,7 +11,9 @@ import {
   HandleType,
   HoveredEdge,
   HoveredPoint,
+  InstanceProperties,
   PointSelection,
+  SelectedKeyframe,
   Selection,
 } from "./types.ts";
 
@@ -36,8 +39,113 @@ const loadShowAllControlPoints = (): boolean => {
   }
 };
 
+const loadShowTransformPoints = (): boolean => {
+  try {
+    const saved = localStorage.getItem("estme:showTransformPoints");
+    return saved === "true";
+  } catch {
+    return false;
+  }
+};
+
+const loadTool = (): Tool => {
+  try {
+    const saved = localStorage.getItem("estme:tool");
+    if (saved === "select" || saved === "line" || saved === "blob") {
+      return saved;
+    }
+  } catch {
+    // Ignore
+  }
+  return "line";
+};
+
+const loadCurrentClipId = (): string | null => {
+  try {
+    return localStorage.getItem("estme:currentClipId");
+  } catch {
+    return null;
+  }
+};
+
+// Default instance properties
+const DEFAULT_INSTANCE_PROPERTIES: InstanceProperties = {
+  opacity: 1,
+  vertexColor: "#ffffff",
+  accentColor: "#ff0303",
+  minimapMask: false,
+};
+
+const loadInstanceProperties = (): InstanceProperties => {
+  try {
+    const saved = localStorage.getItem("estme:instanceProperties");
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      return {
+        opacity: typeof parsed.opacity === "number" ? parsed.opacity : DEFAULT_INSTANCE_PROPERTIES.opacity,
+        vertexColor: typeof parsed.vertexColor === "string" ? parsed.vertexColor : DEFAULT_INSTANCE_PROPERTIES.vertexColor,
+        accentColor: typeof parsed.accentColor === "string" ? parsed.accentColor : DEFAULT_INSTANCE_PROPERTIES.accentColor,
+        minimapMask: typeof parsed.minimapMask === "boolean" ? parsed.minimapMask : DEFAULT_INSTANCE_PROPERTIES.minimapMask,
+      };
+    }
+  } catch {
+    // Ignore
+  }
+  return DEFAULT_INSTANCE_PROPERTIES;
+};
+
+const saveInstanceProperties = (props: InstanceProperties) => {
+  try {
+    localStorage.setItem("estme:instanceProperties", JSON.stringify(props));
+  } catch {
+    // Ignore
+  }
+};
+
+// Selection persistence - only persist pathIds (point selections are transient)
+const loadSelection = (): Selection => {
+  try {
+    const saved = localStorage.getItem("estme:selection");
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed.pathIds)) {
+        return { pathIds: parsed.pathIds, points: [] };
+      }
+    }
+  } catch {
+    // Ignore
+  }
+  return emptySelection;
+};
+
+const saveSelection = (selection: Selection) => {
+  try {
+    // Only save pathIds - point selections are too transient
+    localStorage.setItem("estme:selection", JSON.stringify({ pathIds: selection.pathIds }));
+  } catch {
+    // Ignore
+  }
+};
+
+// Check synchronously if we expect to load a document (either from autosave or saved doc)
+// We can't check IndexedDB synchronously, but we can check if there's a current doc ID
+// If there is, we'll show loading state until the async load completes
+const willLoadDocument = (): boolean => {
+  try {
+    // If there's a current document ID, we'll try to load it
+    const currentId = localStorage.getItem("estme-current-document-id");
+    return currentId !== null;
+  } catch {
+    return false;
+  }
+};
+
 const initialState: EditorState = {
-  tool: "line",
+  isLoadingDocument: willLoadDocument(),
+  documentId: null,
+  documentName: "untitled",
+  isDirty: false,
+  tool: loadTool(),
   paths: [],
   groups: [],
   currentPath: null,
@@ -46,13 +154,14 @@ const initialState: EditorState = {
   hoveredEdge: null,
   hoveredPoint: null,
   hoveredPathId: null,
-  selection: emptySelection,
+  selection: loadSelection(),
   fillColor: "#ffffff",
   fillOpacity: 1,
   blobRadius: 0.3,
   blobSimplify: 0.002,
   showAllPoints: loadShowAllPoints(),
   showAllControlPoints: loadShowAllControlPoints(),
+  showTransformPoints: loadShowTransformPoints(),
   undoStack: [],
   redoStack: [],
   mousePosition: null,
@@ -62,6 +171,12 @@ const initialState: EditorState = {
   groupCounter: 1,
   snapConnections: [],
   pendingBooleanOp: null,
+  animationClips: [],
+  currentClipId: loadCurrentClipId(),
+  playbackTime: 0,
+  isPlaying: false,
+  selectedKeyframe: null,
+  instanceProperties: loadInstanceProperties(),
 };
 
 let state = initialState;
@@ -108,6 +223,19 @@ function executeCommand(cmd: Command) {
     ...state,
     undoStack: [...state.undoStack, cmd],
     redoStack: [],
+    isDirty: true,
+  };
+  notify();
+}
+
+// Record a command for undo/redo WITHOUT applying it (state is already correct)
+// Used when live editing has already modified state and we just need the undo entry
+function recordCommand(cmd: Command) {
+  state = {
+    ...state,
+    undoStack: [...state.undoStack, cmd],
+    redoStack: [],
+    isDirty: true,
   };
   notify();
 }
@@ -131,6 +259,11 @@ export const store = {
       state = { ...state, tool, currentPath: null, currentPathId: null, hoverPoint: null };
     } else {
       state = { ...state, tool };
+    }
+    try {
+      localStorage.setItem("estme:tool", tool);
+    } catch {
+      // Ignore localStorage errors
     }
     notify();
   },
@@ -161,6 +294,16 @@ export const store = {
     state = { ...state, showAllControlPoints: newValue };
     try {
       localStorage.setItem("estme:showAllControlPoints", String(newValue));
+    } catch {
+      // Ignore localStorage errors
+    }
+    notify();
+  },
+  toggleShowTransformPoints: () => {
+    const newValue = !state.showTransformPoints;
+    state = { ...state, showTransformPoints: newValue };
+    try {
+      localStorage.setItem("estme:showTransformPoints", String(newValue));
     } catch {
       // Ignore localStorage errors
     }
@@ -215,10 +358,12 @@ export const store = {
   // Selection management (non-undoable UI state)
   clearSelection: () => {
     state = { ...state, selection: emptySelection };
+    saveSelection(emptySelection);
     notify();
   },
   setSelection: (selection: Selection) => {
     state = { ...state, selection };
+    saveSelection(selection);
     notify();
   },
   // Add to selection (for shift+click)
@@ -231,7 +376,9 @@ export const store = {
     )
       ? [...state.selection.points, point]
       : state.selection.points;
-    state = { ...state, selection: { pathIds: newPathIds, points: newPoints } };
+    const newSelection = { pathIds: newPathIds, points: newPoints };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection);
     notify();
   },
   // Toggle item in selection
@@ -255,7 +402,9 @@ export const store = {
         newPoints = [...newPoints, point];
       }
     }
-    state = { ...state, selection: { pathIds: newPathIds, points: newPoints } };
+    const newSelection = { pathIds: newPathIds, points: newPoints };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection);
     notify();
   },
 
@@ -351,28 +500,66 @@ export const store = {
     executeCommand({ type: "deletePath", path });
   },
   deleteSelection: () => {
-    // Delete all fully selected paths
+    const commands: Command[] = [];
+
+    // Helper to collect snap connection cleanup commands for a path
+    const getConnectionCleanupCommands = (pathId: string): Command[] => {
+      const cmds: Command[] = [];
+      const affectedConnections = state.snapConnections.filter((conn) =>
+        conn.points.some((p) => p.pathId === pathId)
+      );
+      for (const conn of affectedConnections) {
+        const remainingPoints = conn.points.filter((p) => p.pathId !== pathId);
+        if (remainingPoints.length <= 1) {
+          cmds.push({ type: "removeSnapConnection", connection: conn });
+        } else {
+          cmds.push({
+            type: "updateSnapConnection",
+            prevConnection: conn,
+            newConnection: { ...conn, points: remainingPoints },
+          });
+        }
+      }
+      return cmds;
+    };
+
+    // Delete all fully selected paths (skip locked paths)
     for (const pathId of state.selection.pathIds) {
       const path = state.paths.find((p) => p.id === pathId);
-      if (path) {
-        // Clean up snap connections first
-        store.cleanupConnectionsForPath(pathId);
-        executeCommand({ type: "deletePath", path });
+      if (path && !path.locked) {
+        // Add snap connection cleanup commands
+        commands.push(...getConnectionCleanupCommands(pathId));
+        // Add delete path command
+        commands.push({ type: "deletePath", path });
       }
     }
-    // Delete all selected points
-    for (const point of state.selection.points) {
+
+    // Sort selected points by segment index descending so we delete higher indices first
+    // This prevents index shifting from affecting subsequent deletions
+    const sortedPoints = [...state.selection.points].sort((a, b) => {
+      // Group by path first, then by segment index descending
+      if (a.pathId !== b.pathId) return a.pathId.localeCompare(b.pathId);
+      return b.segmentIndex - a.segmentIndex;
+    });
+
+    // Delete all selected points (skip locked paths)
+    for (const point of sortedPoints) {
       const path = state.paths.find((p) => p.id === point.pathId);
-      if (!path) continue;
+      if (!path || path.locked) continue;
 
       const { segmentIndex, handleType, pathId } = point;
 
       if (handleType === "anchor") {
         // Delete anchor - need at least 4 segments to delete one (keeping 3)
-        if (path.segments.length <= 3) continue;
+        // Account for how many anchors we've already queued for deletion on this path
+        const pendingDeletions = commands.filter(
+          (c) => c.type === "deleteAnchor" && c.id === pathId
+        ).length;
+        if (path.segments.length - pendingDeletions <= 3) continue;
+
         // Update snap connection indices for anchors on this path
         store.updateConnectionIndices(pathId, segmentIndex);
-        executeCommand({
+        commands.push({
           type: "deleteAnchor",
           id: pathId,
           anchorIndex: segmentIndex,
@@ -382,17 +569,45 @@ export const store = {
         // Delete c0 control point - collapse to anchor (same as toggle off)
         const anchorMeta = path.anchorMeta?.[segmentIndex];
         if (!anchorMeta || !anchorMeta.rightActive) continue; // Already inactive
-        store.toggleRightControl(pathId, segmentIndex);
+        const seg = path.segments[segmentIndex];
+        const newMeta = { ...anchorMeta, rightActive: false };
+        commands.push({
+          type: "toggleControl",
+          id: pathId,
+          anchorIndex: segmentIndex,
+          handleType: "right",
+          prevMeta: anchorMeta,
+          newMeta,
+          prevControlPos: seg.c0,
+          newControlPos: seg.p0,
+        });
       } else if (handleType === "c1") {
         // Delete c1 control point - collapse to anchor of next segment
-        // For open paths, the last segment's c1 belongs to the final anchor (index = segments.length)
         const nextIdx = path.closed
           ? (segmentIndex + 1) % path.segments.length
           : segmentIndex + 1;
         const anchorMeta = path.anchorMeta?.[nextIdx];
         if (!anchorMeta || !anchorMeta.leftActive) continue; // Already inactive
-        store.toggleLeftControl(pathId, nextIdx);
+        const seg = path.segments[segmentIndex];
+        const newMeta = { ...anchorMeta, leftActive: false };
+        commands.push({
+          type: "toggleControl",
+          id: pathId,
+          anchorIndex: nextIdx,
+          handleType: "left",
+          prevMeta: anchorMeta,
+          newMeta,
+          prevControlPos: seg.c1,
+          newControlPos: seg.p1,
+        });
       }
+    }
+
+    // Execute all commands as a single batch (or single command if only one)
+    if (commands.length === 1) {
+      executeCommand(commands[0]);
+    } else if (commands.length > 1) {
+      executeCommand({ type: "batch", commands });
     }
   },
   insertAnchor: (pathId: string, segmentIndex: number, t: number) => {
@@ -408,31 +623,31 @@ export const store = {
   },
   selectPath: (id: string | null) => {
     // For single path selection (replace current selection)
-    if (id === null) {
-      state = { ...state, selection: emptySelection };
-    } else {
-      state = { ...state, selection: { pathIds: [id], points: [] } };
-    }
+    const newSelection = id === null ? emptySelection : { pathIds: [id], points: [] };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection);
     notify();
   },
   selectPaths: (ids: string[]) => {
     // Select multiple paths (replace current selection)
-    state = { ...state, selection: { pathIds: ids, points: [] } };
+    const newSelection = { pathIds: ids, points: [] };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection);
     notify();
   },
   selectAll: () => {
     // Select all visible paths
     const visiblePathIds = state.paths.filter((p) => p.visible).map((p) => p.id);
-    state = { ...state, selection: { pathIds: visiblePathIds, points: [] } };
+    const newSelection = { pathIds: visiblePathIds, points: [] };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection);
     notify();
   },
   selectPoint: (point: PointSelection | null) => {
     // For single point selection (replace current selection)
-    if (point === null) {
-      state = { ...state, selection: emptySelection };
-    } else {
-      state = { ...state, selection: { pathIds: [], points: [point] } };
-    }
+    const newSelection = point === null ? emptySelection : { pathIds: [], points: [point] };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection); // Saves empty pathIds (point selections are transient)
     notify();
   },
   // Live transform (no undo entry - used during drag)
@@ -488,8 +703,8 @@ export const store = {
     state = {
       ...state,
       paths: state.paths.map((p) => {
-        // If path is fully selected, translate all points uniformly (preserves straight lines)
-        if (selection.pathIds.includes(p.id)) {
+        // If path is fully selected and not locked, translate all points uniformly (preserves straight lines)
+        if (selection.pathIds.includes(p.id) && !p.locked) {
           // Track all anchors as moved
           for (let i = 0; i < p.segments.length; i++) {
             movedPoints.push({ pathId: p.id, segmentIndex: i, handleType: "anchor" });
@@ -681,8 +896,8 @@ export const store = {
     state = {
       ...state,
       paths: state.paths.map((p) => {
-        // If path is fully selected, rotate all points
-        if (selection.pathIds.includes(p.id)) {
+        // If path is fully selected and not locked, rotate all points
+        if (selection.pathIds.includes(p.id) && !p.locked) {
           // Track all anchors as rotated
           for (let i = 0; i < p.segments.length; i++) {
             rotatedPoints.push({ pathId: p.id, segmentIndex: i });
@@ -733,6 +948,7 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, cmd],
       redoStack: [],
+      isDirty: true,
     };
     notify();
   },
@@ -742,14 +958,17 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, cmd],
       redoStack: [],
+      isDirty: true,
     };
     notify();
   },
   // Commit translation for entire selection as a batch
   commitTranslateSelection: (dx: number, dy: number) => {
-    const { selection } = state;
+    const { selection, paths } = state;
     const commands: Command[] = [];
     for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (path?.locked) continue; // Skip locked paths
       commands.push({ type: "translatePath", id: pathId, dx, dy });
     }
     // For individual points, we'd need movePoint commands
@@ -766,14 +985,17 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, cmd],
       redoStack: [],
+      isDirty: true,
     };
     notify();
   },
   // Commit rotation for entire selection as a batch
   commitRotateSelection: (angle: number, center: Point) => {
-    const { selection } = state;
+    const { selection, paths } = state;
     const commands: Command[] = [];
     for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (path?.locked) continue; // Skip locked paths
       commands.push({ type: "rotatePath", id: pathId, angle, center });
     }
     // Note: rotating individual points is just translation in a circle, complex to implement
@@ -784,8 +1006,340 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, cmd],
       redoStack: [],
+      isDirty: true,
     };
     notify();
+  },
+  // Scale a single path around a center point (live, no undo)
+  scalePathLive: (id: string, scale: number, center: Point, scaledPathIds?: Set<string>) => {
+    // Track which paths we've scaled to avoid infinite loops
+    const scaled = scaledPathIds || new Set<string>();
+    if (scaled.has(id)) return;
+    scaled.add(id);
+
+    const path = state.paths.find((p) => p.id === id);
+    if (!path) return;
+
+    // First, collect the old positions of all anchors (for computing connected point deltas)
+    const oldPositions: Point[] = path.segments.map((seg) => ({ ...seg.p0 }));
+
+    // Scale the path
+    state = {
+      ...state,
+      paths: state.paths.map((p) => {
+        if (p.id !== id) return p;
+        return {
+          ...p,
+          segments: p.segments.map((seg) => ({
+            p0: scalePointAround(seg.p0, center, scale),
+            c0: scalePointAround(seg.c0, center, scale),
+            c1: scalePointAround(seg.c1, center, scale),
+            p1: scalePointAround(seg.p1, center, scale),
+          })),
+        };
+      }),
+    };
+
+    // Move connected points on OTHER paths
+    for (let i = 0; i < path.segments.length; i++) {
+      const connectedPoints = store.getConnectedPoints({ pathId: id, segmentIndex: i, handleType: "anchor" });
+      for (const connPoint of connectedPoints) {
+        if (connPoint.pathId !== id && !scaled.has(connPoint.pathId)) {
+          // Get the old position of the connected point
+          const connPath = state.paths.find((p) => p.id === connPoint.pathId);
+          if (!connPath) continue;
+          const connOldPos = connPath.segments[connPoint.segmentIndex]?.p0;
+          if (!connOldPos) continue;
+
+          // Scale around the same center and calculate delta
+          const newPos = scalePointAround(connOldPos, center, scale);
+          const dx = newPos.x - connOldPos.x;
+          const dy = newPos.y - connOldPos.y;
+
+          store._movePointInternal(connPoint.pathId, connPoint.segmentIndex, dx, dy);
+        }
+      }
+    }
+
+    if (!scaledPathIds) {
+      throttledNotify();
+    }
+  },
+  // Scale entire selection around a center point (live, no undo)
+  scaleSelectionLive: (scale: number, center: Point) => {
+    const { selection } = state;
+
+    // Track all points being scaled
+    const scaledPoints: { pathId: string; segmentIndex: number }[] = [];
+
+    state = {
+      ...state,
+      paths: state.paths.map((p) => {
+        // If path is fully selected and not locked, scale all points
+        if (selection.pathIds.includes(p.id) && !p.locked) {
+          // Track all anchors as scaled
+          for (let i = 0; i < p.segments.length; i++) {
+            scaledPoints.push({ pathId: p.id, segmentIndex: i });
+          }
+          return {
+            ...p,
+            segments: p.segments.map((seg) => ({
+              p0: scalePointAround(seg.p0, center, scale),
+              c0: scalePointAround(seg.c0, center, scale),
+              c1: scalePointAround(seg.c1, center, scale),
+              p1: scalePointAround(seg.p1, center, scale),
+            })),
+          };
+        }
+        return p;
+      }),
+    };
+
+    // Move connected points that weren't already scaled
+    const scaledSet = new Set(scaledPoints.map((p) => `${p.pathId}:${p.segmentIndex}`));
+    for (const pt of scaledPoints) {
+      const connectedPoints = store.getConnectedPoints({ pathId: pt.pathId, segmentIndex: pt.segmentIndex, handleType: "anchor" });
+      for (const connPoint of connectedPoints) {
+        const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+        if (!scaledSet.has(key)) {
+          scaledSet.add(key);
+          // Get the current position of the connected point and scale it
+          const connPath = state.paths.find((p) => p.id === connPoint.pathId);
+          if (!connPath) continue;
+          const connOldPos = connPath.segments[connPoint.segmentIndex]?.p0;
+          if (!connOldPos) continue;
+
+          const newPos = scalePointAround(connOldPos, center, scale);
+          const dx = newPos.x - connOldPos.x;
+          const dy = newPos.y - connOldPos.y;
+
+          store._movePointInternal(connPoint.pathId, connPoint.segmentIndex, dx, dy);
+        }
+      }
+    }
+
+    throttledNotify();
+  },
+  // Commit scale to undo stack
+  commitScale: (id: string, scale: number, center: Point) => {
+    const cmd: Command = { type: "scalePath", id, scale, center };
+    state = {
+      ...state,
+      undoStack: [...state.undoStack, cmd],
+      redoStack: [],
+      isDirty: true,
+    };
+    notify();
+  },
+  // Commit scale for entire selection as a batch
+  commitScaleSelection: (scale: number, center: Point) => {
+    const { selection, paths } = state;
+    const commands: Command[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (path?.locked) continue; // Skip locked paths
+      commands.push({ type: "scalePath", id: pathId, scale, center });
+    }
+    if (commands.length === 0) return;
+    const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+    state = {
+      ...state,
+      undoStack: [...state.undoStack, cmd],
+      redoStack: [],
+      isDirty: true,
+    };
+    notify();
+  },
+  // Align selected paths horizontally (move all transform points to same X as selection center)
+  alignHorizontally: () => {
+    const { selection, paths } = state;
+    if (selection.pathIds.length < 2) return;
+
+    // Get the selection's transform point (target X coordinate)
+    const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+    const targetX = selectionTP.x;
+
+    // Calculate deltas for each path
+    const commands: Command[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue; // Skip locked paths
+      const pathTP = getPathTransformPoint(path);
+      const dx = targetX - pathTP.x;
+      if (Math.abs(dx) > 0.0001) {
+        // Apply translation immediately
+        state = {
+          ...state,
+          paths: state.paths.map((p) =>
+            p.id === pathId
+              ? {
+                  ...p,
+                  segments: p.segments.map((seg) => ({
+                    p0: { x: seg.p0.x + dx, y: seg.p0.y },
+                    c0: { x: seg.c0.x + dx, y: seg.c0.y },
+                    c1: { x: seg.c1.x + dx, y: seg.c1.y },
+                    p1: { x: seg.p1.x + dx, y: seg.p1.y },
+                  })),
+                  transformPoint: p.transformPoint
+                    ? { x: p.transformPoint.x + dx, y: p.transformPoint.y }
+                    : null,
+                }
+              : p
+          ),
+        };
+        commands.push({ type: "translatePath", id: pathId, dx, dy: 0 });
+      }
+    }
+
+    if (commands.length === 0) return;
+    const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+    state = {
+      ...state,
+      undoStack: [...state.undoStack, cmd],
+      redoStack: [],
+      isDirty: true,
+    };
+    notify();
+  },
+  // Align selected paths vertically (move all transform points to same Y as selection center)
+  alignVertically: () => {
+    const { selection, paths } = state;
+    if (selection.pathIds.length < 2) return;
+
+    // Get the selection's transform point (target Y coordinate)
+    const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+    const targetY = selectionTP.y;
+
+    // Calculate deltas for each path
+    const commands: Command[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue; // Skip locked paths
+      const pathTP = getPathTransformPoint(path);
+      const dy = targetY - pathTP.y;
+      if (Math.abs(dy) > 0.0001) {
+        // Apply translation immediately
+        state = {
+          ...state,
+          paths: state.paths.map((p) =>
+            p.id === pathId
+              ? {
+                  ...p,
+                  segments: p.segments.map((seg) => ({
+                    p0: { x: seg.p0.x, y: seg.p0.y + dy },
+                    c0: { x: seg.c0.x, y: seg.c0.y + dy },
+                    c1: { x: seg.c1.x, y: seg.c1.y + dy },
+                    p1: { x: seg.p1.x, y: seg.p1.y + dy },
+                  })),
+                  transformPoint: p.transformPoint
+                    ? { x: p.transformPoint.x, y: p.transformPoint.y + dy }
+                    : null,
+                }
+              : p
+          ),
+        };
+        commands.push({ type: "translatePath", id: pathId, dx: 0, dy });
+      }
+    }
+
+    if (commands.length === 0) return;
+    const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+    state = {
+      ...state,
+      undoStack: [...state.undoStack, cmd],
+      redoStack: [],
+      isDirty: true,
+    };
+    notify();
+  },
+  // Bake transform - apply animation transforms to geometry and reset them
+  bakeTransform: (id: string) => {
+    const path = state.paths.find((p) => p.id === id);
+    if (!path) return;
+
+    const { rot, scale } = path.transform;
+
+    // Nothing to bake if rotation is 0 and scale is 1
+    if (Math.abs(rot) < 0.0001 && Math.abs(scale - 1) < 0.0001) return;
+
+    // Get the transform point (pivot) for the transformation
+    const center = path.transformPoint || store.getPathCenter(id);
+    if (!center) return;
+
+    // Save the original path for undo
+    const prevPath = JSON.parse(JSON.stringify(path)) as typeof path;
+
+    // Apply the transform to all geometry points
+    const newSegments = path.segments.map((seg) => {
+      // First scale, then rotate around center
+      const scaleAndRotate = (pt: Point): Point => {
+        // Scale around center
+        let x = center.x + (pt.x - center.x) * scale;
+        let y = center.y + (pt.y - center.y) * scale;
+
+        // Rotate around center
+        if (rot !== 0) {
+          const cos = Math.cos(rot);
+          const sin = Math.sin(rot);
+          const dx = x - center.x;
+          const dy = y - center.y;
+          x = center.x + dx * cos - dy * sin;
+          y = center.y + dx * sin + dy * cos;
+        }
+
+        return { x, y };
+      };
+
+      return {
+        p0: scaleAndRotate(seg.p0),
+        c0: scaleAndRotate(seg.c0),
+        c1: scaleAndRotate(seg.c1),
+        p1: scaleAndRotate(seg.p1),
+      };
+    });
+
+    // Update the path with new geometry and reset transform
+    state = {
+      ...state,
+      paths: state.paths.map((p) => {
+        if (p.id !== id) return p;
+        return {
+          ...p,
+          segments: newSegments,
+          transform: {
+            ...p.transform,
+            rot: 0,
+            scale: 1,
+          },
+        };
+      }),
+    };
+
+    // Add to undo stack
+    const cmd: Command = { type: "bakeTransform", id, prevPath };
+    state = {
+      ...state,
+      undoStack: [...state.undoStack, cmd],
+      redoStack: [],
+      isDirty: true,
+    };
+
+    notify();
+  },
+  // Get path center by ID (bounding box center)
+  getPathCenter: (id: string): Point | null => {
+    const path = state.paths.find((p) => p.id === id);
+    if (!path || path.segments.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const seg of path.segments) {
+      for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+        minX = Math.min(minX, pt.x);
+        minY = Math.min(minY, pt.y);
+        maxX = Math.max(maxX, pt.x);
+        maxY = Math.max(maxY, pt.y);
+      }
+    }
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
   },
   // Internal helper: move a single anchor point without notify (for batch operations)
   _movePointInternal: (id: string, pointIndex: number, dx: number, dy: number) => {
@@ -891,18 +1445,21 @@ export const store = {
         snapConnections: [...state.snapConnections, { id: connId, points: snapConnection.points }],
         undoStack: [...state.undoStack, { type: "batch", commands: [moveCmd, snapCmd] }],
         redoStack: [],
+        isDirty: true,
       };
     } else {
       state = {
         ...state,
         undoStack: [...state.undoStack, moveCmd],
         redoStack: [],
+        isDirty: true,
       };
     }
     notify();
   },
   // Internal helper: move a single control handle without notify (for batch operations)
-  _moveHandleInternal: (id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number) => {
+  // constrainToMagnitude: when true and mirrorAngle is enabled, only allow magnitude changes (radial movement)
+  _moveHandleInternal: (id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number, constrainToMagnitude?: boolean) => {
     state = {
       ...state,
       paths: state.paths.map((p) => {
@@ -939,6 +1496,31 @@ export const store = {
         const mirrorAngle = anchorMeta?.mirrorAngle || false;
         const mirrorDistance = anchorMeta?.mirrorDistance || false;
 
+        // If constrainToMagnitude is true and mirrorAngle is enabled, project dx/dy onto radial direction
+        let effectiveDx = dx;
+        let effectiveDy = dy;
+        if (constrainToMagnitude && mirrorAngle) {
+          // Get anchor position
+          const anchor = anchorIndex < p.segments.length
+            ? p.segments[anchorIndex].p0
+            : p.segments[p.segments.length - 1].p1;
+          // Get current handle position
+          const seg = p.segments[segmentIndex];
+          const handle = handleType === "c0" ? seg.c0 : seg.c1;
+          // Calculate radial direction from anchor to handle
+          const radialX = handle.x - anchor.x;
+          const radialY = handle.y - anchor.y;
+          const radialDist = Math.sqrt(radialX * radialX + radialY * radialY);
+          if (radialDist > 0.001) {
+            // Project movement onto radial direction
+            const radialUnitX = radialX / radialDist;
+            const radialUnitY = radialY / radialDist;
+            const projection = dx * radialUnitX + dy * radialUnitY;
+            effectiveDx = projection * radialUnitX;
+            effectiveDy = projection * radialUnitY;
+          }
+        }
+
         // Check if the mirrored handle is active
         let mirroredActive = true;
         if (mirroredHandleType === "c0") {
@@ -957,9 +1539,9 @@ export const store = {
           segments: p.segments.map((seg, i) => {
             if (i === segmentIndex) {
               if (handleType === "c0") {
-                return { ...seg, c0: { x: seg.c0.x + dx, y: seg.c0.y + dy } };
+                return { ...seg, c0: { x: seg.c0.x + effectiveDx, y: seg.c0.y + effectiveDy } };
               } else if (handleType === "c1") {
-                return { ...seg, c1: { x: seg.c1.x + dx, y: seg.c1.y + dy } };
+                return { ...seg, c1: { x: seg.c1.x + effectiveDx, y: seg.c1.y + effectiveDy } };
               }
             }
 
@@ -967,8 +1549,8 @@ export const store = {
             if ((mirrorAngle || mirrorDistance) && mirroredActive && i === mirroredSegmentIndex && segmentIndex !== mirroredSegmentIndex) {
               const movedSeg = p.segments[segmentIndex];
               const movedHandle = handleType === "c0"
-                ? { x: movedSeg.c0.x + dx, y: movedSeg.c0.y + dy }
-                : { x: movedSeg.c1.x + dx, y: movedSeg.c1.y + dy };
+                ? { x: movedSeg.c0.x + effectiveDx, y: movedSeg.c0.y + effectiveDy }
+                : { x: movedSeg.c1.x + effectiveDx, y: movedSeg.c1.y + effectiveDy };
 
               // Calculate vector from anchor to moved handle
               const vecX = movedHandle.x - anchor.x;
@@ -1021,7 +1603,8 @@ export const store = {
 
   // Live handle move (no undo entry - used during drag)
   // Also moves connected control points and handles mirroring propagation
-  moveHandleLive: (id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number, movedPoints?: Set<string>) => {
+  // constrainToMagnitude: when true and mirrorAngle is enabled, only allow magnitude changes (radial movement)
+  moveHandleLive: (id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number, movedPoints?: Set<string>, constrainToMagnitude?: boolean) => {
     // Track which points we've moved to avoid infinite loops
     const moved = movedPoints || new Set<string>();
     const pointKey = `${id}:${segmentIndex}:${handleType}`;
@@ -1075,7 +1658,7 @@ export const store = {
     }
 
     // Move this handle (which also applies mirroring internally)
-    store._moveHandleInternal(id, segmentIndex, handleType, dx, dy);
+    store._moveHandleInternal(id, segmentIndex, handleType, dx, dy, constrainToMagnitude);
 
     // Move connected control points for the primary handle
     const connectedPoints = store.getConnectedPoints({ pathId: id, segmentIndex, handleType });
@@ -1132,12 +1715,14 @@ export const store = {
         snapConnections: [...state.snapConnections, { id: connId, points: snapConnection.points }],
         undoStack: [...state.undoStack, { type: "batch", commands: [moveCmd, snapCmd] }],
         redoStack: [],
+        isDirty: true,
       };
     } else {
       state = {
         ...state,
         undoStack: [...state.undoStack, moveCmd],
         redoStack: [],
+        isDirty: true,
       };
     }
     notify();
@@ -1231,7 +1816,8 @@ export const store = {
 
     executeCommand({ type: "toggleControl", id: pathId, anchorIndex, handleType: "right", prevMeta, newMeta, prevControlPos, newControlPos });
   },
-  setMirrorAngle: (pathId: string, anchorIndex: number, enabled: boolean) => {
+  // selectedHandle: if provided, only adjust the other handle to match the selected one
+  setMirrorAngle: (pathId: string, anchorIndex: number, enabled: boolean, selectedHandle?: "c0" | "c1") => {
     const path = state.paths.find((p) => p.id === pathId);
     if (!path || !path.anchorMeta) return;
     const prevMeta = path.anchorMeta[anchorIndex];
@@ -1254,9 +1840,43 @@ export const store = {
       const c0Active = prevMeta.rightActive;
       const c1Active = prevMeta.leftActive;
 
-      // If one is active and one is not, create the inactive one by mirroring
-      if (c0Active && !c1Active) {
-        // Mirror c0 to create c1
+      // If a specific handle is selected, adjust it to mirror the other one
+      if (selectedHandle === "c0" && c1Active) {
+        // c0 is selected - adjust c0 to mirror c1's angle (keep c0's distance)
+        const vecX = prevC1.x - anchor.x;
+        const vecY = prevC1.y - anchor.y;
+        const dist = Math.sqrt(vecX * vecX + vecY * vecY);
+        if (dist > 0.001) {
+          // Keep c0's current distance, just adjust its angle to mirror c1
+          const c0VecX = prevC0.x - anchor.x;
+          const c0VecY = prevC0.y - anchor.y;
+          const c0Dist = c0Active ? Math.sqrt(c0VecX * c0VecX + c0VecY * c0VecY) : dist;
+          const useDist = c0Dist > 0.001 ? c0Dist : dist;
+          newC0 = {
+            x: anchor.x - (vecX / dist) * useDist,
+            y: anchor.y - (vecY / dist) * useDist,
+          };
+          newMeta.rightActive = true;
+        }
+      } else if (selectedHandle === "c1" && c0Active) {
+        // c1 is selected - adjust c1 to mirror c0's angle (keep c1's distance)
+        const vecX = prevC0.x - anchor.x;
+        const vecY = prevC0.y - anchor.y;
+        const dist = Math.sqrt(vecX * vecX + vecY * vecY);
+        if (dist > 0.001) {
+          // Keep c1's current distance, just adjust its angle to mirror c0
+          const c1VecX = prevC1.x - anchor.x;
+          const c1VecY = prevC1.y - anchor.y;
+          const c1Dist = c1Active ? Math.sqrt(c1VecX * c1VecX + c1VecY * c1VecY) : dist;
+          const useDist = c1Dist > 0.001 ? c1Dist : dist;
+          newC1 = {
+            x: anchor.x - (vecX / dist) * useDist,
+            y: anchor.y - (vecY / dist) * useDist,
+          };
+          newMeta.leftActive = true;
+        }
+      } else if (c0Active && !c1Active) {
+        // No specific handle selected, c0 is active but c1 is not - mirror c0 to create c1
         const vecX = prevC0.x - anchor.x;
         const vecY = prevC0.y - anchor.y;
         const dist = Math.sqrt(vecX * vecX + vecY * vecY);
@@ -1268,7 +1888,7 @@ export const store = {
           newMeta.leftActive = true;
         }
       } else if (c1Active && !c0Active) {
-        // Mirror c1 to create c0
+        // No specific handle selected, c1 is active but c0 is not - mirror c1 to create c0
         const vecX = prevC1.x - anchor.x;
         const vecY = prevC1.y - anchor.y;
         const dist = Math.sqrt(vecX * vecX + vecY * vecY);
@@ -1279,8 +1899,8 @@ export const store = {
           };
           newMeta.rightActive = true;
         }
-      } else if (c0Active && c1Active) {
-        // Both active - use average angle and adjust both control points
+      } else if (c0Active && c1Active && !selectedHandle) {
+        // Both active, no specific handle selected - use average angle and adjust both
         const c0VecX = prevC0.x - anchor.x;
         const c0VecY = prevC0.y - anchor.y;
         const c0Dist = Math.sqrt(c0VecX * c0VecX + c0VecY * c0VecY);
@@ -1313,7 +1933,8 @@ export const store = {
 
     executeCommand({ type: "setMirror", id: pathId, anchorIndex, prevMeta, newMeta, prevC0, newC0, prevC1, newC1 });
   },
-  setMirrorDistance: (pathId: string, anchorIndex: number, enabled: boolean) => {
+  // selectedHandle: if provided, only adjust the other handle to match the selected one's distance
+  setMirrorDistance: (pathId: string, anchorIndex: number, enabled: boolean, selectedHandle?: "c0" | "c1") => {
     const path = state.paths.find((p) => p.id === pathId);
     if (!path || !path.anchorMeta) return;
     const prevMeta = path.anchorMeta[anchorIndex];
@@ -1336,9 +1957,59 @@ export const store = {
       const c0Active = prevMeta.rightActive;
       const c1Active = prevMeta.leftActive;
 
-      // If one is active and one is not, create the inactive one
-      if (c0Active && !c1Active) {
-        // Create c1 at same distance as c0, opposite direction
+      // If a specific handle is selected, adjust its distance to match the other one
+      if (selectedHandle === "c0" && c1Active) {
+        // c0 is selected - adjust c0's distance to match c1
+        const c1VecX = prevC1.x - anchor.x;
+        const c1VecY = prevC1.y - anchor.y;
+        const c1Dist = Math.sqrt(c1VecX * c1VecX + c1VecY * c1VecY);
+        if (c1Dist > 0.001) {
+          const c0VecX = prevC0.x - anchor.x;
+          const c0VecY = prevC0.y - anchor.y;
+          const c0Dist = c0Active ? Math.sqrt(c0VecX * c0VecX + c0VecY * c0VecY) : 0;
+          if (c0Dist > 0.001) {
+            // Scale c0 to match c1's distance
+            newC0 = {
+              x: anchor.x + (c0VecX / c0Dist) * c1Dist,
+              y: anchor.y + (c0VecY / c0Dist) * c1Dist,
+            };
+          } else {
+            // c0 doesn't exist - create it opposite to c1
+            newC0 = {
+              x: anchor.x - c1VecX,
+              y: anchor.y - c1VecY,
+            };
+            newMeta.rightActive = true;
+            newMeta.mirrorAngle = true;
+          }
+        }
+      } else if (selectedHandle === "c1" && c0Active) {
+        // c1 is selected - adjust c1's distance to match c0
+        const c0VecX = prevC0.x - anchor.x;
+        const c0VecY = prevC0.y - anchor.y;
+        const c0Dist = Math.sqrt(c0VecX * c0VecX + c0VecY * c0VecY);
+        if (c0Dist > 0.001) {
+          const c1VecX = prevC1.x - anchor.x;
+          const c1VecY = prevC1.y - anchor.y;
+          const c1Dist = c1Active ? Math.sqrt(c1VecX * c1VecX + c1VecY * c1VecY) : 0;
+          if (c1Dist > 0.001) {
+            // Scale c1 to match c0's distance
+            newC1 = {
+              x: anchor.x + (c1VecX / c1Dist) * c0Dist,
+              y: anchor.y + (c1VecY / c1Dist) * c0Dist,
+            };
+          } else {
+            // c1 doesn't exist - create it opposite to c0
+            newC1 = {
+              x: anchor.x - c0VecX,
+              y: anchor.y - c0VecY,
+            };
+            newMeta.leftActive = true;
+            newMeta.mirrorAngle = true;
+          }
+        }
+      } else if (c0Active && !c1Active) {
+        // No specific handle selected, c0 is active but c1 is not - create c1 at same distance
         const vecX = prevC0.x - anchor.x;
         const vecY = prevC0.y - anchor.y;
         const dist = Math.sqrt(vecX * vecX + vecY * vecY);
@@ -1351,7 +2022,7 @@ export const store = {
           newMeta.mirrorAngle = true; // Also enable angle mirroring
         }
       } else if (c1Active && !c0Active) {
-        // Create c0 at same distance as c1, opposite direction
+        // No specific handle selected, c1 is active but c0 is not - create c0 at same distance
         const vecX = prevC1.x - anchor.x;
         const vecY = prevC1.y - anchor.y;
         const dist = Math.sqrt(vecX * vecX + vecY * vecY);
@@ -1363,8 +2034,8 @@ export const store = {
           newMeta.rightActive = true;
           newMeta.mirrorAngle = true; // Also enable angle mirroring
         }
-      } else if (c0Active && c1Active) {
-        // Both active - use average distance and adjust both control points
+      } else if (c0Active && c1Active && !selectedHandle) {
+        // Both active, no specific handle selected - use average distance and adjust both
         const c0VecX = prevC0.x - anchor.x;
         const c0VecY = prevC0.y - anchor.y;
         const c0Dist = Math.sqrt(c0VecX * c0VecX + c0VecY * c0VecY);
@@ -1473,6 +2144,7 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, { type: "setAnchorMeta", id: pathId, anchorIndex, prevMeta, newMeta }],
       redoStack: [],
+      isDirty: true,
     };
     notify();
 
@@ -1583,6 +2255,7 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, cmd],
       redoStack: [],
+      isDirty: true,
     };
     notify();
 
@@ -1634,6 +2307,7 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, { type: "setPathFill", id: pathId, prevFill: originalFill, newFill: currentFill }],
       redoStack: [],
+      isDirty: true,
     };
     notify();
   },
@@ -1662,10 +2336,69 @@ export const store = {
     if (!path || path.locked === locked) return;
     executeCommand({ type: "setPathLocked", id: pathId, locked });
   },
+  setPathPlayerMask: (pathId: string, playerMask: boolean) => {
+    const path = state.paths.find((p) => p.id === pathId);
+    if (!path || path.playerMask === playerMask) return;
+    executeCommand({ type: "setPathPlayerMask", id: pathId, playerMask });
+  },
   setPathName: (pathId: string, name: string) => {
     const path = state.paths.find((p) => p.id === pathId);
     if (!path || path.name === name) return;
     executeCommand({ type: "setPathName", id: pathId, prevName: path.name, newName: name });
+  },
+  // Set transform point for a path or group (with undo)
+  setTransformPoint: (itemId: string, itemType: "path" | "group", point: Point | null) => {
+    if (itemType === "path") {
+      const path = state.paths.find((p) => p.id === itemId);
+      if (!path) return;
+      const prevPoint = path.transformPoint;
+      if ((prevPoint === null && point === null) ||
+          (prevPoint !== null && point !== null && prevPoint.x === point.x && prevPoint.y === point.y)) return;
+      executeCommand({ type: "setTransformPoint", itemId, itemType, prevPoint, newPoint: point });
+    } else {
+      const group = state.groups.find((g) => g.id === itemId);
+      if (!group) return;
+      const prevPoint = group.transformPoint;
+      if ((prevPoint === null && point === null) ||
+          (prevPoint !== null && point !== null && prevPoint.x === point.x && prevPoint.y === point.y)) return;
+      executeCommand({ type: "setTransformPoint", itemId, itemType, prevPoint, newPoint: point });
+    }
+  },
+  // Set transform point live (no undo - for dragging)
+  setTransformPointLive: (itemId: string, itemType: "path" | "group", point: Point) => {
+    if (itemType === "path") {
+      state = {
+        ...state,
+        paths: state.paths.map((p) =>
+          p.id === itemId ? { ...p, transformPoint: point } : p
+        ),
+      };
+    } else {
+      state = {
+        ...state,
+        groups: state.groups.map((g) =>
+          g.id === itemId ? { ...g, transformPoint: point } : g
+        ),
+      };
+    }
+    throttledNotify();
+  },
+  // Commit transform point change (for undo stack after drag)
+  commitTransformPoint: (itemId: string, itemType: "path" | "group", prevPoint: Point | null, newPoint: Point | null) => {
+    if ((prevPoint === null && newPoint === null) ||
+        (prevPoint !== null && newPoint !== null && prevPoint.x === newPoint.x && prevPoint.y === newPoint.y)) return;
+    const cmd: Command = { type: "setTransformPoint", itemId, itemType, prevPoint, newPoint };
+    state = {
+      ...state,
+      undoStack: [...state.undoStack, cmd],
+      redoStack: [],
+      isDirty: true,
+    };
+    notify();
+  },
+  // Clear transform point (reset to dynamic center)
+  clearTransformPoint: (itemId: string, itemType: "path" | "group") => {
+    store.setTransformPoint(itemId, itemType, null);
   },
   getNextPathName: (): string => {
     const name = `Path ${state.pathCounter}`;
@@ -1781,6 +2514,7 @@ export const store = {
       ...state,
       undoStack: [...state.undoStack, cmd],
       redoStack: [],
+      isDirty: true,
     };
     notify();
 
@@ -1840,18 +2574,27 @@ export const store = {
 
     // If full paths are selected, copy them
     if (selection.pathIds.length > 0) {
-      const copiedPaths = selection.pathIds
-        .map((id) => paths.find((p) => p.id === id))
-        .filter((p): p is Path => p !== undefined)
-        .map((p) => ({
-          ...p,
-          id: crypto.randomUUID(), // New ID for paste
-          segments: p.segments.map((seg) => ({ ...seg, p0: { ...seg.p0 }, c0: { ...seg.c0 }, c1: { ...seg.c1 }, p1: { ...seg.p1 } })),
-          anchorMeta: p.anchorMeta.map((m) => ({ ...m })),
-        }));
+      // Sort by paths array order (not selection order) to preserve relative z-order
+      const selectedSet = new Set(selection.pathIds);
+      const sourcePaths = paths.filter((p) => selectedSet.has(p.id));
+
+      const copiedPaths = sourcePaths.map((p) => ({
+        ...p,
+        id: crypto.randomUUID(), // New ID for paste
+        segments: p.segments.map((seg) => ({ ...seg, p0: { ...seg.p0 }, c0: { ...seg.c0 }, c1: { ...seg.c1 }, p1: { ...seg.p1 } })),
+        anchorMeta: p.anchorMeta.map((m) => ({ ...m })),
+      }));
 
       if (copiedPaths.length > 0) {
-        state = { ...state, clipboard: { type: "paths", paths: copiedPaths } };
+        state = {
+          ...state,
+          clipboard: {
+            type: "paths",
+            paths: copiedPaths,
+            sourceIds: sourcePaths.map((p) => p.id),
+            sourceNames: sourcePaths.map((p) => p.name),
+          },
+        };
         notify();
       }
       return;
@@ -1891,16 +2634,51 @@ export const store = {
     store.deleteSelection();
   },
   paste: () => {
-    const { clipboard } = state;
+    const { clipboard, paths } = state;
     if (!clipboard) return;
 
     if (clipboard.type === "paths") {
-      // Paste paths with new IDs and names (no offset), at root level
-      const pastedPaths = clipboard.paths.map((p) => ({
+      // Generate names with " 2", " 3" suffixes based on existing paths with same base name
+      const getNextCopyName = (baseName: string): string => {
+        // Strip existing " N" suffix to get the true base name
+        const baseMatch = baseName.match(/^(.+?) (\d+)$/);
+        const trueName = baseMatch ? baseMatch[1] : baseName;
+
+        // Find all existing paths with this base name or base name + number
+        const existingNumbers: number[] = [1]; // The original counts as "1"
+        for (const p of paths) {
+          if (p.name === trueName) {
+            existingNumbers.push(1);
+          } else {
+            const match = p.name.match(/^(.+?) (\d+)$/);
+            if (match && match[1] === trueName) {
+              existingNumbers.push(parseInt(match[2], 10));
+            }
+          }
+        }
+
+        // Find the next available number
+        const maxNum = Math.max(...existingNumbers);
+        return `${trueName} ${maxNum + 1}`;
+      };
+
+      // Determine parent for pasted paths: use source path's parent if it still exists
+      const getSourceParent = (index: number): string | null => {
+        const sourceId = clipboard.sourceIds[index];
+        const sourcePath = paths.find((p) => p.id === sourceId);
+        if (sourcePath) {
+          return sourcePath.parentId;
+        }
+        // Fallback: use the parentId from the copied path data
+        return clipboard.paths[index].parentId;
+      };
+
+      // Create pasted paths with proper names and parent
+      const pastedPaths = clipboard.paths.map((p, i) => ({
         ...p,
         id: crypto.randomUUID(),
-        name: store.getNextPathName(),
-        parentId: null, // Paste at root level
+        name: getNextCopyName(clipboard.sourceNames[i] || p.name),
+        parentId: getSourceParent(i),
         segments: p.segments.map((seg) => ({
           p0: { ...seg.p0 },
           c0: { ...seg.c0 },
@@ -1910,9 +2688,43 @@ export const store = {
         anchorMeta: p.anchorMeta.map((m) => ({ ...m })),
       }));
 
-      // Add all pasted paths
-      const commands: Command[] = pastedPaths.map((path) => ({ type: "addPath" as const, path }));
-      const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+      // Find the highest index among source paths that still exist
+      // Higher index = rendered on top = appears above in hierarchy
+      // Insert after the highest-indexed source path so pasted paths appear above
+      let insertAfterIdx = -1;
+      for (const sourceId of clipboard.sourceIds) {
+        const idx = paths.findIndex((p) => p.id === sourceId);
+        if (idx > insertAfterIdx) {
+          insertAfterIdx = idx;
+        }
+      }
+
+      // Insert position is right after the highest source path
+      const insertPos = insertAfterIdx + 1;
+
+      // Build the target path order: insert pasted paths at the calculated position
+      const newPathIds = [
+        ...paths.slice(0, insertPos).map((p) => p.id),
+        ...pastedPaths.map((p) => p.id),
+        ...paths.slice(insertPos).map((p) => p.id),
+      ];
+
+      // Create a single batch command: add paths + reorder (if needed)
+      const addCommands: Command[] = pastedPaths.map((path) => ({ type: "addPath" as const, path }));
+      // Need to reorder if inserting anywhere other than the end
+      const needsReorder = insertPos < paths.length;
+
+      if (needsReorder) {
+        // After adding, paths will be at end. Calculate prevPathIds for reorder.
+        const pathIdsAfterAdd = [...paths.map((p) => p.id), ...pastedPaths.map((p) => p.id)];
+        addCommands.push({
+          type: "reorderPaths",
+          prevPathIds: pathIdsAfterAdd,
+          newPathIds: newPathIds,
+        });
+      }
+
+      const cmd: Command = addCommands.length === 1 ? addCommands[0] : { type: "batch", commands: addCommands };
       executeCommand(cmd);
 
       // Select the pasted paths
@@ -1933,6 +2745,7 @@ export const store = {
       ...state,
       undoStack: state.undoStack.slice(0, -1),
       redoStack: [...state.redoStack, cmd],
+      isDirty: true,
     };
     notify();
   },
@@ -1944,6 +2757,7 @@ export const store = {
       ...state,
       redoStack: state.redoStack.slice(0, -1),
       undoStack: [...state.undoStack, cmd],
+      isDirty: true,
     };
     notify();
   },
@@ -2045,8 +2859,12 @@ export const store = {
       anchorMeta: meta1,
       closed: true,
       fill: path.fill,
+      opacity: path.opacity,
       visible: path.visible,
       locked: path.locked,
+      playerMask: path.playerMask,
+      transform: { ...path.transform },
+      transformPoint: null, // Reset for new path
     };
 
     const newPath2: Path = {
@@ -2057,8 +2875,12 @@ export const store = {
       anchorMeta: meta2,
       closed: true,
       fill: path.fill,
+      opacity: path.opacity,
       visible: path.visible,
       locked: path.locked,
+      playerMask: path.playerMask,
+      transform: { ...path.transform },
+      transformPoint: null, // Reset for new path
     };
 
     // Create snap connections for the split points (they're at the same position)
@@ -2346,19 +3168,25 @@ export const store = {
       name: store.getNextGroupName(),
       parentId,
       collapsed: false,
+      transformPoint: null,
     };
     executeCommand({ type: "addGroup", group });
     return group.id;
   },
 
   // Get the ancestor chain for an item (path or group), from immediate parent to root
-  getAncestorChain: (parentId: string | null): string[] => {
-    const chain: string[] = [];
+  // Returns Group objects (not just IDs) for use with animation transforms
+  getAncestorChain: (parentId: string | null): Group[] => {
+    const chain: Group[] = [];
     let current = parentId;
     while (current) {
-      chain.push(current);
       const group = state.groups.find((g) => g.id === current);
-      current = group?.parentId ?? null;
+      if (group) {
+        chain.push(group);
+        current = group.parentId;
+      } else {
+        break;
+      }
     }
     return chain;
   },
@@ -2367,7 +3195,7 @@ export const store = {
   findLowestCommonAncestor: (parentIds: (string | null)[]): string | null => {
     if (parentIds.length === 0) return null;
 
-    // Get ancestor chains for all items
+    // Get ancestor chains for all items (as Group objects)
     const chains = parentIds.map((pid) => store.getAncestorChain(pid));
 
     // If any item is at root level, LCA is root
@@ -2377,11 +3205,11 @@ export const store = {
 
     // Find common ancestors by checking each ancestor in the first chain
     const firstChain = chains[0];
-    for (const ancestorId of firstChain) {
+    for (const ancestor of firstChain) {
       // Check if this ancestor appears in all other chains
-      const isCommon = chains.every((chain) => chain.includes(ancestorId));
+      const isCommon = chains.every((chain) => chain.some((g) => g.id === ancestor.id));
       if (isCommon) {
-        return ancestorId;
+        return ancestor.id;
       }
     }
 
@@ -2405,6 +3233,7 @@ export const store = {
       name: store.getNextGroupName(),
       parentId: commonAncestor,
       collapsed: false,
+      transformPoint: null,
     };
 
     const commands: Command[] = [{ type: "addGroup", group }];
@@ -2434,10 +3263,9 @@ export const store = {
         // ancestorChain goes from immediate parent toward root
         // We want the one whose parent is commonAncestor
         let groupToMove: string | null = null;
-        for (const ancestorId of ancestorChain) {
-          const ancestorGroup = state.groups.find((g) => g.id === ancestorId);
-          if (ancestorGroup?.parentId === commonAncestor) {
-            groupToMove = ancestorId;
+        for (const ancestor of ancestorChain) {
+          if (ancestor.parentId === commonAncestor) {
+            groupToMove = ancestor.id;
             break;
           }
         }
@@ -2566,7 +3394,9 @@ export const store = {
   selectGroup: (groupId: string) => {
     // Select all descendant paths
     const pathIds = store.getDescendantPathIds(groupId);
-    state = { ...state, selection: { pathIds, points: [] } };
+    const newSelection = { pathIds, points: [] };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection);
     notify();
   },
 
@@ -2587,8 +3417,146 @@ export const store = {
       newPathIds = [...new Set([...currentSelected, ...pathIds])];
     }
 
-    state = { ...state, selection: { pathIds: newPathIds, points: [] } };
+    const newSelection = { pathIds: newPathIds, points: [] };
+    state = { ...state, selection: newSelection };
+    saveSelection(newSelection);
     notify();
+  },
+
+  // Reorder a path within the paths array (affects z-order)
+  reorderPath: (pathId: string, newIndex: number) => {
+    const prevIndex = state.paths.findIndex((p) => p.id === pathId);
+    if (prevIndex === -1 || prevIndex === newIndex) return;
+    // Clamp newIndex to valid range
+    const clampedIndex = Math.max(0, Math.min(state.paths.length - 1, newIndex));
+    if (prevIndex === clampedIndex) return;
+    executeCommand({ type: "reorderItem", itemId: pathId, itemType: "path", prevIndex, newIndex: clampedIndex });
+  },
+
+  // Reorder a group within the groups array
+  reorderGroup: (groupId: string, newIndex: number) => {
+    const prevIndex = state.groups.findIndex((g) => g.id === groupId);
+    if (prevIndex === -1 || prevIndex === newIndex) return;
+    const clampedIndex = Math.max(0, Math.min(state.groups.length - 1, newIndex));
+    if (prevIndex === clampedIndex) return;
+    executeCommand({ type: "reorderItem", itemId: groupId, itemType: "group", prevIndex, newIndex: clampedIndex });
+  },
+
+  // Move item to a different parent group (or root if null)
+  moveItemToGroup: (itemId: string, itemType: "path" | "group", newParentId: string | null) => {
+    if (itemType === "path") {
+      const path = state.paths.find((p) => p.id === itemId);
+      if (!path || path.parentId === newParentId) return;
+      executeCommand({ type: "moveToGroup", itemId, itemType: "path", prevParentId: path.parentId, newParentId });
+    } else {
+      const group = state.groups.find((g) => g.id === itemId);
+      if (!group || group.parentId === newParentId) return;
+      // Prevent moving a group into itself or its descendants
+      if (newParentId) {
+        const ancestors = store.getAncestorChain(newParentId);
+        if (ancestors.some((a) => a.id === itemId) || newParentId === itemId) return;
+      }
+      executeCommand({ type: "moveToGroup", itemId, itemType: "group", prevParentId: group.parentId, newParentId });
+    }
+  },
+
+  // Reposition paths to be before or after a target path in the array
+  // When moving a group, moves all its descendant paths together
+  repositionItem: (
+    itemId: string,
+    itemType: "path" | "group",
+    targetId: string,
+    targetType: "path" | "group",
+    position: "before" | "after"
+  ) => {
+    // Get the path IDs that need to be moved (preserving their relative order)
+    let pathIdsToMove: string[];
+    if (itemType === "path") {
+      pathIdsToMove = [itemId];
+    } else {
+      // Get all descendant paths of the group, in their current array order
+      const descendantIds = new Set(store.getDescendantPathIds(itemId));
+      pathIdsToMove = state.paths.filter((p) => descendantIds.has(p.id)).map((p) => p.id);
+    }
+
+    if (pathIdsToMove.length === 0) return;
+
+    // Find the target index in the paths array
+    let targetIndex: number;
+    if (targetType === "path") {
+      targetIndex = state.paths.findIndex((p) => p.id === targetId);
+    } else {
+      // For a group target, find the first or last path in the group
+      const groupPathIds = new Set(store.getDescendantPathIds(targetId));
+      if (groupPathIds.size === 0) return; // Empty group, can't position relative to it
+
+      if (position === "before") {
+        // Find the first path that belongs to this group
+        targetIndex = state.paths.findIndex((p) => groupPathIds.has(p.id));
+      } else {
+        // Find the last path that belongs to this group
+        for (let i = state.paths.length - 1; i >= 0; i--) {
+          if (groupPathIds.has(state.paths[i].id)) {
+            targetIndex = i;
+            break;
+          }
+        }
+        targetIndex = targetIndex!;
+      }
+    }
+
+    if (targetIndex === -1) return;
+
+    // Build the new paths array
+    const movingSet = new Set(pathIdsToMove);
+    const pathsWithoutMoving = state.paths.filter((p) => !movingSet.has(p.id));
+    const movingPaths = state.paths.filter((p) => movingSet.has(p.id));
+
+    // Find where to insert in the filtered array
+    let insertIndex: number;
+    if (targetType === "path") {
+      insertIndex = pathsWithoutMoving.findIndex((p) => p.id === targetId);
+      if (insertIndex === -1) {
+        // Target was one of the moving paths, use original target index logic
+        insertIndex = position === "before" ? targetIndex : targetIndex + 1;
+        insertIndex = Math.min(insertIndex, pathsWithoutMoving.length);
+      } else if (position === "after") {
+        insertIndex++;
+      }
+    } else {
+      // For group target, find position relative to group's paths in the filtered array
+      const groupPathIds = new Set(store.getDescendantPathIds(targetId));
+      if (position === "before") {
+        insertIndex = pathsWithoutMoving.findIndex((p) => groupPathIds.has(p.id));
+        if (insertIndex === -1) insertIndex = 0;
+      } else {
+        insertIndex = pathsWithoutMoving.length;
+        for (let i = pathsWithoutMoving.length - 1; i >= 0; i--) {
+          if (groupPathIds.has(pathsWithoutMoving[i].id)) {
+            insertIndex = i + 1;
+            break;
+          }
+        }
+      }
+    }
+
+    // Create the new array
+    const newPaths = [
+      ...pathsWithoutMoving.slice(0, insertIndex),
+      ...movingPaths,
+      ...pathsWithoutMoving.slice(insertIndex),
+    ];
+
+    // Check if anything actually changed
+    const changed = newPaths.some((p, i) => p.id !== state.paths[i].id);
+    if (!changed) return;
+
+    // Use the reorderPaths command for proper undo support
+    executeCommand({
+      type: "reorderPaths",
+      prevPathIds: state.paths.map((p) => p.id),
+      newPathIds: newPaths.map((p) => p.id),
+    });
   },
 
   // =========================================================================
@@ -3048,7 +4016,744 @@ export const store = {
       executeCommand({ type: "batch", commands });
     }
   },
+
+  // Animation actions
+  addAnimationClip: (clip: AnimationClip) => {
+    // Add empty keyframe at time 0 for all existing paths (user will tick properties they want)
+    const clipWithDefaults: AnimationClip = {
+      ...clip,
+      parts: { ...clip.parts },
+    };
+    for (const path of state.paths) {
+      // Create an empty unified keyframe at t=0 (no properties set)
+      clipWithDefaults.parts[path.id] = [{ t: 0 }];
+    }
+    executeCommand({ type: "addAnimationClip", clip: clipWithDefaults });
+    // Auto-select the new clip and select the first keyframe if there's a path
+    const firstPath = state.paths[0];
+    state = {
+      ...state,
+      currentClipId: clipWithDefaults.id,
+      selectedKeyframe: firstPath ? { pathId: firstPath.id, time: 0 } : null,
+    };
+    notify();
+  },
+
+  deleteAnimationClip: (clipId: string) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+    executeCommand({ type: "deleteAnimationClip", clip });
+    // Deselect if we deleted the current clip
+    if (state.currentClipId === clipId) {
+      const newClipId = state.animationClips[0]?.id ?? null;
+      state = { ...state, currentClipId: newClipId };
+      try {
+        if (newClipId) {
+          localStorage.setItem("estme:currentClipId", newClipId);
+        } else {
+          localStorage.removeItem("estme:currentClipId");
+        }
+      } catch {
+        // Ignore localStorage errors
+      }
+      notify();
+    }
+  },
+
+  selectAnimationClip: (clipId: string | null) => {
+    state = { ...state, currentClipId: clipId };
+    try {
+      if (clipId) {
+        localStorage.setItem("estme:currentClipId", clipId);
+      } else {
+        localStorage.removeItem("estme:currentClipId");
+      }
+    } catch {
+      // Ignore localStorage errors
+    }
+    notify();
+  },
+
+  updateAnimationClip: (clipId: string, updates: Partial<Omit<AnimationClip, "id">>) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+    const newClip = { ...clip, ...updates };
+    executeCommand({ type: "updateAnimationClip", prevClip: clip, newClip });
+  },
+
+  // Set a property value on a keyframe (creates keyframe if needed)
+  setKeyframeProperty: (
+    clipId: string,
+    partId: string,
+    property: AnimatableProperty,
+    t: number,
+    value: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const prevAnimation = clip.parts[partId] ?? [];
+    const newAnimation = setKeyframeProperty(prevAnimation, t, property, value);
+
+    executeCommand({
+      type: "setPartAnimation",
+      clipId,
+      partId,
+      prevAnimation,
+      newAnimation,
+    });
+  },
+
+  // Set a property value on a keyframe LIVE (no undo entry - used during drag)
+  setKeyframePropertyLive: (
+    clipId: string,
+    partId: string,
+    property: AnimatableProperty,
+    t: number,
+    value: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const prevAnimation = clip.parts[partId] ?? [];
+    const newAnimation = setKeyframeProperty(prevAnimation, t, property, value);
+
+    // Update state directly without adding to undo stack
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === clipId
+          ? { ...c, parts: { ...c.parts, [partId]: newAnimation } }
+          : c
+      ),
+    };
+    throttledNotify();
+  },
+
+  // Commit a keyframe property change (adds undo entry after live editing)
+  commitKeyframeProperty: (
+    clipId: string,
+    partId: string,
+    prevAnimation: PartAnimation,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const newAnimation = clip.parts[partId] ?? [];
+
+    // Only add undo entry if something changed
+    // Use recordCommand instead of executeCommand since state is already correct
+    if (JSON.stringify(prevAnimation) !== JSON.stringify(newAnimation)) {
+      recordCommand({
+        type: "setPartAnimation",
+        clipId,
+        partId,
+        prevAnimation,
+        newAnimation,
+      });
+    }
+  },
+
+  // Unset a property on a keyframe (removes keyframe if no properties left)
+  unsetKeyframeProperty: (
+    clipId: string,
+    partId: string,
+    property: AnimatableProperty,
+    t: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const partAnim = clip.parts[partId];
+    if (!partAnim) return;
+
+    const prevAnimation = partAnim;
+    const newAnimation = unsetKeyframeProperty(prevAnimation, t, property);
+
+    executeCommand({
+      type: "setPartAnimation",
+      clipId,
+      partId,
+      prevAnimation,
+      newAnimation,
+    });
+  },
+
+  // Create an empty keyframe (no properties set) at a specific time
+  createEmptyKeyframe: (
+    clipId: string,
+    partId: string,
+    t: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const prevAnimation = clip.parts[partId] ?? [];
+
+    // Check if keyframe already exists at this time
+    const existingIndex = prevAnimation.findIndex((kf) => Math.abs(kf.t - t) < 0.0001);
+    if (existingIndex >= 0) {
+      // Keyframe already exists, nothing to do
+      return;
+    }
+
+    // Find the most immediate (closest in time) existing keyframe to copy properties from
+    let closestKeyframe: typeof prevAnimation[0] | null = null;
+    let closestDistance = Infinity;
+    for (const kf of prevAnimation) {
+      const distance = Math.abs(kf.t - t);
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closestKeyframe = kf;
+      }
+    }
+
+    // Create new keyframe, copying properties from closest keyframe if one exists
+    let newKeyframe: typeof prevAnimation[0] = { t };
+    if (closestKeyframe) {
+      // Copy all properties except 't' from the closest keyframe
+      newKeyframe = { ...closestKeyframe, t };
+    }
+
+    const newAnimation = [...prevAnimation, newKeyframe];
+    newAnimation.sort((a, b) => a.t - b.t);
+
+    executeCommand({
+      type: "setPartAnimation",
+      clipId,
+      partId,
+      prevAnimation,
+      newAnimation,
+    });
+  },
+
+  // Delete an entire keyframe (all properties at that time)
+  deleteKeyframe: (
+    clipId: string,
+    partId: string,
+    t: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const partAnim = clip.parts[partId];
+    if (!partAnim) return;
+
+    const prevAnimation = partAnim;
+    const newAnimation = removeKeyframe(prevAnimation, t);
+
+    executeCommand({
+      type: "setPartAnimation",
+      clipId,
+      partId,
+      prevAnimation,
+      newAnimation,
+    });
+  },
+
+  // Change the time of a keyframe
+  changeKeyframeTime: (
+    clipId: string,
+    partId: string,
+    oldTime: number,
+    newTime: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const partAnim = clip.parts[partId];
+    if (!partAnim) return;
+
+    const prevAnimation = partAnim;
+    const newAnimation = changeKeyframeTime(prevAnimation, oldTime, newTime);
+
+    executeCommand({
+      type: "setPartAnimation",
+      clipId,
+      partId,
+      prevAnimation,
+      newAnimation,
+    });
+
+    // Update selected keyframe time if it was the one being moved
+    if (state.selectedKeyframe &&
+        state.selectedKeyframe.pathId === partId &&
+        Math.abs(state.selectedKeyframe.time - oldTime) < 0.0001) {
+      state = { ...state, selectedKeyframe: { pathId: partId, time: newTime } };
+      notify();
+    }
+  },
+
+  setPlaybackTime: (time: number) => {
+    state = { ...state, playbackTime: time };
+    notify();
+  },
+
+  setIsPlaying: (isPlaying: boolean) => {
+    state = { ...state, isPlaying };
+    notify();
+  },
+
+  togglePlayback: () => {
+    state = { ...state, isPlaying: !state.isPlaying };
+    notify();
+  },
+
+  // Transform-based path manipulation (for animation)
+  // Updates animation keyframes if a clip is active for live visual feedback
+  translatePathTransform: (id: string, dx: number, dy: number) => {
+    const path = state.paths.find((p) => p.id === id);
+    if (!path) return;
+
+    // If we have an active animation clip, update keyframes directly for live feedback
+    if (state.currentClipId) {
+      const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+      if (clip) {
+        const t = state.playbackTime;
+        const prevAnimation = clip.parts[id] ?? [];
+
+        // Get current tx/ty values at this time (interpolated or from keyframe)
+        const currentTx = getPropertyValue(prevAnimation, "tx", t);
+        const currentTy = getPropertyValue(prevAnimation, "ty", t);
+
+        // Set new tx and ty on the keyframe at this time
+        let newAnimation = setKeyframeProperty(prevAnimation, t, "tx", currentTx + dx);
+        newAnimation = setKeyframeProperty(newAnimation, t, "ty", currentTy + dy);
+
+        state = {
+          ...state,
+          animationClips: state.animationClips.map((c) =>
+            c.id === state.currentClipId
+              ? { ...c, parts: { ...c.parts, [id]: newAnimation } }
+              : c
+          ),
+          selectedKeyframe: { pathId: id, time: t },
+        };
+        throttledNotify();
+        return;
+      }
+    }
+
+    // Fallback: update path transform directly (no animation clip active)
+    const newTransform = {
+      ...path.transform,
+      tx: path.transform.tx + dx,
+      ty: path.transform.ty + dy,
+    };
+
+    state = {
+      ...state,
+      paths: state.paths.map((p) =>
+        p.id === id ? { ...p, transform: newTransform } : p
+      ),
+    };
+    throttledNotify();
+  },
+
+  commitTranslateTransform: (id: string, prevAnimation: PartAnimation | null) => {
+    // In animation mode, the keyframes have already been updated by live editing
+    // We just need to record the undo entry
+    if (state.currentClipId && prevAnimation !== null) {
+      const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+      if (clip) {
+        const newAnimation = clip.parts[id] ?? [];
+
+        // Only record if something changed
+        if (JSON.stringify(prevAnimation) !== JSON.stringify(newAnimation)) {
+          recordCommand({
+            type: "setPartAnimation",
+            clipId: state.currentClipId,
+            partId: id,
+            prevAnimation,
+            newAnimation,
+          });
+        }
+      }
+    }
+  },
+
+  rotatePathTransform: (id: string, angle: number) => {
+    const path = state.paths.find((p) => p.id === id);
+    if (!path) return;
+
+    // If we have an active animation clip, update keyframes directly for live feedback
+    if (state.currentClipId) {
+      const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+      if (clip) {
+        const t = state.playbackTime;
+        const prevAnimation = clip.parts[id] ?? [];
+
+        // Get current rotation value at this time (interpolated or from keyframe)
+        const currentRot = getPropertyValue(prevAnimation, "rot", t);
+
+        // Set new rotation on the keyframe at this time
+        const newAnimation = setKeyframeProperty(prevAnimation, t, "rot", currentRot + angle);
+
+        state = {
+          ...state,
+          animationClips: state.animationClips.map((c) =>
+            c.id === state.currentClipId
+              ? { ...c, parts: { ...c.parts, [id]: newAnimation } }
+              : c
+          ),
+          selectedKeyframe: { pathId: id, time: t },
+        };
+        throttledNotify();
+        return;
+      }
+    }
+
+    // Fallback: update path transform directly (no animation clip active)
+    const newTransform = {
+      ...path.transform,
+      rot: path.transform.rot + angle,
+    };
+
+    state = {
+      ...state,
+      paths: state.paths.map((p) =>
+        p.id === id ? { ...p, transform: newTransform } : p
+      ),
+    };
+    throttledNotify();
+  },
+
+  commitRotateTransform: (id: string, prevAnimation: PartAnimation | null) => {
+    // In animation mode, the keyframes have already been updated by live editing
+    // We just need to record the undo entry
+    if (state.currentClipId && prevAnimation !== null) {
+      const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+      if (clip) {
+        const newAnimation = clip.parts[id] ?? [];
+
+        // Only record if something changed
+        if (JSON.stringify(prevAnimation) !== JSON.stringify(newAnimation)) {
+          recordCommand({
+            type: "setPartAnimation",
+            clipId: state.currentClipId,
+            partId: id,
+            prevAnimation,
+            newAnimation,
+          });
+        }
+      }
+    }
+  },
+
+  // Translate all selected paths in animation mode
+  translateSelectionTransform: (dx: number, dy: number) => {
+    if (!state.currentClipId) return;
+
+    const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+    if (!clip) return;
+
+    const t = state.playbackTime;
+    const selectedPathIds = state.selection.pathIds;
+    if (selectedPathIds.length === 0) return;
+
+    // Update keyframes for all selected paths
+    const newParts = { ...clip.parts };
+    for (const pathId of selectedPathIds) {
+      const path = state.paths.find((p) => p.id === pathId);
+      if (!path) continue;
+
+      const prevAnimation = newParts[pathId] ?? [];
+      const currentTx = getPropertyValue(prevAnimation, "tx", t);
+      const currentTy = getPropertyValue(prevAnimation, "ty", t);
+
+      let newAnimation = setKeyframeProperty(prevAnimation, t, "tx", currentTx + dx);
+      newAnimation = setKeyframeProperty(newAnimation, t, "ty", currentTy + dy);
+      newParts[pathId] = newAnimation;
+    }
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === state.currentClipId ? { ...c, parts: newParts } : c
+      ),
+      // Select keyframe of first path in selection
+      selectedKeyframe: selectedPathIds.length > 0
+        ? { pathId: selectedPathIds[0], time: t }
+        : state.selectedKeyframe,
+    };
+    throttledNotify();
+  },
+
+  // Rotate all selected paths in animation mode
+  rotateSelectionTransform: (angle: number) => {
+    if (!state.currentClipId) return;
+
+    const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+    if (!clip) return;
+
+    const t = state.playbackTime;
+    const selectedPathIds = state.selection.pathIds;
+    if (selectedPathIds.length === 0) return;
+
+    // Update keyframes for all selected paths
+    const newParts = { ...clip.parts };
+    for (const pathId of selectedPathIds) {
+      const path = state.paths.find((p) => p.id === pathId);
+      if (!path) continue;
+
+      const prevAnimation = newParts[pathId] ?? [];
+      const currentRot = getPropertyValue(prevAnimation, "rot", t);
+
+      const newAnimation = setKeyframeProperty(prevAnimation, t, "rot", currentRot + angle);
+      newParts[pathId] = newAnimation;
+    }
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === state.currentClipId ? { ...c, parts: newParts } : c
+      ),
+      // Select keyframe of first path in selection
+      selectedKeyframe: selectedPathIds.length > 0
+        ? { pathId: selectedPathIds[0], time: t }
+        : state.selectedKeyframe,
+    };
+    throttledNotify();
+  },
+
+  // Commit selection translation in animation mode (for undo)
+  commitTranslateSelectionTransform: (prevAnimations: Map<string, PartAnimation>) => {
+    if (!state.currentClipId) return;
+
+    const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+    if (!clip) return;
+
+    // Collect all commands for batch undo
+    const commands: Command[] = [];
+    for (const [pathId, prevAnimation] of prevAnimations) {
+      const newAnimation = clip.parts[pathId] ?? [];
+
+      if (JSON.stringify(prevAnimation) !== JSON.stringify(newAnimation)) {
+        commands.push({
+          type: "setPartAnimation",
+          clipId: state.currentClipId,
+          partId: pathId,
+          prevAnimation,
+          newAnimation,
+        });
+      }
+    }
+
+    // Record as a single batch command for atomic undo
+    if (commands.length > 0) {
+      const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+      recordCommand(cmd);
+    }
+  },
+
+  // Commit selection rotation in animation mode (for undo)
+  commitRotateSelectionTransform: (prevAnimations: Map<string, PartAnimation>) => {
+    if (!state.currentClipId) return;
+
+    const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+    if (!clip) return;
+
+    // Collect all commands for batch undo
+    const commands: Command[] = [];
+    for (const [pathId, prevAnimation] of prevAnimations) {
+      const newAnimation = clip.parts[pathId] ?? [];
+
+      if (JSON.stringify(prevAnimation) !== JSON.stringify(newAnimation)) {
+        commands.push({
+          type: "setPartAnimation",
+          clipId: state.currentClipId,
+          partId: pathId,
+          prevAnimation,
+          newAnimation,
+        });
+      }
+    }
+
+    // Record as a single batch command for atomic undo
+    if (commands.length > 0) {
+      const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+      recordCommand(cmd);
+    }
+  },
+
+  // Check if we should use transform-based or geometry-based movement
+  hasActiveAnimationClip: (): boolean => {
+    return state.currentClipId !== null;
+  },
+
+  // Keyframe selection
+  selectKeyframe: (keyframe: SelectedKeyframe) => {
+    state = { ...state, selectedKeyframe: keyframe };
+    notify();
+  },
+
+  clearKeyframeSelection: () => {
+    state = { ...state, selectedKeyframe: null };
+    notify();
+  },
+
+  // Get the unified keyframe at the selected time
+  getSelectedKeyframe: () => {
+    if (!state.selectedKeyframe || !state.currentClipId) return null;
+    const { pathId, time } = state.selectedKeyframe;
+    const clip = state.animationClips.find((c) => c.id === state.currentClipId);
+    if (!clip) return null;
+    const partAnim = clip.parts[pathId];
+    if (!partAnim) return null;
+    return partAnim.find((kf) => Math.abs(kf.t - time) < 0.0001) ?? null;
+  },
+
+  // ============================================================================
+  // Document save/load
+  // ============================================================================
+
+  // Get document data for saving
+  getDocumentData: () => {
+    return {
+      version: 1,
+      id: state.documentId,
+      name: state.documentName,
+      paths: state.paths,
+      groups: state.groups,
+      snapConnections: state.snapConnections,
+      animationClips: state.animationClips,
+      pathCounter: state.pathCounter,
+      groupCounter: state.groupCounter,
+    };
+  },
+
+  // Load document from saved data
+  // If documentId is provided, use it (from IndexedDB open) - not dirty
+  // If documentId is null, use ID from file data or generate new (from file load) - dirty (needs saving)
+  // If documentId is undefined, preserve existing documentId (for autosave reload)
+  loadDocument: (data: {
+    version?: number;
+    id?: string | null;
+    name?: string;
+    paths: Path[];
+    groups: Group[];
+    snapConnections?: SnapConnection[];
+    animationClips?: AnimationClip[];
+    pathCounter?: number;
+    groupCounter?: number;
+  }, documentId?: string | null) => {
+    // undefined = preserve existing, null = use file's id or generate new, string = use provided
+    const id = documentId === undefined
+      ? state.documentId
+      : (documentId ?? data.id ?? generateId());
+    const isFromStorage = documentId != null && documentId !== undefined;
+    // Migrate paths: ensure newer properties exist with defaults
+    const migratedPaths = (data.paths || []).map((p) => ({
+      ...p,
+      playerMask: p.playerMask ?? false,
+      visible: p.visible ?? true,
+      locked: p.locked ?? false,
+    }));
+    // Load selection and filter to only include paths that exist in this document
+    const pathIdSet = new Set(migratedPaths.map((p) => p.id));
+    const groupIdSet = new Set((data.groups || []).map((g) => g.id));
+    const savedSelection = loadSelection();
+    const validSelection: Selection = {
+      pathIds: savedSelection.pathIds.filter((id) => pathIdSet.has(id) || groupIdSet.has(id)),
+      points: [],
+    };
+    state = {
+      ...initialState,
+      isLoadingDocument: false, // Done loading
+      documentId: id,
+      documentName: data.name || "untitled",
+      isDirty: !isFromStorage, // Dirty if loaded from file (not yet in storage)
+      paths: migratedPaths,
+      groups: data.groups || [],
+      snapConnections: data.snapConnections || [],
+      animationClips: data.animationClips || [],
+      pathCounter: data.pathCounter || (data.paths?.length || 0) + 1,
+      groupCounter: data.groupCounter || (data.groups?.length || 0) + 1,
+      // Preserve UI settings
+      showAllPoints: state.showAllPoints,
+      showAllControlPoints: state.showAllControlPoints,
+      showTransformPoints: state.showTransformPoints,
+      // Restore valid selection
+      selection: validSelection,
+    };
+    if (id) setCurrentDocumentId(id);
+    saveSelection(validSelection);
+    notify();
+  },
+
+  // Set document ID (for IndexedDB storage)
+  setDocumentId: (id: string | null) => {
+    state = { ...state, documentId: id };
+    setCurrentDocumentId(id);
+    notify();
+  },
+
+  // Create a new empty document
+  newDocument: () => {
+    const newId = generateId();
+    state = {
+      ...initialState,
+      isLoadingDocument: false, // Done loading
+      documentId: newId,
+      // Preserve UI settings
+      showAllPoints: state.showAllPoints,
+      showAllControlPoints: state.showAllControlPoints,
+      showTransformPoints: state.showTransformPoints,
+      // Clear selection for new document
+      selection: emptySelection,
+    };
+    setCurrentDocumentId(newId);
+    saveSelection(emptySelection);
+    notify();
+  },
+
+  // Set document name (marks document as dirty)
+  setDocumentName: (name: string) => {
+    state = { ...state, documentName: name, isDirty: true };
+    notify();
+  },
+
+  // Mark document as clean (no unsaved changes)
+  markClean: () => {
+    state = { ...state, isDirty: false };
+    notify();
+  },
+
+  // Mark document as dirty (has unsaved changes)
+  markDirty: () => {
+    state = { ...state, isDirty: true };
+    notify();
+  },
+
+  // Instance properties (not part of document, stored in localStorage)
+  setInstanceOpacity: (opacity: number) => {
+    const instanceProperties = { ...state.instanceProperties, opacity: Math.max(0, Math.min(1, opacity)) };
+    state = { ...state, instanceProperties };
+    saveInstanceProperties(instanceProperties);
+    notify();
+  },
+  setInstanceVertexColor: (vertexColor: string) => {
+    const instanceProperties = { ...state.instanceProperties, vertexColor };
+    state = { ...state, instanceProperties };
+    saveInstanceProperties(instanceProperties);
+    notify();
+  },
+  setInstanceAccentColor: (accentColor: string) => {
+    const instanceProperties = { ...state.instanceProperties, accentColor };
+    state = { ...state, instanceProperties };
+    saveInstanceProperties(instanceProperties);
+    notify();
+  },
+  setInstanceMinimapMask: (minimapMask: boolean) => {
+    const instanceProperties = { ...state.instanceProperties, minimapMask };
+    state = { ...state, instanceProperties };
+    saveInstanceProperties(instanceProperties);
+    notify();
+  },
 };
+
+// Import AnimationClip, AnimatableProperty, and keyframe utilities for use in store
+import { AnimationClip, AnimatableProperty, PartAnimation, setKeyframeProperty, unsetKeyframeProperty, removeKeyframe, changeKeyframeTime, getOrCreateKeyframe, getPropertyValue } from "../animation.ts";
 
 export function useStore<T>(selector: (state: EditorState) => T): T {
   return useSyncExternalStore(

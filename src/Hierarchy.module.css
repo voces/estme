@@ -1,6 +1,7 @@
 .hierarchy {
   font-size: 12px;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .title {
@@ -153,4 +154,58 @@
 .groupIcon {
   font-size: 12px;
   flex-shrink: 0;
+}
+
+/* Drag and drop styles */
+.item.dragging {
+  opacity: 0.5;
+}
+
+.item {
+  position: relative;
+}
+
+.item.dropBefore::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: var(--drop-indent, 0);
+  right: 0;
+  height: 2px;
+  background: #4488ff;
+  pointer-events: none;
+}
+
+.item.dropAfter::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: var(--drop-indent, 0);
+  right: 0;
+  height: 2px;
+  background: #4488ff;
+  pointer-events: none;
+}
+
+.item.dropInto {
+  background: #3a4a6a;
+  box-shadow: inset 0 0 0 2px #4488ff;
+}
+
+/* Group end drop zone - invisible until dragging */
+.groupEndDropZone {
+  height: 8px;
+  position: relative;
+}
+
+.groupEndDropZone.dropAfter::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: var(--drop-indent, 0);
+  right: 0;
+  height: 2px;
+  background: #4488ff;
+  transform: translateY(-50%);
+  pointer-events: none;
 }

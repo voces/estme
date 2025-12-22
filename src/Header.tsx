@@ -8,6 +8,7 @@ export const Header = () => {
   const paths = useStore((s) => s.paths);
   const showAllPoints = useStore((s) => s.showAllPoints);
   const showAllControlPoints = useStore((s) => s.showAllControlPoints);
+  const showTransformPoints = useStore((s) => s.showTransformPoints);
   const clipboard = useStore((s) => s.clipboard);
   const canDelete = selection.pathIds.length > 0 || selection.points.length > 0;
   const canCopy = selection.pathIds.length > 0 || selection.points.some((p) => p.handleType === "anchor");
@@ -33,6 +34,9 @@ export const Header = () => {
   const canIntersect = useStore(() => store.canIntersect());
   const canSubtract = useStore(() => store.canSubtract());
   const canExclude = useStore(() => store.canExclude());
+
+  // Check if alignment is possible (need 2+ selected paths)
+  const canAlign = selection.pathIds.length >= 2;
 
   return (
     <header className={styles.header}>
@@ -99,9 +103,6 @@ export const Header = () => {
         >
           {"\u{1F4C4}"}
         </button>
-      </div>
-      <div className={styles.separator} />
-      <div className={styles.buttonGroup}>
         <button
           className={`${styles.button} ${!canDelete ? styles.disabled : ""}`}
           onClick={() => store.deleteSelection()}
@@ -110,6 +111,9 @@ export const Header = () => {
         >
           {"\u{1F5D1}"}
         </button>
+      </div>
+      <div className={styles.separator} />
+      <div className={styles.buttonGroup}>
         <button
           className={`${styles.button} ${!canSplit ? styles.disabled : ""}`}
           onClick={() => store.splitPath()}
@@ -150,6 +154,28 @@ export const Header = () => {
         >
           {"\u2296"}
         </button>
+      </div>
+      <div className={styles.separator} />
+      <div className={styles.buttonGroup}>
+        <button
+          className={`${styles.button} ${!canAlign ? styles.disabled : ""}`}
+          onClick={() => store.alignHorizontally()}
+          disabled={!canAlign}
+          title="Align Horizontally (centers)"
+        >
+          {"\u2550"}
+        </button>
+        <button
+          className={`${styles.button} ${!canAlign ? styles.disabled : ""}`}
+          onClick={() => store.alignVertically()}
+          disabled={!canAlign}
+          title="Align Vertically (centers)"
+        >
+          {"\u2551"}
+        </button>
+      </div>
+      <div className={styles.separator} />
+      <div className={styles.buttonGroup}>
         <button
           className={`${styles.button} ${showAllPoints ? styles.active : ""}`}
           onClick={() => store.toggleShowAllPoints()}
@@ -163,6 +189,13 @@ export const Header = () => {
           title="Show All Control Points (,)"
         >
           {"\u25CE"}
+        </button>
+        <button
+          className={`${styles.button} ${showTransformPoints ? styles.active : ""}`}
+          onClick={() => store.toggleShowTransformPoints()}
+          title="Show Transform Points (/)"
+        >
+          {"\u2316"}
         </button>
       </div>
     </header>

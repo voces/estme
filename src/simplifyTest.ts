@@ -6,19 +6,23 @@
  */
 
 import paper from "paper";
-import { Path, Point } from "./types.ts";
+import { defaultTransform, Path, Point } from "./types.ts";
 
 // Test path data - replace with actual test path
 export const TEST_PATH: Path = {
   id: "test-path",
   name: "Test Path",
   segments: [], // Will be populated with test data
+  anchorMeta: [],
   closed: true,
   fill: "#ff0000",
   opacity: 1,
   visible: true,
   locked: false,
+  playerMask: false,
   parentId: null,
+  transform: defaultTransform(),
+  transformPoint: null,
 };
 
 // Convert our Path to paper.js Path

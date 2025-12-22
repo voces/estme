@@ -1,4 +1,4 @@
-import { CubicSegment, HandleType, Path, Point, PointReference } from "./types.ts";
+import { CubicSegment, Group, HandleType, Path, Point, PointReference } from "./types.ts";
 
 // Anchor point with identity info for snap connection tracking
 export type AnchorPointWithInfo = {
@@ -26,6 +26,13 @@ export function subtractPoints(a: Point, b: Point): Point {
 
 export function scalePoint(p: Point, s: number): Point {
   return { x: p.x * s, y: p.y * s };
+}
+
+export function scalePointAround(p: Point, center: Point, scale: number): Point {
+  return {
+    x: center.x + (p.x - center.x) * scale,
+    y: center.y + (p.y - center.y) * scale,
+  };
 }
 
 export function rotatePoint(p: Point, center: Point, angle: number): Point {
@@ -217,15 +224,86 @@ export function splitBezierAt(
 // Path utilities
 // ============================================================================
 
-// Get path center (centroid of anchors)
+// Get path center (bounding box center including control points)
 export function getPathCenter(path: Path): Point {
-  let sumX = 0;
-  let sumY = 0;
-  for (const seg of path.segments) {
-    sumX += seg.p0.x;
-    sumY += seg.p0.y;
+  if (path.segments.length === 0) {
+    return { x: 0, y: 0 };
   }
-  return { x: sumX / path.segments.length, y: sumY / path.segments.length };
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const seg of path.segments) {
+    for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+      minX = Math.min(minX, pt.x);
+      minY = Math.min(minY, pt.y);
+      maxX = Math.max(maxX, pt.x);
+      maxY = Math.max(maxY, pt.y);
+    }
+  }
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+}
+
+// Get effective transform point for a path (custom if set, otherwise dynamic center)
+export function getPathTransformPoint(path: Path): Point {
+  if (path.transformPoint) {
+    return path.transformPoint;
+  }
+  return getPathCenter(path);
+}
+
+// Get effective transform point for a group (custom if set, otherwise center of children)
+export function getGroupTransformPoint(
+  group: Group,
+  paths: Path[],
+  groups: Group[]
+): Point {
+  if (group.transformPoint) {
+    return group.transformPoint;
+  }
+  return getGroupCenter(group, paths, groups);
+}
+
+// Get center of a group (bounding box center of all descendant paths)
+export function getGroupCenter(
+  group: Group,
+  paths: Path[],
+  groups: Group[]
+): Point {
+  // Find all paths that are descendants
+  const descendantPaths: Path[] = [];
+
+  function collectDescendants(parentId: string) {
+    // Add direct child paths
+    for (const path of paths) {
+      if (path.parentId === parentId) {
+        descendantPaths.push(path);
+      }
+    }
+    // Recurse into child groups
+    for (const g of groups) {
+      if (g.parentId === parentId) {
+        collectDescendants(g.id);
+      }
+    }
+  }
+
+  collectDescendants(group.id);
+
+  if (descendantPaths.length === 0) {
+    return { x: 0, y: 0 };
+  }
+
+  // Compute bounding box of all descendant paths
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const path of descendantPaths) {
+    for (const seg of path.segments) {
+      for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+        minX = Math.min(minX, pt.x);
+        minY = Math.min(minY, pt.y);
+        maxX = Math.max(maxX, pt.x);
+        maxY = Math.max(maxY, pt.y);
+      }
+    }
+  }
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
 }
 
 // Get all anchor points from a path
@@ -243,22 +321,99 @@ export function hasVertexColors(path: Path): boolean {
   return path.anchorMeta?.some((meta) => meta.color !== null) ?? false;
 }
 
-// Get center of multiple paths
+// Get center of multiple paths (bounding box center)
 export function getSelectionCenter(paths: Path[], pathIds: string[]): Point {
-  let sumX = 0;
-  let sumY = 0;
-  let count = 0;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  let hasPoints = false;
+
   for (const pathId of pathIds) {
     const path = paths.find((p) => p.id === pathId);
     if (path) {
-      const center = getPathCenter(path);
-      sumX += center.x;
-      sumY += center.y;
-      count++;
+      for (const seg of path.segments) {
+        for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+          minX = Math.min(minX, pt.x);
+          minY = Math.min(minY, pt.y);
+          maxX = Math.max(maxX, pt.x);
+          maxY = Math.max(maxY, pt.y);
+          hasPoints = true;
+        }
+      }
     }
   }
-  if (count === 0) return { x: 0, y: 0 };
-  return { x: sumX / count, y: sumY / count };
+
+  if (!hasPoints) return { x: 0, y: 0 };
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+}
+
+// Get transform point of multiple paths
+// If any path has a custom transform point, use bounding center of custom transform points
+// Otherwise, use bounding center of geometry
+export function getSelectionTransformPoint(paths: Path[], pathIds: string[]): Point {
+  // Collect paths and check for custom transform points
+  const selectedPaths: Path[] = [];
+  const customTransformPoints: Point[] = [];
+
+  for (const pathId of pathIds) {
+    const path = paths.find((p) => p.id === pathId);
+    if (path) {
+      selectedPaths.push(path);
+      if (path.transformPoint) {
+        customTransformPoints.push(path.transformPoint);
+      }
+    }
+  }
+
+  if (selectedPaths.length === 0) return { x: 0, y: 0 };
+
+  // If any path has a custom transform point, use bounding center of those points
+  if (customTransformPoints.length > 0) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const pt of customTransformPoints) {
+      minX = Math.min(minX, pt.x);
+      minY = Math.min(minY, pt.y);
+      maxX = Math.max(maxX, pt.x);
+      maxY = Math.max(maxY, pt.y);
+    }
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  }
+
+  // Otherwise, use bounding center of geometry
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const path of selectedPaths) {
+    for (const seg of path.segments) {
+      for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+        minX = Math.min(minX, pt.x);
+        minY = Math.min(minY, pt.y);
+        maxX = Math.max(maxX, pt.x);
+        maxY = Math.max(maxY, pt.y);
+      }
+    }
+  }
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+}
+
+// Get bounding box center of multiple paths (for dynamic transform point of multi-selection)
+export function getSelectionBoundingCenter(paths: Path[], pathIds: string[]): Point {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  let hasPoints = false;
+
+  for (const pathId of pathIds) {
+    const path = paths.find((p) => p.id === pathId);
+    if (path) {
+      for (const seg of path.segments) {
+        for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+          minX = Math.min(minX, pt.x);
+          minY = Math.min(minY, pt.y);
+          maxX = Math.max(maxX, pt.x);
+          maxY = Math.max(maxY, pt.y);
+          hasPoints = true;
+        }
+      }
+    }
+  }
+
+  if (!hasPoints) return { x: 0, y: 0 };
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
 }
 
 // Get path angle (from center to first anchor, in degrees)

@@ -1,13 +1,19 @@
 import { useState, useEffect, useRef } from "react";
 import { store, useStore, PointSelection, Selection } from "./store/index.ts";
+import { InstanceProperties as InstancePropertiesType } from "./store/types.ts";
 import { Path, Point, PointReference, HandleType } from "./types.ts";
+import { AnimatableProperty, ANIMATABLE_PROPERTIES, propertyColors, UnifiedKeyframe, defaultPropertyValues } from "./animation.ts";
 import {
   averageColors,
   getAnchorColor,
   getAnchorPosition,
   getPathAngle,
   getPathCenter,
+  getPathTransformPoint,
+  getGroupTransformPoint,
+  getGroupCenter,
 } from "./geometry.ts";
+import { Group } from "./types.ts";
 import styles from "./Properties.module.css";
 
 // Round to avoid floating point display issues like "-0.000"
@@ -141,15 +147,24 @@ function DraggableNumberInput({ value, onChange, min, max, step = 1, decimals = 
   );
 }
 
-// Calculate center of multiple paths/points (includes individual point selections)
+// Calculate center of multiple paths/points as bounding box center (includes individual point selections)
 function getMultiSelectionCenter(paths: Path[], selection: Selection): Point | null {
-  const allPoints: Point[] = [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  let hasPoints = false;
 
-  // Add centroid of each fully selected path
+  // Add all geometry points from fully selected paths
   for (const pathId of selection.pathIds) {
     const path = paths.find((p) => p.id === pathId);
     if (path) {
-      allPoints.push(getPathCenter(path));
+      for (const seg of path.segments) {
+        for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+          minX = Math.min(minX, pt.x);
+          minY = Math.min(minY, pt.y);
+          maxX = Math.max(maxX, pt.x);
+          maxY = Math.max(maxY, pt.y);
+          hasPoints = true;
+        }
+      }
     }
   }
 
@@ -158,44 +173,177 @@ function getMultiSelectionCenter(paths: Path[], selection: Selection): Point | n
     const path = paths.find((p) => p.id === pointSel.pathId);
     if (!path) continue;
 
+    let pt: Point;
     if (pointSel.handleType === "anchor") {
-      allPoints.push(getAnchorPosition(path, pointSel.segmentIndex));
+      pt = getAnchorPosition(path, pointSel.segmentIndex);
     } else if (pointSel.handleType === "c0") {
-      allPoints.push(path.segments[pointSel.segmentIndex].c0);
-    } else if (pointSel.handleType === "c1") {
-      allPoints.push(path.segments[pointSel.segmentIndex].c1);
+      pt = path.segments[pointSel.segmentIndex].c0;
+    } else {
+      pt = path.segments[pointSel.segmentIndex].c1;
     }
+    minX = Math.min(minX, pt.x);
+    minY = Math.min(minY, pt.y);
+    maxX = Math.max(maxX, pt.x);
+    maxY = Math.max(maxY, pt.y);
+    hasPoints = true;
   }
 
-  if (allPoints.length === 0) return null;
+  if (!hasPoints) return null;
 
-  let sumX = 0, sumY = 0;
-  for (const p of allPoints) {
-    sumX += p.x;
-    sumY += p.y;
-  }
-  return { x: sumX / allPoints.length, y: sumY / allPoints.length };
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+}
+
+const PROPERTY_LABELS: Record<AnimatableProperty, string> = {
+  tx: "Translate X",
+  ty: "Translate Y",
+  rot: "Rotation",
+  scale: "Scale",
+  opacity: "Opacity",
+};
+
+// Instance properties section (global rendering properties not part of document)
+function InstancePropertiesSection() {
+  const instanceProperties = useStore((s) => s.instanceProperties);
+
+  return (
+    <>
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Instance Properties</div>
+        <div className={styles.hint}>Rendering properties (not saved with document)</div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Opacity</div>
+        <div className={styles.row}>
+          <DraggableNumberInput
+            value={Math.round(instanceProperties.opacity * 100)}
+            min={0}
+            max={100}
+            step={1}
+            decimals={0}
+            suffix="%"
+            onChange={(v) => store.setInstanceOpacity(v / 100)}
+          />
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Vertex Color</div>
+        <div className={styles.colorRow}>
+          <input
+            type="color"
+            className={styles.colorInput}
+            value={instanceProperties.vertexColor}
+            onChange={(e) => store.setInstanceVertexColor(e.target.value)}
+          />
+          <span className={styles.colorValue}>{instanceProperties.vertexColor}</span>
+        </div>
+        <div className={styles.hint}>Multiplied with per-vertex colors</div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Accent Color</div>
+        <div className={styles.colorRow}>
+          <input
+            type="color"
+            className={styles.colorInput}
+            value={instanceProperties.accentColor}
+            onChange={(e) => store.setInstanceAccentColor(e.target.value)}
+          />
+          <span className={styles.colorValue}>{instanceProperties.accentColor}</span>
+        </div>
+        <div className={styles.hint}>For player-masked vertices</div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.checkboxRow}>
+          <input
+            type="checkbox"
+            id="minimapMask"
+            checked={instanceProperties.minimapMask}
+            onChange={(e) => store.setInstanceMinimapMask(e.target.checked)}
+          />
+          <label htmlFor="minimapMask">Minimap Mask</label>
+        </div>
+        <div className={styles.hint}>Render as solid accent color silhouette</div>
+      </div>
+    </>
+  );
 }
 
 export const Properties = () => {
   const selection = useStore((s) => s.selection);
   const paths = useStore((s) => s.paths);
+  const groups = useStore((s) => s.groups);
+  const selectedKeyframe = useStore((s) => s.selectedKeyframe);
+  const currentClipId = useStore((s) => s.currentClipId);
+  const animationClips = useStore((s) => s.animationClips);
+
+  // If a keyframe is selected, show unified keyframe editor
+  if (selectedKeyframe && currentClipId) {
+    const clip = animationClips.find((c) => c.id === currentClipId);
+    // Check both paths and groups for the item name
+    const path = paths.find((p) => p.id === selectedKeyframe.pathId);
+    const group = groups.find((g) => g.id === selectedKeyframe.pathId);
+    const itemName = path?.name ?? group?.name ?? "Unknown";
+    const unifiedKeyframe = store.getSelectedKeyframe();
+
+    if (unifiedKeyframe) {
+      return (
+        <UnifiedKeyframeProperties
+          clipId={currentClipId}
+          pathId={selectedKeyframe.pathId}
+          pathName={itemName}
+          clipName={clip?.name ?? ""}
+          keyframe={unifiedKeyframe}
+          clipDuration={clip?.duration ?? 1}
+        />
+      );
+    }
+  }
 
   const hasSelection = selection.pathIds.length > 0 || selection.points.length > 0;
 
   if (!hasSelection) {
     return (
       <div className={styles.properties}>
-        <div className={styles.empty}>No path selected</div>
+        <InstancePropertiesSection />
       </div>
     );
   }
 
   // Check if we have a single path fully selected (show full path properties)
   if (selection.pathIds.length === 1 && selection.points.length === 0) {
+    // First check if this ID is a group
+    const group = groups.find((g) => g.id === selection.pathIds[0]);
+    if (group) {
+      return <GroupProperties group={group} paths={paths} groups={groups} />;
+    }
+    // Otherwise it's a path
     const path = paths.find((p) => p.id === selection.pathIds[0]);
     if (path) {
       return <PathProperties path={path} pathId={selection.pathIds[0]} />;
+    }
+  }
+
+  // Check if selection matches a group exactly (all children of a single group)
+  if (selection.pathIds.length > 0 && selection.points.length === 0) {
+    // Find if there's a group whose children exactly match selection.pathIds
+    for (const group of groups) {
+      const childPathIds = paths
+        .filter((p) => p.parentId === group.id)
+        .map((p) => p.id);
+      const childGroupIds = groups
+        .filter((g) => g.parentId === group.id)
+        .map((g) => g.id);
+      const allChildIds = [...childPathIds, ...childGroupIds];
+
+      // Check if selection matches exactly the children of this group
+      if (allChildIds.length === selection.pathIds.length &&
+          selection.pathIds.every((id) => allChildIds.includes(id)) &&
+          allChildIds.every((id) => selection.pathIds.includes(id))) {
+        return <GroupProperties group={group} paths={paths} groups={groups} />;
+      }
     }
   }
 
@@ -220,6 +368,20 @@ export const Properties = () => {
 function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selection: Selection }) {
   const center = getMultiSelectionCenter(paths, selection);
   const count = selection.pathIds.length + selection.points.length;
+
+  const handleCenterChange = (axis: "x" | "y", value: number) => {
+    if (!center) return;
+    const dx = axis === "x" ? value - center.x : 0;
+    const dy = axis === "y" ? value - center.y : 0;
+    if (dx !== 0 || dy !== 0) {
+      // Translate all selected paths
+      for (const pathId of selection.pathIds) {
+        store.translatePathLive(pathId, dx, dy);
+      }
+      // Commit as a batch
+      store.commitTranslateSelection(dx, dy);
+    }
+  };
 
   // Collect all vertex colors in the selection
   const vertexColors: string[] = [];
@@ -288,11 +450,45 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
         <div className={styles.sectionTitle}>Center</div>
         <div className={styles.row}>
           <label>X</label>
-          <span className={styles.value}>{formatNumber(center.x, 3)}</span>
+          <DraggableNumberInput
+            value={center.x}
+            min={-100000}
+            max={100000}
+            step={0.1}
+            decimals={3}
+            onChange={(v) => handleCenterChange("x", v)}
+          />
         </div>
         <div className={styles.row}>
           <label>Y</label>
-          <span className={styles.value}>{formatNumber(center.y, 3)}</span>
+          <DraggableNumberInput
+            value={center.y}
+            min={-100000}
+            max={100000}
+            step={0.1}
+            decimals={3}
+            onChange={(v) => handleCenterChange("y", v)}
+          />
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Align</div>
+        <div className={styles.buttonRow}>
+          <button
+            className={styles.smallButton}
+            onClick={() => store.alignHorizontally()}
+            title="Align transform points horizontally"
+          >
+            ⇔ Horizontal
+          </button>
+          <button
+            className={styles.smallButton}
+            onClick={() => store.alignVertically()}
+            title="Align transform points vertically"
+          >
+            ⇕ Vertical
+          </button>
         </div>
       </div>
     </div>
@@ -376,6 +572,15 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
             onChange={(v) => store.setPathOpacity(path.id, v / 100)}
           />
         </div>
+        <div className={styles.checkboxRow}>
+          <input
+            type="checkbox"
+            id={`playerMask-${pathId}`}
+            checked={path.playerMask}
+            onChange={(e) => store.setPathPlayerMask(path.id, e.target.checked)}
+          />
+          <label htmlFor={`playerMask-${pathId}`}>Accent Color</label>
+        </div>
       </div>
 
       <div className={styles.section}>
@@ -410,6 +615,147 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
           />
         </div>
       </div>
+
+      <TransformPointSection itemId={pathId} itemType="path" path={path} />
+
+      {(path.transform.rot !== 0 || path.transform.scale !== 1) && (
+        <div className={styles.section}>
+          <div className={styles.sectionTitle}>Animation Transform</div>
+          <div className={styles.row}>
+            <label>Rot</label>
+            <span className={styles.value}>{formatNumber(path.transform.rot * (180 / Math.PI), 1)}°</span>
+          </div>
+          <div className={styles.row}>
+            <label>Scale</label>
+            <span className={styles.value}>{formatNumber(path.transform.scale * 100, 0)}%</span>
+          </div>
+          <button
+            className={styles.resetButton}
+            onClick={() => store.bakeTransform(pathId)}
+            title="Apply rotation and scale to geometry, resetting them to identity"
+            style={{ width: "100%", marginTop: "4px" }}
+          >
+            Bake Transform
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Transform point editing section
+function TransformPointSection({ itemId, itemType, path, group, allPaths, allGroups }: {
+  itemId: string;
+  itemType: "path" | "group";
+  path?: Path;
+  group?: Group;
+  allPaths?: Path[];
+  allGroups?: Group[];
+}) {
+  const currentPoint = itemType === "path" && path
+    ? getPathTransformPoint(path)
+    : itemType === "group" && group && allPaths && allGroups
+    ? getGroupTransformPoint(group, allPaths, allGroups)
+    : null;
+
+  const isCustom = itemType === "path" && path
+    ? path.transformPoint !== null
+    : itemType === "group" && group
+    ? group.transformPoint !== null
+    : false;
+
+  if (!currentPoint) return null;
+
+  const handleTransformPointChange = (axis: "x" | "y", value: string) => {
+    const num = parseFloat(value);
+    if (isNaN(num)) return;
+    const newPoint: Point = {
+      x: axis === "x" ? num : currentPoint.x,
+      y: axis === "y" ? num : currentPoint.y,
+    };
+    store.setTransformPoint(itemId, itemType, newPoint);
+  };
+
+  const handleReset = () => {
+    store.clearTransformPoint(itemId, itemType);
+  };
+
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionTitle}>
+        <span>Transform Point</span>
+        {isCustom && (
+          <button className={styles.resetButton} onClick={handleReset} title="Reset to dynamic center">
+            Reset
+          </button>
+        )}
+      </div>
+      <div className={styles.row}>
+        <label>X</label>
+        <NumberInput
+          value={currentPoint.x}
+          step="0.1"
+          onChange={(v) => handleTransformPointChange("x", v)}
+        />
+      </div>
+      <div className={styles.row}>
+        <label>Y</label>
+        <NumberInput
+          value={currentPoint.y}
+          step="0.1"
+          onChange={(v) => handleTransformPointChange("y", v)}
+        />
+      </div>
+      {!isCustom && (
+        <div className={styles.hint}>Dynamic (follows geometry)</div>
+      )}
+    </div>
+  );
+}
+
+// Group properties
+function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]; groups: Group[] }) {
+  const center = getGroupCenter(group, paths, groups);
+
+  // Count direct children
+  const childPathCount = paths.filter((p) => p.parentId === group.id).length;
+  const childGroupCount = groups.filter((g) => g.parentId === group.id).length;
+
+  return (
+    <div className={styles.properties}>
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Group</div>
+        <div className={styles.row}>
+          <label>Name</label>
+          <span className={styles.value}>{group.name}</span>
+        </div>
+        <div className={styles.row}>
+          <label>Children</label>
+          <span className={styles.value}>
+            {childPathCount} path{childPathCount !== 1 ? "s" : ""}, {childGroupCount} group{childGroupCount !== 1 ? "s" : ""}
+          </span>
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Center</div>
+        <div className={styles.row}>
+          <label>X</label>
+          <span className={styles.value}>{formatNumber(center.x, 3)}</span>
+        </div>
+        <div className={styles.row}>
+          <label>Y</label>
+          <span className={styles.value}>{formatNumber(center.y, 3)}</span>
+        </div>
+      </div>
+
+      <TransformPointSection
+        itemId={group.id}
+        itemType="group"
+        group={group}
+        allPaths={paths}
+        allGroups={groups}
+      />
     </div>
   );
 }
@@ -698,10 +1044,41 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
   };
 
   // Calculate angle and magnitude relative to anchor
-  const dx = controlPoint.x - anchor.x;
-  const dy = controlPoint.y - anchor.y;
-  const magnitude = Math.sqrt(dx * dx + dy * dy);
-  const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+  const vecX = controlPoint.x - anchor.x;
+  const vecY = controlPoint.y - anchor.y;
+  const magnitude = Math.sqrt(vecX * vecX + vecY * vecY);
+  const angle = Math.atan2(vecY, vecX) * (180 / Math.PI);
+
+  const handleAngleChange = (value: string) => {
+    const newAngle = parseFloat(value);
+    if (isNaN(newAngle)) return;
+    const newAngleRad = newAngle * (Math.PI / 180);
+    // Keep the same magnitude, change the angle
+    const newX = anchor.x + Math.cos(newAngleRad) * magnitude;
+    const newY = anchor.y + Math.sin(newAngleRad) * magnitude;
+    const dx = newX - controlPoint.x;
+    const dy = newY - controlPoint.y;
+    if (dx !== 0 || dy !== 0) {
+      store.moveHandleLive(pathId, segmentIndex, handleType, dx, dy);
+      store.commitMoveHandle(pathId, segmentIndex, handleType, dx, dy);
+    }
+  };
+
+  const handleMagnitudeChange = (value: string) => {
+    const newMagnitude = parseFloat(value);
+    if (isNaN(newMagnitude) || newMagnitude < 0) return;
+    if (magnitude < 0.001) return; // Can't scale from zero
+    // Keep the same direction, change the magnitude
+    const scale = newMagnitude / magnitude;
+    const newX = anchor.x + vecX * scale;
+    const newY = anchor.y + vecY * scale;
+    const dx = newX - controlPoint.x;
+    const dy = newY - controlPoint.y;
+    if (dx !== 0 || dy !== 0) {
+      store.moveHandleLive(pathId, segmentIndex, handleType, dx, dy);
+      store.commitMoveHandle(pathId, segmentIndex, handleType, dx, dy);
+    }
+  };
 
   return (
     <div className={styles.properties}>
@@ -729,11 +1106,20 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
         <div className={styles.sectionTitle}>Relative to Anchor</div>
         <div className={styles.row}>
           <label>Angle</label>
-          <span className={styles.value}>{angle.toFixed(1)}°</span>
+          <NumberInput
+            value={angle}
+            step="1"
+            onChange={handleAngleChange}
+          />
+          <span className={styles.unit}>°</span>
         </div>
         <div className={styles.row}>
           <label>Dist</label>
-          <span className={styles.value}>{magnitude.toFixed(3)}</span>
+          <NumberInput
+            value={magnitude}
+            step="0.01"
+            onChange={handleMagnitudeChange}
+          />
         </div>
       </div>
 
@@ -747,7 +1133,7 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
             type="checkbox"
             id="mirrorAngle"
             checked={meta.mirrorAngle}
-            onChange={() => store.setMirrorAngle(pathId, anchorIndex, !meta.mirrorAngle)}
+            onChange={() => store.setMirrorAngle(pathId, anchorIndex, !meta.mirrorAngle, handleType)}
           />
           <label htmlFor="mirrorAngle">Lock angles (180°)</label>
         </div>
@@ -756,13 +1142,296 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
             type="checkbox"
             id="mirrorDistance"
             checked={meta.mirrorDistance}
-            onChange={() => store.setMirrorDistance(pathId, anchorIndex, !meta.mirrorDistance)}
+            onChange={() => store.setMirrorDistance(pathId, anchorIndex, !meta.mirrorDistance, handleType)}
           />
           <label htmlFor="mirrorDistance">Lock magnitudes</label>
         </div>
       </div>
 
       <SnapConnectionsSection pathId={pathId} segmentIndex={segmentIndex} handleType={handleType} />
+    </div>
+  );
+}
+
+// Keyframe property input with live updates during typing
+function KeyframePropertyInput({
+  clipId,
+  pathId,
+  property,
+  keyframeTime,
+  value,
+  step,
+  decimals,
+}: {
+  clipId: string;
+  pathId: string;
+  property: AnimatableProperty;
+  keyframeTime: number;
+  value: number;
+  step: string;
+  decimals: number;
+}) {
+  const [localValue, setLocalValue] = useState(formatNumber(value, decimals));
+  const [isFocused, setIsFocused] = useState(false);
+  const prevAnimationRef = useRef<any>(null);
+  // Track which keyframe we're editing to detect when it changes
+  const editingKeyframeRef = useRef<{ pathId: string; time: number } | null>(null);
+
+  // Update local value when external value changes (but not while focused on SAME keyframe)
+  useEffect(() => {
+    // If keyframe changed (different path or time), always update even if focused
+    const keyframeChanged = editingKeyframeRef.current &&
+      (editingKeyframeRef.current.pathId !== pathId ||
+       Math.abs(editingKeyframeRef.current.time - keyframeTime) > 0.0001);
+
+    if (!isFocused || keyframeChanged) {
+      setLocalValue(formatNumber(value, decimals));
+      // If keyframe changed while focused, commit any pending changes
+      if (keyframeChanged && isFocused) {
+        setIsFocused(false);
+        if (prevAnimationRef.current !== null) {
+          store.commitKeyframeProperty(clipId, editingKeyframeRef.current!.pathId, prevAnimationRef.current);
+          prevAnimationRef.current = null;
+        }
+        editingKeyframeRef.current = null;
+      }
+    }
+  }, [value, decimals, isFocused, pathId, keyframeTime, clipId]);
+
+  const handleFocus = () => {
+    setIsFocused(true);
+    // Track which keyframe we're editing
+    editingKeyframeRef.current = { pathId, time: keyframeTime };
+    // Capture the animation state before editing starts
+    const clip = store.getState().animationClips.find((c) => c.id === clipId);
+    prevAnimationRef.current = clip?.parts[pathId] ?? [];
+  };
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const newValue = e.target.value;
+    setLocalValue(newValue);
+    // Live update for immediate visual feedback
+    const num = parseFloat(newValue);
+    if (!isNaN(num)) {
+      store.setKeyframePropertyLive(clipId, pathId, property, keyframeTime, num);
+    }
+  };
+
+  const handleBlur = () => {
+    setIsFocused(false);
+    // Commit the change to undo stack
+    if (prevAnimationRef.current !== null) {
+      store.commitKeyframeProperty(clipId, pathId, prevAnimationRef.current);
+      prevAnimationRef.current = null;
+    }
+    // Format on blur
+    const num = parseFloat(localValue);
+    if (!isNaN(num)) {
+      setLocalValue(formatNumber(num, decimals));
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // Pressing '-' anywhere negates the value (without moving cursor or reformatting)
+    if (e.key === "-") {
+      const num = parseFloat(localValue);
+      if (!isNaN(num)) {
+        e.preventDefault();
+        const input = e.currentTarget;
+        const cursorPos = input.selectionStart;
+        const negated = -num;
+        // Convert to string without reformatting
+        const newValue = String(negated);
+        setLocalValue(newValue);
+        // Live update
+        store.setKeyframePropertyLive(clipId, pathId, property, keyframeTime, negated);
+        // Restore cursor position after React updates the input
+        requestAnimationFrame(() => {
+          // Adjust cursor position: if we added/removed a minus sign, shift accordingly
+          if (cursorPos !== null) {
+            const hadMinus = num < 0;
+            const hasMinus = negated < 0;
+            let newPos = cursorPos;
+            if (!hadMinus && hasMinus) {
+              // Added minus sign, shift cursor right by 1
+              newPos = cursorPos + 1;
+            } else if (hadMinus && !hasMinus) {
+              // Removed minus sign, shift cursor left by 1 (but not below 0)
+              newPos = Math.max(0, cursorPos - 1);
+            }
+            input.setSelectionRange(newPos, newPos);
+          }
+        });
+      }
+    }
+  };
+
+  return (
+    <input
+      type="number"
+      step={step}
+      value={localValue}
+      onChange={handleChange}
+      onFocus={handleFocus}
+      onBlur={handleBlur}
+      onKeyDown={handleKeyDown}
+    />
+  );
+}
+
+// Unified keyframe properties editor - shows all properties in a single keyframe
+function UnifiedKeyframeProperties({
+  clipId,
+  pathId,
+  pathName,
+  clipName,
+  keyframe,
+  clipDuration,
+}: {
+  clipId: string;
+  pathId: string;
+  pathName: string;
+  clipName: string;
+  keyframe: UnifiedKeyframe;
+  clipDuration: number;
+}) {
+  const [editingTime, setEditingTime] = useState(false);
+  const [timeValue, setTimeValue] = useState(keyframe.t.toFixed(3));
+
+  // Update time value when keyframe changes
+  useEffect(() => {
+    if (!editingTime) {
+      setTimeValue(keyframe.t.toFixed(3));
+    }
+  }, [keyframe.t, editingTime]);
+
+  const handlePropertyToggle = (property: AnimatableProperty, isSet: boolean) => {
+    if (isSet) {
+      // Unset the property
+      store.unsetKeyframeProperty(clipId, pathId, property, keyframe.t);
+    } else {
+      // Set the property to its default value
+      store.setKeyframeProperty(clipId, pathId, property, keyframe.t, defaultPropertyValues[property]);
+    }
+  };
+
+  const handleTimeChange = () => {
+    const newTime = parseFloat(timeValue);
+    if (!isNaN(newTime) && newTime >= 0 && newTime <= clipDuration && Math.abs(newTime - keyframe.t) > 0.0001) {
+      store.changeKeyframeTime(clipId, pathId, keyframe.t, newTime);
+    }
+    setEditingTime(false);
+  };
+
+  const handleDelete = () => {
+    store.deleteKeyframe(clipId, pathId, keyframe.t);
+    store.clearKeyframeSelection();
+  };
+
+  // Get which properties are currently set
+  const setProperties = ANIMATABLE_PROPERTIES.filter((p) => keyframe[p] !== undefined);
+
+  // Determine step and decimals based on property
+  const getInputConfig = (property: AnimatableProperty) => {
+    switch (property) {
+      case "tx":
+      case "ty":
+        return { step: "0.1", decimals: 3 };
+      case "rot":
+        return { step: "0.01", decimals: 3 };
+      case "scale":
+        return { step: "0.01", decimals: 3 };
+      case "opacity":
+        return { step: "0.01", decimals: 2 };
+    }
+  };
+
+  return (
+    <div className={styles.properties}>
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Keyframe</div>
+        <div className={styles.row}>
+          <label>Clip</label>
+          <span className={styles.value}>{clipName}</span>
+        </div>
+        <div className={styles.row}>
+          <label>Path</label>
+          <span className={styles.value}>{pathName}</span>
+        </div>
+        <div className={styles.row}>
+          <label>Time</label>
+          {editingTime ? (
+            <input
+              type="number"
+              step="0.001"
+              min={0}
+              max={clipDuration}
+              value={timeValue}
+              onChange={(e) => setTimeValue(e.target.value)}
+              onBlur={handleTimeChange}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleTimeChange();
+                if (e.key === "Escape") {
+                  setTimeValue(keyframe.t.toFixed(3));
+                  setEditingTime(false);
+                }
+              }}
+              autoFocus
+            />
+          ) : (
+            <span
+              className={styles.value}
+              style={{ cursor: "pointer" }}
+              onClick={() => setEditingTime(true)}
+              title="Click to edit time"
+            >
+              {keyframe.t.toFixed(3)}s
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Properties</div>
+        {ANIMATABLE_PROPERTIES.map((prop) => {
+          const isSet = keyframe[prop] !== undefined;
+          const value = keyframe[prop] ?? defaultPropertyValues[prop];
+          const config = getInputConfig(prop);
+          return (
+            <div key={prop} className={styles.row}>
+              <input
+                type="checkbox"
+                checked={isSet}
+                onChange={() => handlePropertyToggle(prop, isSet)}
+                title={isSet ? "Unset this property" : "Set this property"}
+                style={{ marginRight: 4 }}
+              />
+              <label style={{ color: propertyColors[prop], minWidth: 50 }}>
+                {PROPERTY_LABELS[prop]}
+              </label>
+              {isSet ? (
+                <KeyframePropertyInput
+                  clipId={clipId}
+                  pathId={pathId}
+                  property={prop}
+                  keyframeTime={keyframe.t}
+                  value={value}
+                  step={config.step}
+                  decimals={config.decimals}
+                />
+              ) : (
+                <span className={styles.value} style={{ opacity: 0.5 }}>—</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className={styles.section}>
+        <button className={styles.deleteButton} onClick={handleDelete}>
+          Delete Keyframe
+        </button>
+      </div>
     </div>
   );
 }

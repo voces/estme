@@ -1,5 +1,5 @@
 import paper from "paper";
-import { AnchorMeta, CubicSegment, Path, Point, defaultAnchorMeta } from "./types.ts";
+import { AnchorMeta, CubicSegment, defaultTransform, Path, Point, defaultAnchorMeta } from "./types.ts";
 import { averageColors, getAnchorColor } from "./geometry.ts";
 
 // Initialize Paper.js without canvas (headless mode)
@@ -277,6 +277,9 @@ function fromPaperPath(
     opacity,
     visible: true,
     locked: false,
+    playerMask: false,
+    transform: defaultTransform(),
+    transformPoint: null,
   };
 }
 
@@ -503,7 +506,7 @@ function createCapsule(p1: Point, p2: Point, radius: number): paper.Path {
   // A: top of first semicircle - no handleIn (straight from F), handleOut toward B
   path.add(new paper.Segment(
     new paper.Point(p1.x + perpX * radius, p1.y + perpY * radius),
-    null,  // handleIn: straight line from F
+    undefined,  // handleIn: straight line from F
     new paper.Point(-dirX * k, -dirY * k)  // handleOut: curve toward B
   ));
 
@@ -518,13 +521,13 @@ function createCapsule(p1: Point, p2: Point, radius: number): paper.Path {
   path.add(new paper.Segment(
     new paper.Point(p1.x - perpX * radius, p1.y - perpY * radius),
     new paper.Point(-dirX * k, -dirY * k),  // handleIn: curve from B
-    null  // handleOut: straight line to D
+    undefined  // handleOut: straight line to D
   ));
 
   // D: bottom of second semicircle - no handleIn (straight from C), handleOut toward E
   path.add(new paper.Segment(
     new paper.Point(p2.x - perpX * radius, p2.y - perpY * radius),
-    null,  // handleIn: straight line from C
+    undefined,  // handleIn: straight line from C
     new paper.Point(dirX * k, dirY * k)  // handleOut: curve toward E
   ));
 
@@ -539,7 +542,7 @@ function createCapsule(p1: Point, p2: Point, radius: number): paper.Path {
   path.add(new paper.Segment(
     new paper.Point(p2.x + perpX * radius, p2.y + perpY * radius),
     new paper.Point(dirX * k, dirY * k),  // handleIn: curve from E
-    null  // handleOut: straight line to A
+    undefined  // handleOut: straight line to A
   ));
 
   path.closed = true;
@@ -1094,7 +1097,7 @@ function createBlobShape(points: Point[], radius: number, simplifyTolerance: num
     if (result === null) {
       result = capsule;
     } else {
-      const newResult = result.unite(capsule);
+      const newResult: paper.PathItem = result.unite(capsule);
       result.remove();
       capsule.remove();
       result = newResult;

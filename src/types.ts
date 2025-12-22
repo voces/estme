@@ -18,6 +18,14 @@ export type CubicSegment = {
   p1: Point; // end
 };
 
+// Animation transform properties (applied on top of geometry)
+export type PathTransform = {
+  tx: number; // Translation X
+  ty: number; // Translation Y
+  rot: number; // Rotation in radians
+  scale: number; // Uniform scale
+};
+
 export type Path = {
   id: string;
   name: string; // User-editable path name
@@ -29,6 +37,11 @@ export type Path = {
   opacity: number; // 0-1 range
   visible: boolean;
   locked: boolean;
+  playerMask: boolean; // When true, use accent color instead of vertex colors
+  // Animation transform (base pose, keyframes animate relative to this or override)
+  transform: PathTransform;
+  // Custom transform point (null = use dynamic center)
+  transformPoint: Point | null;
 };
 
 export type Group = {
@@ -36,6 +49,8 @@ export type Group = {
   name: string;
   parentId: string | null; // Groups can nest
   collapsed: boolean; // UI state for hierarchy expand/collapse
+  // Custom transform point (null = use dynamic center of children)
+  transformPoint: Point | null;
 };
 
 export type Tool = "select" | "line" | "blob";
@@ -58,6 +73,11 @@ export type SnapConnection = {
 // Default anchor metadata
 export function defaultAnchorMeta(): AnchorMeta {
   return { leftActive: true, rightActive: true, mirrorAngle: false, mirrorDistance: false, color: null };
+}
+
+// Default path transform (identity)
+export function defaultTransform(): PathTransform {
+  return { tx: 0, ty: 0, rot: 0, scale: 1 };
 }
 
 // Helper to create a line segment as cubic bezier
