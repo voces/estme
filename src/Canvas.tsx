@@ -3341,28 +3341,38 @@ export const Canvas = () => {
       }
       // Ctrl+C / Cmd+C for copy
       if (isCopy(e)) {
+        // Don't intercept if user has text selected (let browser handle it)
+        const textSelection = window.getSelection();
+        if (textSelection && textSelection.toString().length > 0) {
+          return; // Let browser handle text copy
+        }
         const { currentPath, selection } = store.getState();
         const hasSelection = selection.pathIds.length > 0 || selection.points.length > 0;
         if (!currentPath && hasSelection) {
           e.preventDefault();
-          store.copy();
+          store.copyToClipboard();
         }
       }
       // Ctrl+X / Cmd+X for cut
       if (isCut(e)) {
+        // Don't intercept if user has text selected
+        const textSelection = window.getSelection();
+        if (textSelection && textSelection.toString().length > 0) {
+          return; // Let browser handle text cut
+        }
         const { currentPath, selection } = store.getState();
         const hasSelection = selection.pathIds.length > 0 || selection.points.length > 0;
         if (!currentPath && hasSelection) {
           e.preventDefault();
-          store.cut();
+          store.cutToClipboard();
         }
       }
       // Ctrl+V / Cmd+V for paste
       if (isPaste(e)) {
         const { currentPath } = store.getState();
-        if (!currentPath && store.canPaste()) {
+        if (!currentPath) {
           e.preventDefault();
-          store.paste();
+          store.pasteFromClipboard();
         }
       }
       // Ctrl+A / Cmd+A for select all

@@ -9,10 +9,8 @@ export const Header = () => {
   const showAllPoints = useStore((s) => s.showAllPoints);
   const showAllControlPoints = useStore((s) => s.showAllControlPoints);
   const showTransformPoints = useStore((s) => s.showTransformPoints);
-  const clipboard = useStore((s) => s.clipboard);
   const canDelete = selection.pathIds.length > 0 || selection.points.length > 0;
   const canCopy = selection.pathIds.length > 0 || selection.points.some((p) => p.handleType === "anchor");
-  const canPaste = clipboard !== null && clipboard.type === "paths";
   const hasSelection = selection.pathIds.length > 0 || selection.points.length > 0;
   const hasPaths = paths.length > 0;
 
@@ -81,7 +79,7 @@ export const Header = () => {
       <div className={styles.buttonGroup}>
         <button
           className={`${styles.button} ${!canCopy ? styles.disabled : ""}`}
-          onClick={() => store.copy()}
+          onClick={() => store.copyToClipboard()}
           disabled={!canCopy}
           title="Copy (Ctrl+C)"
         >
@@ -89,16 +87,15 @@ export const Header = () => {
         </button>
         <button
           className={`${styles.button} ${!canCopy ? styles.disabled : ""}`}
-          onClick={() => store.cut()}
+          onClick={() => store.cutToClipboard()}
           disabled={!canCopy}
           title="Cut (Ctrl+X)"
         >
           {"\u2702"}
         </button>
         <button
-          className={`${styles.button} ${!canPaste ? styles.disabled : ""}`}
-          onClick={() => store.paste()}
-          disabled={!canPaste}
+          className={styles.button}
+          onClick={() => store.pasteFromClipboard()}
           title="Paste (Ctrl+V)"
         >
           {"\u{1F4C4}"}

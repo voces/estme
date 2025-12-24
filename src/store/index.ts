@@ -1,5 +1,5 @@
 import { useCallback, useSyncExternalStore } from "react";
-import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, Point, PointReference, SnapConnection, Tool } from "../types.ts";
+import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, PathTransform, Point, PointReference, SnapConnection, Tool } from "../types.ts";
 import { booleanOperation, canBooleanOp, uniteMultiplePaths } from "../pathBool.ts";
 import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, getPathTransformPoint, getSelectionTransformPoint } from "../geometry.ts";
 import { applyCommand } from "./commands.ts";
@@ -2755,6 +2755,200 @@ export const store = {
     // For now, we only support pasting full paths
   },
   canPaste: () => state.clipboard !== null && state.clipboard.type === "paths",
+
+  // System clipboard operations (async, uses navigator.clipboard API)
+  copyToClipboard: async () => {
+    const { selection, paths } = state;
+
+    // If full paths are selected, copy them
+    if (selection.pathIds.length > 0) {
+      const selectedSet = new Set(selection.pathIds);
+      const sourcePaths = paths.filter((p) => selectedSet.has(p.id));
+
+      if (sourcePaths.length > 0) {
+        // Create a serializable format
+        const clipboardData = {
+          type: "estme-paths" as const,
+          version: 1,
+          paths: sourcePaths.map((p) => ({
+            name: p.name,
+            segments: p.segments,
+            anchorMeta: p.anchorMeta,
+            closed: p.closed,
+            fill: p.fill,
+            opacity: p.opacity,
+            playerMask: p.playerMask,
+            transform: p.transform,
+            transformPoint: p.transformPoint,
+          })),
+        };
+
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(clipboardData, null, 2));
+          // Also update internal clipboard for fallback
+          store.copy();
+        } catch (e) {
+          console.warn("Failed to write to system clipboard, using internal clipboard:", e);
+          store.copy();
+        }
+      }
+      return;
+    }
+
+    // Fallback to internal copy for anchor points
+    store.copy();
+  },
+
+  cutToClipboard: async () => {
+    await store.copyToClipboard();
+    store.deleteSelection();
+  },
+
+  pasteFromClipboard: async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+
+      // Try to parse as estme JSON format
+      try {
+        const data = JSON.parse(text);
+        if (data.type === "estme-paths" && Array.isArray(data.paths)) {
+          store._pasteEstmePaths(data.paths);
+          return;
+        }
+      } catch {
+        // Not JSON, try as SVG
+      }
+
+      // Try to parse as SVG
+      if (text.trim().startsWith("<") && (text.includes("<svg") || text.includes("<path") || text.includes("<rect") || text.includes("<circle"))) {
+        // Wrap in SVG if it's just path elements
+        let svgText = text;
+        if (!text.includes("<svg")) {
+          svgText = `<svg xmlns="http://www.w3.org/2000/svg">${text}</svg>`;
+        }
+
+        try {
+          const { importSvg } = await import("../svgImport.ts");
+          const result = importSvg(svgText, state.pathCounter, state.groupCounter);
+
+          if (result.paths.length > 0) {
+            // Add the imported paths
+            const addCommands: Command[] = result.paths.map((path) => ({
+              type: "addPath" as const,
+              path,
+            }));
+
+            // Add groups if any
+            for (const group of result.groups) {
+              addCommands.push({ type: "addGroup" as const, group });
+            }
+
+            const cmd: Command = addCommands.length === 1 ? addCommands[0] : { type: "batch", commands: addCommands };
+            executeCommand(cmd);
+
+            // Update counters and select pasted paths
+            state = {
+              ...state,
+              pathCounter: result.newPathCounter,
+              groupCounter: result.newGroupCounter,
+              selection: { pathIds: result.paths.map((p) => p.id), points: [] },
+            };
+            notify();
+            return;
+          }
+        } catch (e) {
+          console.warn("Failed to parse clipboard as SVG:", e);
+        }
+      }
+
+      // Fallback to internal paste
+      if (store.canPaste()) {
+        store.paste();
+      }
+    } catch (e) {
+      // Clipboard read failed, fallback to internal paste
+      console.warn("Failed to read system clipboard, using internal clipboard:", e);
+      if (store.canPaste()) {
+        store.paste();
+      }
+    }
+  },
+
+  // Internal helper to paste estme-format paths
+  _pasteEstmePaths: (pathsData: Array<{
+    name: string;
+    segments: CubicSegment[];
+    anchorMeta: AnchorMeta[];
+    closed: boolean;
+    fill: string;
+    opacity: number;
+    playerMask?: boolean;
+    transform?: PathTransform;
+    transformPoint?: Point | null;
+  }>) => {
+    const { paths, pathCounter } = state;
+
+    // Generate names with " 2", " 3" suffixes
+    const getNextCopyName = (baseName: string): string => {
+      const baseMatch = baseName.match(/^(.+?) (\d+)$/);
+      const trueName = baseMatch ? baseMatch[1] : baseName;
+
+      const existingNumbers: number[] = [1];
+      for (const p of paths) {
+        if (p.name === trueName) {
+          existingNumbers.push(1);
+        } else {
+          const match = p.name.match(/^(.+?) (\d+)$/);
+          if (match && match[1] === trueName) {
+            existingNumbers.push(parseInt(match[2], 10));
+          }
+        }
+      }
+
+      const maxNum = Math.max(...existingNumbers);
+      return `${trueName} ${maxNum + 1}`;
+    };
+
+    let pCounter = pathCounter;
+    const pastedPaths: Path[] = pathsData.map((p) => ({
+      id: crypto.randomUUID(),
+      name: getNextCopyName(p.name || `Path ${++pCounter}`),
+      parentId: null, // Paste at root level
+      segments: p.segments.map((seg) => ({
+        p0: { ...seg.p0 },
+        c0: { ...seg.c0 },
+        c1: { ...seg.c1 },
+        p1: { ...seg.p1 },
+      })),
+      anchorMeta: p.anchorMeta.map((m) => ({ ...m })),
+      closed: p.closed,
+      fill: p.fill,
+      opacity: p.opacity ?? 1,
+      visible: true,
+      locked: false,
+      playerMask: p.playerMask ?? false,
+      transform: p.transform ?? defaultTransform(),
+      transformPoint: p.transformPoint ?? null,
+    }));
+
+    if (pastedPaths.length === 0) return;
+
+    const addCommands: Command[] = pastedPaths.map((path) => ({
+      type: "addPath" as const,
+      path,
+    }));
+
+    const cmd: Command = addCommands.length === 1 ? addCommands[0] : { type: "batch", commands: addCommands };
+    executeCommand(cmd);
+
+    // Update counter and select pasted paths
+    state = {
+      ...state,
+      pathCounter: pCounter,
+      selection: { pathIds: pastedPaths.map((p) => p.id), points: [] },
+    };
+    notify();
+  },
 
   // Undo/Redo
   undo: () => {
