@@ -11,8 +11,8 @@
     "react-dom/client": "npm:react-dom@^19/client",
     "vite": "npm:vite@^6",
     "@vitejs/plugin-react": "npm:@vitejs/plugin-react@^4",
-    "three": "npm:three@^0.170",
-    "@types/three": "npm:@types/three@^0.170"
+    "three": "npm:three",
+    "@types/three": "npm:@types/three"
   },
   "nodeModulesDir": "auto",
   "compilerOptions": {

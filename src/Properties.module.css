@@ -170,6 +170,26 @@
   white-space: nowrap;
 }
 
+.snapInfoButton {
+  background: transparent;
+  border: none;
+  font-size: 11px;
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+  flex: 1;
+  min-width: 0;
+}
+
+.snapInfoButton:hover {
+  color: #fff;
+  text-decoration: underline;
+}
+
 .unsnapButton {
   background: #4a3030;
   border: 1px solid #664444;

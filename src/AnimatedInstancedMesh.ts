@@ -1,3 +1,12 @@
+/**
+ * AnimatedInstancedMesh - Instanced mesh with GPU-driven part-based animation.
+ *
+ * Animation is entirely GPU-side:
+ * - Each vertex has a partID attribute
+ * - Per-instance: animClip, animPhase, animSpeed
+ * - Shader samples transform/opacity textures based on uTime
+ */
+
 import {
   Box3,
   BufferGeometry,
@@ -9,7 +18,6 @@ import {
   Intersection,
   Material,
   Matrix4,
-  MeshBasicMaterial,
   Mesh,
   Object3D,
   Ray,
@@ -17,11 +25,9 @@ import {
   Sphere,
 } from "three";
 import { BVH } from "./BVH.ts";
-import { getShaderRef } from "./AnimatedMeshMaterial.ts";
+import { getDepthMaterial, getShaderRef } from "./AnimatedMeshMaterial.ts";
 
 const dummy = new Object3D();
-const dummyColor = new Color();
-
 const _tempBox = new Box3();
 const _instanceLocalMatrix = new Matrix4();
 const _box3 = new Box3();
@@ -44,8 +50,10 @@ export interface AnimationData {
   partCount: number;
   /** Number of samples per animation clip */
   sampleCount: number;
-  /** Animation clips: name -> clip index */
-  clips: Map<string, number>;
+  /** Number of animation clips */
+  clipCount: number;
+  /** Animation clips: name -> { index, duration } */
+  clips: Map<string, { index: number; duration: number }>;
   /**
    * Transform texture (RGBA32F):
    * - R = tx, G = ty, B = rot (radians), A = scale
@@ -62,18 +70,6 @@ export interface AnimationData {
   opacityTexture: DataTexture;
 }
 
-/**
- * AnimatedInstancedMesh - Instanced mesh with GPU-driven part-based animation.
- *
- * Animation is entirely GPU-side:
- * - Each vertex has a partID attribute
- * - Per-instance: animClip, animPhase, animSpeed
- * - Shader samples transform/opacity textures based on uTime
- *
- * Also supports (from InstancedSvg):
- * - Per-instance: alpha, player color, tint, minimap mask
- * - Per-vertex: color, playerMask
- */
 export class AnimatedInstancedMesh extends InstancedMesh {
   private map: Record<string, number> = {};
   private reverseMap: string[] = [];
@@ -81,9 +77,14 @@ export class AnimatedInstancedMesh extends InstancedMesh {
   private bvh: BVH;
   private skipBoundsRecalc: boolean;
   private mapUtilizationThreshold: number;
+  private debouncingBoundingBox = false;
+  private debouncingBoundingSphere = false;
+  private transparentInstanceCount = 0;
 
   /** Animation data (textures, clip info) */
   readonly animationData: AnimationData | null;
+  /** Depth pre-pass mesh for intra-instance occlusion */
+  readonly depthMesh: InstancedMesh;
 
   constructor(
     geometry: BufferGeometry,
@@ -102,51 +103,69 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     this.bvh = new BVH(modelName);
     this.bvh.setGetBoundingBox((index) => {
       this.getMatrixAt(index, _instanceLocalMatrix);
-      if (!this.isFiniteMatrix(_instanceLocalMatrix)) return null;
-      return this.computeInstanceBoundingBox(index);
+      return this.isFiniteMatrix(_instanceLocalMatrix)
+        ? this.computeInstanceBoundingBox(index)
+        : null;
     });
     this.innerCount = count;
     this.skipBoundsRecalc = options?.skipBoundsRecalc ?? false;
     this.mapUtilizationThreshold = options?.mapUtilizationThreshold ?? 0.5;
 
-    // Add instance attributes
     this.initializeInstanceAttributes(count);
-
-    // Patch bounding box/sphere computation
     this.patchBounds();
 
-    // Set up onBeforeRender to update animation uniforms per-mesh
-    this.onBeforeRender = (_renderer, _scene, _camera, _geometry, _material) => {
-      if (!(material instanceof MeshBasicMaterial)) return;
-      const shaderRef = getShaderRef(material);
-      if (!shaderRef) return;
+    const depthMaterial = getDepthMaterial();
+    this.depthMesh = new InstancedMesh(geometry, depthMaterial, count);
+    this.depthMesh.instanceMatrix = this.instanceMatrix;
+    this.depthMesh.renderOrder = 0;
+    this.depthMesh.frustumCulled = false;
+    this.depthMesh.visible = false; // Only visible when transparent instances exist
 
-      // Update uniforms with this mesh's animation data
-      if (this.animationData) {
-        shaderRef.uniforms.uTransformTex.value = this.animationData.transformTexture;
-        shaderRef.uniforms.uOpacityTex.value = this.animationData.opacityTexture;
-        shaderRef.uniforms.uSampleCount.value = this.animationData.sampleCount;
-        shaderRef.uniforms.uPartCount.value = this.animationData.partCount;
-      } else {
-        // No animation
-        shaderRef.uniforms.uTransformTex.value = null;
-        shaderRef.uniforms.uOpacityTex.value = null;
-        shaderRef.uniforms.uSampleCount.value = 1;
-        shaderRef.uniforms.uPartCount.value = 0;
-      }
-      // uTime is updated globally once per frame via updateAnimationTime()
+    this.depthMesh.onBeforeRender = (
+      _renderer,
+      _scene,
+      _camera,
+      _geometry,
+      mat,
+    ) => {
+      const shaderRef = getShaderRef(mat);
+      if (!shaderRef) return;
+      this.updateAnimationUniforms(shaderRef);
     };
 
-    // Initialize all instances at infinity
+    this.onBeforeRender = (_renderer, _scene, _camera, _geometry, material) => {
+      const shaderRef = getShaderRef(material);
+      if (!shaderRef) return;
+      this.updateAnimationUniforms(shaderRef);
+    };
+
     for (let i = 0; i < count; i++) {
       this.setPositionAt(i, Infinity, Infinity, undefined, Infinity);
+    }
+  }
+
+  private updateAnimationUniforms(
+    shaderRef: { uniforms: Record<string, { value: unknown }> },
+  ) {
+    if (this.animationData) {
+      shaderRef.uniforms.uTransformTex.value =
+        this.animationData.transformTexture;
+      shaderRef.uniforms.uOpacityTex.value = this.animationData.opacityTexture;
+      shaderRef.uniforms.uSampleCount.value = this.animationData.sampleCount;
+      shaderRef.uniforms.uPartCount.value = this.animationData.partCount;
+      shaderRef.uniforms.uClipCount.value = this.animationData.clipCount;
+    } else {
+      shaderRef.uniforms.uTransformTex.value = null;
+      shaderRef.uniforms.uOpacityTex.value = null;
+      shaderRef.uniforms.uSampleCount.value = 1;
+      shaderRef.uniforms.uPartCount.value = 0;
+      shaderRef.uniforms.uClipCount.value = 1;
     }
   }
 
   private initializeInstanceAttributes(count: number) {
     const geo = this.geometry;
 
-    // Instance alpha (float)
     const instanceAlphaAttr = new InstancedBufferAttribute(
       new Float32Array(count),
       1,
@@ -155,7 +174,6 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     instanceAlphaAttr.setUsage(DynamicDrawUsage);
     geo.setAttribute("instanceAlpha", instanceAlphaAttr);
 
-    // Minimap mask (float)
     const instanceMinimapMaskAttr = new InstancedBufferAttribute(
       new Float32Array(count),
       1,
@@ -164,44 +182,31 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     instanceMinimapMaskAttr.setUsage(DynamicDrawUsage);
     geo.setAttribute("instanceMinimapMask", instanceMinimapMaskAttr);
 
-    // Player color (vec3) - accent color for player-masked vertices
     const instancePlayerColorAttr = new InstancedBufferAttribute(
       new Float32Array(count * 3),
       3,
     );
-    for (let i = 0; i < count * 3; i++) {
-      instancePlayerColorAttr.array[i] = 1;
-    }
+    for (let i = 0; i < count * 3; i++) instancePlayerColorAttr.array[i] = 1;
     instancePlayerColorAttr.setUsage(DynamicDrawUsage);
     geo.setAttribute("instancePlayerColor", instancePlayerColorAttr);
 
-    // Tint color (vec4) - overall tint applied to non-player vertices
-    // RGB = tint color, A = tint strength (0 = no tint, 1 = full tint)
+    // instanceTint: [R, G, B] - multiplied with vertex color for non-player vertices
     const instanceTintAttr = new InstancedBufferAttribute(
-      new Float32Array(count * 4),
-      4,
+      new Float32Array(count * 3),
+      3,
     );
-    // Default: white with 0 strength (no tint)
-    for (let i = 0; i < count; i++) {
-      instanceTintAttr.array[i * 4] = 1;     // R
-      instanceTintAttr.array[i * 4 + 1] = 1; // G
-      instanceTintAttr.array[i * 4 + 2] = 1; // B
-      instanceTintAttr.array[i * 4 + 3] = 0; // strength
-    }
+    for (let i = 0; i < count * 3; i++) instanceTintAttr.array[i] = 1;
     instanceTintAttr.setUsage(DynamicDrawUsage);
     geo.setAttribute("instanceTint", instanceTintAttr);
 
-    // Animation state (vec3): animClip, animPhase, animSpeed
-    // animClip: which clip (index into clips)
-    // animPhase: phase offset (0-1, added to time)
-    // animSpeed: playback speed multiplier
+    // instanceAnim: [clipIndex, phase, speed] - phase is 0-1 offset, speed is multiplier
     const instanceAnimAttr = new InstancedBufferAttribute(
       new Float32Array(count * 3),
       3,
     );
     // Default: clip 0, phase 0, speed 1
     for (let i = 0; i < count; i++) {
-      instanceAnimAttr.array[i * 3] = 0;     // clip
+      instanceAnimAttr.array[i * 3] = 0; // clip
       instanceAnimAttr.array[i * 3 + 1] = 0; // phase
       instanceAnimAttr.array[i * 3 + 2] = 1; // speed
     }
@@ -212,13 +217,11 @@ export class AnimatedInstancedMesh extends InstancedMesh {
   resize(value: number) {
     const geo = this.geometry;
 
-    // Resize instance matrix
     const oldMatrixArray = this.instanceMatrix.array;
     const newMatrixArray = new Float32Array(value * 16);
     newMatrixArray.set(
       oldMatrixArray.slice(0, Math.min(value, this.innerCount) * 16),
     );
-    // Initialize new instances at infinity
     dummy.matrix.setPosition(Infinity, Infinity, Infinity);
     for (let n = this.innerCount; n < value; n++) {
       dummy.matrix.toArray(newMatrixArray, n * 16);
@@ -226,24 +229,11 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     this.instanceMatrix = new InstancedBufferAttribute(newMatrixArray, 16);
     this.instanceMatrix.setUsage(DynamicDrawUsage);
 
-    // Resize instance color if it exists
-    if (this.instanceColor) {
-      const oldColorArray = this.instanceColor.array;
-      const newColorArray = new Float32Array(value * 3);
-      newColorArray.set(
-        oldColorArray.slice(0, Math.min(value, this.innerCount) * 3),
-      );
-      for (let i = this.innerCount * 3; i < value * 3; i += 3) {
-        newColorArray[i] = 1;
-        newColorArray[i + 1] = 1;
-        newColorArray[i + 2] = 1;
-      }
-      this.instanceColor = new InstancedBufferAttribute(newColorArray, 3);
-      this.instanceColor.setUsage(DynamicDrawUsage);
-    }
-
-    // Helper to resize a float attribute with a single default value
-    const resizeFloatAttr = (name: string, components: number, defaultValue: number) => {
+    const resizeFloatAttr = (
+      name: string,
+      components: number,
+      defaultValue: number,
+    ) => {
       const oldAttr = geo.getAttribute(name);
       const newAttr = new InstancedBufferAttribute(
         new Float32Array(value * components),
@@ -271,9 +261,7 @@ export class AnimatedInstancedMesh extends InstancedMesh {
       new Float32Array(value * 3),
       3,
     );
-    for (let i = 0; i < value * 3; i++) {
-      newPlayerColorAttr.array[i] = 1;
-    }
+    for (let i = 0; i < value * 3; i++) newPlayerColorAttr.array[i] = 1;
     if (oldPlayerColorAttr) {
       (newPlayerColorAttr.array as Float32Array).set(
         (oldPlayerColorAttr.array as Float32Array).slice(
@@ -285,23 +273,18 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     newPlayerColorAttr.setUsage(DynamicDrawUsage);
     geo.setAttribute("instancePlayerColor", newPlayerColorAttr);
 
-    // Resize instanceTint (default to white with 0 strength)
+    // Resize instanceTint (default to white)
     const oldTintAttr = geo.getAttribute("instanceTint");
     const newTintAttr = new InstancedBufferAttribute(
-      new Float32Array(value * 4),
-      4,
+      new Float32Array(value * 3),
+      3,
     );
-    for (let i = 0; i < value; i++) {
-      newTintAttr.array[i * 4] = 1;
-      newTintAttr.array[i * 4 + 1] = 1;
-      newTintAttr.array[i * 4 + 2] = 1;
-      newTintAttr.array[i * 4 + 3] = 0;
-    }
+    for (let i = 0; i < value * 3; i++) newTintAttr.array[i] = 1;
     if (oldTintAttr) {
       (newTintAttr.array as Float32Array).set(
         (oldTintAttr.array as Float32Array).slice(
           0,
-          Math.min(value, this.innerCount) * 4,
+          Math.min(value, this.innerCount) * 3,
         ),
       );
     }
@@ -340,6 +323,10 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     this.innerCount = value;
     // deno-lint-ignore no-explicit-any
     (this as any).count = value;
+
+    this.depthMesh.instanceMatrix = this.instanceMatrix;
+    // deno-lint-ignore no-explicit-any
+    (this.depthMesh as any).count = value;
   }
 
   getCount() {
@@ -351,6 +338,13 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     const index = this.map[id];
     const swapIndex = this.reverseMap.length - 1;
 
+    // Update transparent count if deleted instance was transparent
+    const instanceAlphaAttr = this.geometry.getAttribute("instanceAlpha");
+    if (instanceAlphaAttr.getX(index) < 1) {
+      this.transparentInstanceCount--;
+      this.depthMesh.visible = this.transparentInstanceCount > 0;
+    }
+
     if (swapIndex !== index) {
       const swapId = this.reverseMap[swapIndex];
 
@@ -359,18 +353,12 @@ export class AnimatedInstancedMesh extends InstancedMesh {
 
       this.setPositionAt(swapId, Infinity, Infinity, undefined, Infinity);
 
-      if (this.instanceColor?.array) {
-        this.getColorAt(swapIndex, dummyColor);
-        this.setColorAt(index, dummyColor);
-        this.instanceColor.needsUpdate = true;
-      }
-
-      // Copy all instance attributes from swapIndex to index
       const copyAttr = (name: string, components: number) => {
         const attr = this.geometry.getAttribute(name);
         if (!attr) return;
         for (let c = 0; c < components; c++) {
-          const value = (attr.array as Float32Array)[swapIndex * components + c];
+          const value =
+            (attr.array as Float32Array)[swapIndex * components + c];
           (attr.array as Float32Array)[index * components + c] = value;
         }
         attr.needsUpdate = true;
@@ -379,7 +367,7 @@ export class AnimatedInstancedMesh extends InstancedMesh {
       copyAttr("instanceAlpha", 1);
       copyAttr("instanceMinimapMask", 1);
       copyAttr("instancePlayerColor", 3);
-      copyAttr("instanceTint", 4);
+      copyAttr("instanceTint", 3);
       copyAttr("instanceAnim", 3);
 
       this.map[swapId] = index;
@@ -399,14 +387,8 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     this.map[id] = index;
     if (index + 1 > this.getCount()) this.resize((index + 1) * 2);
 
-    // Initialize new instance with default values
     dummy.matrix.identity();
     this.setMatrixAtIndex(index, dummy.matrix);
-
-    if (this.instanceColor) {
-      this.setColorAt(index, new Color(1, 1, 1));
-      this.instanceColor.needsUpdate = true;
-    }
 
     const setAttrDefault = (name: string, values: number[]) => {
       const attr = this.geometry.getAttribute(name);
@@ -420,7 +402,7 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     setAttrDefault("instanceAlpha", [1]);
     setAttrDefault("instanceMinimapMask", [0]);
     setAttrDefault("instancePlayerColor", [1, 1, 1]);
-    setAttrDefault("instanceTint", [1, 1, 1, 0]);
+    setAttrDefault("instanceTint", [1, 1, 1]);
     setAttrDefault("instanceAnim", [0, 0, 1]); // clip 0, phase 0, speed 1
 
     return index;
@@ -452,13 +434,8 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     this.computeBoundingBox = function () {
       const geometry = this.geometry;
 
-      if (this.boundingBox === null) {
-        this.boundingBox = new Box3();
-      }
-
-      if (geometry.boundingBox === null) {
-        geometry.computeBoundingBox();
-      }
+      if (this.boundingBox === null) this.boundingBox = new Box3();
+      if (geometry.boundingBox === null) geometry.computeBoundingBox();
 
       this.boundingBox.makeEmpty();
 
@@ -475,7 +452,6 @@ export class AnimatedInstancedMesh extends InstancedMesh {
       const geometry = this.geometry;
 
       if (this.boundingSphere === null) this.boundingSphere = new Sphere();
-
       if (geometry.boundingSphere === null) geometry.computeBoundingSphere();
 
       this.boundingSphere.makeEmpty();
@@ -492,7 +468,6 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     };
   }
 
-  private debouncingBoundingBox = false;
   private debouncedComputeBoundingBox() {
     if (this.skipBoundsRecalc) return;
     if (this.debouncingBoundingBox) return;
@@ -503,7 +478,6 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     });
   }
 
-  private debouncingBoundingSphere = false;
   private debouncedComputeBoundingSphere() {
     if (this.skipBoundsRecalc) return;
     if (this.debouncingBoundingSphere) return;
@@ -556,15 +530,6 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     return dummy.position.clone();
   }
 
-  private initializeInstanceColorWithWhite() {
-    if (!this.instanceColor) {
-      const white = new Color(1, 1, 1);
-      for (let i = 0; i < this.getCount(); i++) {
-        this.setColorAt(i, white);
-      }
-    }
-  }
-
   setPlayerColorAt(index: number | string, color: Color) {
     if (typeof index === "string") index = this.getIndex(index);
     const playerColorAttr = this.geometry.getAttribute("instancePlayerColor");
@@ -574,14 +539,24 @@ export class AnimatedInstancedMesh extends InstancedMesh {
 
   setVertexColorAt(index: number | string, color: Color) {
     if (typeof index === "string") index = this.getIndex(index);
-    this.initializeInstanceColorWithWhite();
-    this.setColorAt(index, color);
-    if (this.instanceColor) this.instanceColor.needsUpdate = true;
+    this.setTintAt(index, color);
   }
 
   setAlphaAt(index: number | string, alpha: number) {
     if (typeof index === "string") index = this.getIndex(index);
     const instanceAlphaAttr = this.geometry.getAttribute("instanceAlpha");
+    const prevAlpha = instanceAlphaAttr.getX(index);
+
+    // Track transparent instance count for depth mesh visibility optimization
+    const wasTransparent = prevAlpha < 1;
+    const isTransparent = alpha < 1;
+    if (wasTransparent && !isTransparent) {
+      this.transparentInstanceCount--;
+    } else if (!wasTransparent && isTransparent) {
+      this.transparentInstanceCount++;
+    }
+    this.depthMesh.visible = this.transparentInstanceCount > 0;
+
     instanceAlphaAttr.setX(index, alpha);
     instanceAlphaAttr.needsUpdate = true;
   }
@@ -597,30 +572,28 @@ export class AnimatedInstancedMesh extends InstancedMesh {
 
   /**
    * Set tint color for an instance.
-   * Tint is blended with the base vertex color for non-player vertices.
-   * Player-masked vertices are NOT affected by tint.
+   * Tint is multiplied with the base vertex color for non-player vertices.
    */
-  setTintAt(index: number | string, color: Color, strength: number = 1) {
+  setTintAt(index: number | string, color: Color) {
     if (typeof index === "string") index = this.getIndex(index);
     const tintAttr = this.geometry.getAttribute("instanceTint");
-    tintAttr.setXYZW(index, color.r, color.g, color.b, strength);
+    tintAttr.setXYZ(index, color.r, color.g, color.b);
     tintAttr.needsUpdate = true;
   }
 
-  /** Clear tint for an instance (reset to no tint). */
+  /** Clear tint for an instance (reset to white/no tint). */
   clearTintAt(index: number | string) {
     if (typeof index === "string") index = this.getIndex(index);
     const tintAttr = this.geometry.getAttribute("instanceTint");
-    tintAttr.setXYZW(index, 1, 1, 1, 0);
+    tintAttr.setXYZ(index, 1, 1, 1);
     tintAttr.needsUpdate = true;
   }
 
   /**
    * Set animation state for an instance.
-   * @param index Instance index or ID
-   * @param clip Animation clip index (or name if animationData exists)
+   * @param clip Animation clip index or name
    * @param phase Phase offset (0-1, added to time for desync)
-   * @param speed Playback speed multiplier (1 = normal, 2 = double speed)
+   * @param speed Playback speed multiplier
    */
   setAnimationAt(
     index: number | string,
@@ -630,39 +603,35 @@ export class AnimatedInstancedMesh extends InstancedMesh {
   ) {
     if (typeof index === "string") index = this.getIndex(index);
 
-    let clipIndex: number;
-    if (typeof clip === "string") {
-      clipIndex = this.animationData?.clips.get(clip) ?? 0;
-    } else {
-      clipIndex = clip;
-    }
+    const clipIndex = typeof clip === "string"
+      ? this.animationData?.clips.get(clip)?.index ?? 0
+      : clip;
 
     const animAttr = this.geometry.getAttribute("instanceAnim");
     animAttr.setXYZ(index, clipIndex, phase, speed);
     animAttr.needsUpdate = true;
   }
 
-  /** Get clip index by name. */
-  getClipIndex(name: string): number | undefined {
+  /** Get clip info by name. */
+  getClipInfo(name: string): { index: number; duration: number } | undefined {
     return this.animationData?.clips.get(name);
   }
 
   saveInstanceColors(index: number | string): Color | null {
     if (typeof index === "string") index = this.getIndex(index);
-    if (this.instanceColor) {
-      const savedColor = new Color();
-      this.getColorAt(index, savedColor);
-      return savedColor;
+    const tintAttr = this.geometry.getAttribute("instanceTint");
+    if (tintAttr) {
+      const r = tintAttr.getX(index);
+      const g = tintAttr.getY(index);
+      const b = tintAttr.getZ(index);
+      return new Color(r, g, b);
     }
     return null;
   }
 
   restoreInstanceColors(index: number | string, color: Color | null) {
     if (typeof index === "string") index = this.getIndex(index);
-    if (color) {
-      this.setColorAt(index, color);
-      if (this.instanceColor) this.instanceColor.needsUpdate = true;
-    }
+    if (color) this.setTintAt(index, color);
   }
 
   setScaleAt(index: number | string, scale: number, aspectRatio?: number) {
@@ -687,9 +656,7 @@ export class AnimatedInstancedMesh extends InstancedMesh {
     _tempBox.makeEmpty();
 
     const geoBox = this.geometry.boundingBox;
-    if (!geoBox) {
-      this.geometry.computeBoundingBox();
-    }
+    if (!geoBox) this.geometry.computeBoundingBox();
 
     const matrix = new Matrix4();
     this.getMatrixAt(index, matrix);

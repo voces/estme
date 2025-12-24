@@ -109,6 +109,9 @@ export const Hierarchy = () => {
   const [editingName, setEditingName] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Track last clicked item for shift+click range selection
+  const lastClickedRef = useRef<{ id: string; type: "path" | "group" } | null>(null);
+
   // Drag and drop state
   const [draggedItem, setDraggedItem] = useState<{ id: string; type: "path" | "group"; parentId: string | null } | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget>(null);
@@ -120,22 +123,126 @@ export const Hierarchy = () => {
     }
   }, [editingId]);
 
+  // Build a flat list of selectable items in display order for range selection
+  const getSelectableItems = (): { id: string; type: "path" | "group" }[] => {
+    const pathArrayIndices = new Map(paths.map((p, i) => [p.id, i]));
+    const tree = buildHierarchyTree(paths, groups, null, 0, { current: 0 }, pathArrayIndices);
+    const items: { id: string; type: "path" | "group" }[] = [];
+    for (const node of tree) {
+      if (node.type === "path") {
+        items.push({ id: node.path.id, type: "path" });
+      } else if (node.type === "group") {
+        items.push({ id: node.group.id, type: "group" });
+      }
+    }
+    return items;
+  };
+
+  // Handle range selection between two items
+  const selectRange = (fromId: string, toId: string) => {
+    const items = getSelectableItems();
+    const fromIndex = items.findIndex(item => item.id === fromId);
+    const toIndex = items.findIndex(item => item.id === toId);
+
+    if (fromIndex === -1 || toIndex === -1) return;
+
+    const startIndex = Math.min(fromIndex, toIndex);
+    const endIndex = Math.max(fromIndex, toIndex);
+
+    const pathIds: string[] = [];
+    for (let i = startIndex; i <= endIndex; i++) {
+      const item = items[i];
+      if (item.type === "path") {
+        pathIds.push(item.id);
+      } else if (item.type === "group") {
+        // Add all paths in the group
+        const groupPathIds = store.getDescendantPathIds(item.id);
+        pathIds.push(...groupPathIds);
+      }
+    }
+
+    // Set selection to all paths in range
+    store.setSelection({ pathIds: [...new Set(pathIds)], points: [] });
+  };
+
+  // Find the nearest selected item to use as anchor for range selection
+  const findNearestSelectedItem = (clickedId: string): { id: string; type: "path" | "group" } | null => {
+    const items = getSelectableItems();
+    const clickedIndex = items.findIndex(item => item.id === clickedId);
+    if (clickedIndex === -1) return null;
+
+    // Check which items are currently selected
+    const selectedPathIds = new Set(selection.pathIds);
+
+    let nearestItem: { id: string; type: "path" | "group" } | null = null;
+    let nearestDistance = Infinity;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      let isSelected = false;
+
+      if (item.type === "path") {
+        isSelected = selectedPathIds.has(item.id);
+      } else if (item.type === "group") {
+        // Group is selected if all its paths are selected
+        const groupPathIds = store.getDescendantPathIds(item.id);
+        isSelected = groupPathIds.length > 0 && groupPathIds.every(id => selectedPathIds.has(id));
+      }
+
+      if (isSelected) {
+        const distance = Math.abs(i - clickedIndex);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestItem = item;
+        }
+      }
+    }
+
+    return nearestItem;
+  };
+
   const handlePathClick = (pathId: string, e: React.MouseEvent) => {
     e.preventDefault();
+
     if (e.shiftKey) {
+      // Shift+click: range select from nearest selected item
+      const nearestSelected = findNearestSelectedItem(pathId);
+      if (nearestSelected) {
+        selectRange(nearestSelected.id, pathId);
+      } else {
+        store.selectPath(pathId);
+      }
+    } else if (e.ctrlKey || e.metaKey) {
+      // Ctrl+click: toggle in selection
       store.toggleInSelection(pathId);
     } else {
+      // Regular click: single selection
       store.selectPath(pathId);
     }
+
+    lastClickedRef.current = { id: pathId, type: "path" };
   };
 
   const handleGroupClick = (groupId: string, e: React.MouseEvent) => {
     e.preventDefault();
+
     if (e.shiftKey) {
+      // Shift+click: range select from nearest selected item
+      const nearestSelected = findNearestSelectedItem(groupId);
+      if (nearestSelected) {
+        selectRange(nearestSelected.id, groupId);
+      } else {
+        store.selectGroup(groupId);
+      }
+    } else if (e.ctrlKey || e.metaKey) {
+      // Ctrl+click: toggle group in selection
       store.toggleGroupInSelection(groupId);
     } else {
+      // Regular click: single selection
       store.selectGroup(groupId);
     }
+
+    lastClickedRef.current = { id: groupId, type: "group" };
   };
 
   const handleDoubleClick = (id: string, type: "path" | "group", currentName: string, e: React.MouseEvent) => {

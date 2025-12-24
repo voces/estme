@@ -1493,6 +1493,11 @@ export const Canvas = () => {
     let dragTransformPointItemId: string | null = null;
     let dragTransformPointItemType: "path" | "group" | null = null;
     let dragTransformPointOriginal: Point | null = null;
+    // Click-to-cycle state: only cycle through overlapping paths on mouseup (not mousedown)
+    // This allows dragging an already-selected path without it cycling away
+    let pendingCyclePathsAtPoint: string[] = [];
+    let pendingCycleClickPoint: Point | null = null;
+    let pendingCycleWasAlreadySelected = false;
 
     // Helper to find nearest control handle (respects active state)
     const findNearestHandle = (
@@ -1727,13 +1732,36 @@ export const Canvas = () => {
           const currentSelection = store.getState().selection;
           const currentlySelectedId = currentSelection.pathIds.length === 1 ? currentSelection.pathIds[0] : null;
 
-          // Get the next path in cycle (or topmost if nothing selected at this point)
-          const clickedPathId = getNextPathInCycle(pathsAtPoint, currentlySelectedId, currentSelection.pathIds);
+          // Check if clicking on an already-selected path
+          // If so, don't cycle on mousedown - allow dragging. Cycle on mouseup if no drag occurred.
+          const topmostPath = pathsAtPoint[0] ?? null;
+          const clickedIsAlreadySelected = topmostPath && currentSelection.pathIds.includes(topmostPath);
+
+          // Determine which path to select on mousedown
+          let clickedPathId: string | null;
+          if (clickedIsAlreadySelected) {
+            // Keep current selection - will cycle on mouseup if it's a simple click
+            clickedPathId = topmostPath;
+            // Store info for potential cycling on mouseup
+            pendingCyclePathsAtPoint = pathsAtPoint;
+            pendingCycleClickPoint = clickPoint;
+            pendingCycleWasAlreadySelected = true;
+          } else {
+            // Not already selected - select topmost (or use cycle logic if something else was selected)
+            clickedPathId = getNextPathInCycle(pathsAtPoint, currentlySelectedId, currentSelection.pathIds);
+            // Store info for potential cycling on mouseup
+            pendingCyclePathsAtPoint = pathsAtPoint;
+            pendingCycleClickPoint = clickPoint;
+            pendingCycleWasAlreadySelected = false;
+          }
           const clickedPath = clickedPathId ? paths.find((p) => p.id === clickedPathId) ?? null : null;
 
           if (isShiftClick && clickedPathId) {
             // Toggle path in selection
             store.toggleInSelection(clickedPathId);
+            // Clear pending cycle on shift-click
+            pendingCyclePathsAtPoint = [];
+            pendingCycleClickPoint = null;
           } else if (clickedPathId) {
             // If clicked path is already in selection, preserve selection for multi-path drag
             const clickedIsSelected = currentSelection.pathIds.includes(clickedPathId);
@@ -2140,8 +2168,28 @@ export const Canvas = () => {
       const currentSelection = store.getState().selection;
       const currentlySelectedId = currentSelection.pathIds.length === 1 ? currentSelection.pathIds[0] : null;
 
-      // Get the next path in cycle (or topmost if nothing selected at this point)
-      const clickedPathId = getNextPathInCycle(pathsAtPoint, currentlySelectedId, currentSelection.pathIds);
+      // Check if clicking on an already-selected path
+      // If so, don't cycle on mousedown - allow dragging. Cycle on mouseup if no drag occurred.
+      const topmostPath = pathsAtPoint[0] ?? null;
+      const clickedIsAlreadySelected = topmostPath && currentSelection.pathIds.includes(topmostPath);
+
+      // Determine which path to select on mousedown
+      let clickedPathId: string | null;
+      if (clickedIsAlreadySelected) {
+        // Keep current selection - will cycle on mouseup if it's a simple click
+        clickedPathId = topmostPath;
+        // Store info for potential cycling on mouseup
+        pendingCyclePathsAtPoint = pathsAtPoint;
+        pendingCycleClickPoint = clickPoint;
+        pendingCycleWasAlreadySelected = true;
+      } else {
+        // Not already selected - select topmost (or use cycle logic if something else was selected)
+        clickedPathId = getNextPathInCycle(pathsAtPoint, currentlySelectedId, currentSelection.pathIds);
+        // Store info for potential cycling on mouseup
+        pendingCyclePathsAtPoint = pathsAtPoint;
+        pendingCycleClickPoint = clickPoint;
+        pendingCycleWasAlreadySelected = false;
+      }
       const clickedPath = clickedPathId ? paths.find((p) => p.id === clickedPathId) ?? null : null;
 
       if (isShiftClick && clickedPathId) {
@@ -2154,6 +2202,9 @@ export const Canvas = () => {
           // Toggle path in selection
           store.toggleInSelection(clickedPathId);
         }
+        // Clear pending cycle on shift-click
+        pendingCyclePathsAtPoint = [];
+        pendingCycleClickPoint = null;
       } else if (clickedPathId) {
         // If clicked path is already in selection, preserve selection for multi-path drag
         const clickedIsSelected = currentSelection.pathIds.includes(clickedPathId);
@@ -2794,6 +2845,24 @@ export const Canvas = () => {
           }
         }
       }
+
+      // Handle click-to-cycle through overlapping paths
+      // Only cycle if this was a simple click (no significant drag), the path was already selected
+      // on mousedown, and there are multiple overlapping paths
+      const wasSimpleClick = Math.abs(totalDx) < 0.5 && Math.abs(totalDy) < 0.5 && !isRotating && !isScaling;
+      if (wasSimpleClick && pendingCycleWasAlreadySelected && pendingCyclePathsAtPoint.length > 1) {
+        const currentSelection = store.getState().selection;
+        const currentlySelectedId = currentSelection.pathIds.length === 1 ? currentSelection.pathIds[0] : null;
+
+        if (currentlySelectedId && pendingCyclePathsAtPoint.includes(currentlySelectedId)) {
+          // Get next path in cycle
+          const nextPathId = getNextPathInCycle(pendingCyclePathsAtPoint, currentlySelectedId, currentSelection.pathIds);
+          if (nextPathId && nextPathId !== currentlySelectedId) {
+            store.selectPath(nextPathId);
+          }
+        }
+      }
+
       // Reset tracking variables
       isDragging = false;
       isDraggingPoint = false;
@@ -2818,6 +2887,10 @@ export const Canvas = () => {
       isRotating = false;
       isScaling = false;
       snappedToTarget = null;
+      // Reset cycle state
+      pendingCyclePathsAtPoint = [];
+      pendingCycleClickPoint = null;
+      pendingCycleWasAlreadySelected = false;
     };
 
     const onWheel = (e: WheelEvent) => {

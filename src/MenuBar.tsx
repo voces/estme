@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { store, useStore } from "./store/index.ts";
 import { saveDocument, loadDocument, listDocuments, deleteDocument, generateId, findDocumentByName, getCurrentDocumentId, setCurrentDocumentId, StoredDocument, saveAutosave, loadAutosave, clearAutosave } from "./storage.ts";
 import { importSvg } from "./svgImport.ts";
-import { exportToThreeJS } from "./export.ts";
+import { exportBinary } from "./exportBinary.ts";
 import styles from "./MenuBar.module.css";
 
 export const MenuBar = () => {
@@ -242,24 +242,22 @@ export const MenuBar = () => {
     setOpenMenu(null);
   };
 
-  // Export to Three.js format
-  const handleExport = () => {
+  // Export binary format
+  const handleExportBinary = () => {
     setOpenMenu(null);
     try {
       const state = store.getState();
-      const exported = exportToThreeJS(
-        documentName,
+      const binary = exportBinary(
         state.paths,
         state.groups,
         state.animationClips,
       );
-      const json = JSON.stringify(exported);
-      const blob = new Blob([json], { type: "application/json" });
+      const blob = new Blob([binary], { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
 
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${documentName}.estme3d`;
+      a.download = `${documentName}.estb`;
       a.click();
 
       URL.revokeObjectURL(url);
@@ -271,6 +269,8 @@ export const MenuBar = () => {
   // Save to IndexedDB
   const handleSaveToStorage = async () => {
     setOpenMenu(null);
+    // Don't save while initial document is still loading
+    if (isLoadingDocument) return;
     try {
       const id = documentId || generateId();
       const data = store.getDocumentData();
@@ -410,8 +410,8 @@ export const MenuBar = () => {
               <div className={styles.dropdownItem} onClick={handleDownload}>
                 <span>Download</span>
               </div>
-              <div className={styles.dropdownItem} onClick={handleExport}>
-                <span>Export for Three.js</span>
+              <div className={styles.dropdownItem} onClick={handleExportBinary}>
+                <span>Export (.estb)</span>
               </div>
               <div className={styles.separator} />
               <div className={styles.dropdownItem} onClick={handleRename}>

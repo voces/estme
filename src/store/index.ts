@@ -673,15 +673,23 @@ export const store = {
             c1: { x: seg.c1.x + dx, y: seg.c1.y + dy },
             p1: { x: seg.p1.x + dx, y: seg.p1.y + dy },
           })),
+          // Also move custom transform point if set
+          transformPoint: p.transformPoint
+            ? { x: p.transformPoint.x + dx, y: p.transformPoint.y + dy }
+            : null,
         };
       }),
     };
 
     // Move connected points on OTHER paths (not on this path since all its points moved together)
+    // Track moved points to avoid moving the same point twice if multiple anchors snap to it
+    const movedPoints = new Set<string>();
     for (let i = 0; i < path.segments.length; i++) {
       const connectedPoints = store.getConnectedPoints({ pathId: id, segmentIndex: i, handleType: "anchor" });
       for (const connPoint of connectedPoints) {
-        if (connPoint.pathId !== id && !moved.has(connPoint.pathId)) {
+        const pointKey = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+        if (connPoint.pathId !== id && !movedPoints.has(pointKey)) {
+          movedPoints.add(pointKey);
           // Move this connected point
           store._movePointInternal(connPoint.pathId, connPoint.segmentIndex, dx, dy);
         }
@@ -717,6 +725,10 @@ export const store = {
               c1: { x: seg.c1.x + dx, y: seg.c1.y + dy },
               p1: { x: seg.p1.x + dx, y: seg.p1.y + dy },
             })),
+            // Also move custom transform point if set
+            transformPoint: p.transformPoint
+              ? { x: p.transformPoint.x + dx, y: p.transformPoint.y + dy }
+              : null,
           };
         }
 
@@ -862,10 +874,14 @@ export const store = {
     };
 
     // Move connected points on OTHER paths
+    // Track moved points to avoid moving the same point twice if multiple anchors snap to it
+    const movedPoints = new Set<string>();
     for (let i = 0; i < path.segments.length; i++) {
       const connectedPoints = store.getConnectedPoints({ pathId: id, segmentIndex: i, handleType: "anchor" });
       for (const connPoint of connectedPoints) {
-        if (connPoint.pathId !== id && !rotated.has(connPoint.pathId)) {
+        const pointKey = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+        if (connPoint.pathId !== id && !movedPoints.has(pointKey)) {
+          movedPoints.add(pointKey);
           // Get the old position of the connected point
           const connPath = state.paths.find((p) => p.id === connPoint.pathId);
           if (!connPath) continue;
@@ -1041,10 +1057,14 @@ export const store = {
     };
 
     // Move connected points on OTHER paths
+    // Track moved points to avoid moving the same point twice if multiple anchors snap to it
+    const movedPoints = new Set<string>();
     for (let i = 0; i < path.segments.length; i++) {
       const connectedPoints = store.getConnectedPoints({ pathId: id, segmentIndex: i, handleType: "anchor" });
       for (const connPoint of connectedPoints) {
-        if (connPoint.pathId !== id && !scaled.has(connPoint.pathId)) {
+        const pointKey = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+        if (connPoint.pathId !== id && !movedPoints.has(pointKey)) {
+          movedPoints.add(pointKey);
           // Get the old position of the connected point
           const connPath = state.paths.find((p) => p.id === connPoint.pathId);
           if (!connPath) continue;
@@ -4179,6 +4199,188 @@ export const store = {
     });
   },
 
+  // ============================================================================
+  // Multi-selection keyframe operations
+  // ============================================================================
+
+  // Set a property on keyframes for multiple paths at once
+  setKeyframePropertyMulti: (
+    clipId: string,
+    partIds: string[],
+    property: AnimatableProperty,
+    t: number,
+    value: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || partIds.length === 0) return;
+
+    const commands: Command[] = [];
+    for (const partId of partIds) {
+      const prevAnimation = clip.parts[partId] ?? [];
+      const newAnimation = setKeyframeProperty(prevAnimation, t, property, value);
+      commands.push({
+        type: "setPartAnimation",
+        clipId,
+        partId,
+        prevAnimation,
+        newAnimation,
+      });
+    }
+
+    executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+  },
+
+  // Set a property on keyframes for multiple paths LIVE (no undo entry)
+  setKeyframePropertyLiveMulti: (
+    clipId: string,
+    partIds: string[],
+    property: AnimatableProperty,
+    t: number,
+    value: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || partIds.length === 0) return;
+
+    const newParts = { ...clip.parts };
+    for (const partId of partIds) {
+      const prevAnimation = newParts[partId] ?? [];
+      newParts[partId] = setKeyframeProperty(prevAnimation, t, property, value);
+    }
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === clipId ? { ...c, parts: newParts } : c
+      ),
+    };
+    throttledNotify();
+  },
+
+  // Commit keyframe property changes for multiple paths
+  commitKeyframePropertyMulti: (
+    clipId: string,
+    prevAnimations: Map<string, PartAnimation>,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const commands: Command[] = [];
+    for (const [partId, prevAnimation] of prevAnimations) {
+      const newAnimation = clip.parts[partId] ?? [];
+      if (JSON.stringify(prevAnimation) !== JSON.stringify(newAnimation)) {
+        commands.push({
+          type: "setPartAnimation",
+          clipId,
+          partId,
+          prevAnimation,
+          newAnimation,
+        });
+      }
+    }
+
+    if (commands.length > 0) {
+      recordCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+    }
+  },
+
+  // Unset a property on keyframes for multiple paths
+  unsetKeyframePropertyMulti: (
+    clipId: string,
+    partIds: string[],
+    property: AnimatableProperty,
+    t: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || partIds.length === 0) return;
+
+    const commands: Command[] = [];
+    for (const partId of partIds) {
+      const partAnim = clip.parts[partId];
+      if (!partAnim) continue;
+
+      const prevAnimation = partAnim;
+      const newAnimation = unsetKeyframeProperty(prevAnimation, t, property);
+      commands.push({
+        type: "setPartAnimation",
+        clipId,
+        partId,
+        prevAnimation,
+        newAnimation,
+      });
+    }
+
+    if (commands.length > 0) {
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+    }
+  },
+
+  // Delete keyframes for multiple paths at once
+  deleteKeyframeMulti: (
+    clipId: string,
+    partIds: string[],
+    t: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || partIds.length === 0) return;
+
+    const commands: Command[] = [];
+    for (const partId of partIds) {
+      const partAnim = clip.parts[partId];
+      if (!partAnim) continue;
+
+      const prevAnimation = partAnim;
+      const newAnimation = removeKeyframe(prevAnimation, t);
+      commands.push({
+        type: "setPartAnimation",
+        clipId,
+        partId,
+        prevAnimation,
+        newAnimation,
+      });
+    }
+
+    if (commands.length > 0) {
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+    }
+  },
+
+  // Change keyframe time for multiple paths at once
+  changeKeyframeTimeMulti: (
+    clipId: string,
+    partIds: string[],
+    oldTime: number,
+    newTime: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || partIds.length === 0) return;
+
+    const commands: Command[] = [];
+    for (const partId of partIds) {
+      const partAnim = clip.parts[partId];
+      if (!partAnim) continue;
+
+      const prevAnimation = partAnim;
+      const newAnimation = changeKeyframeTime(prevAnimation, oldTime, newTime);
+      commands.push({
+        type: "setPartAnimation",
+        clipId,
+        partId,
+        prevAnimation,
+        newAnimation,
+      });
+    }
+
+    if (commands.length > 0) {
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+    }
+
+    // Update selected keyframe time
+    if (state.selectedKeyframe && Math.abs(state.selectedKeyframe.time - oldTime) < 0.0001) {
+      state = { ...state, selectedKeyframe: { ...state.selectedKeyframe, time: newTime } };
+      notify();
+    }
+  },
+
   // Create an empty keyframe (no properties set) at a specific time
   createEmptyKeyframe: (
     clipId: string,
@@ -4582,8 +4784,14 @@ export const store = {
   },
 
   // Keyframe selection
-  selectKeyframe: (keyframe: SelectedKeyframe) => {
-    state = { ...state, selectedKeyframe: keyframe };
+  selectKeyframe: (keyframe: { pathId: string; time: number }) => {
+    // Also select the path so property edits apply to the correct path
+    const newSelection = {
+      pathIds: [keyframe.pathId],
+      points: [],
+    };
+    state = { ...state, selectedKeyframe: keyframe, selection: newSelection };
+    saveSelection(newSelection);
     notify();
   },
 
@@ -4657,6 +4865,11 @@ export const store = {
       pathIds: savedSelection.pathIds.filter((id) => pathIdSet.has(id) || groupIdSet.has(id)),
       points: [],
     };
+    // Validate currentClipId exists in loaded document's clips
+    const loadedClips = data.animationClips || [];
+    const validCurrentClipId = loadedClips.some((c) => c.id === initialState.currentClipId)
+      ? initialState.currentClipId
+      : null;
     state = {
       ...initialState,
       isLoadingDocument: false, // Done loading
@@ -4666,7 +4879,8 @@ export const store = {
       paths: migratedPaths,
       groups: data.groups || [],
       snapConnections: data.snapConnections || [],
-      animationClips: data.animationClips || [],
+      animationClips: loadedClips,
+      currentClipId: validCurrentClipId,
       pathCounter: data.pathCounter || (data.paths?.length || 0) + 1,
       groupCounter: data.groupCounter || (data.groups?.length || 0) + 1,
       // Preserve UI settings

@@ -136,7 +136,7 @@ export function setKeyframeProperty(
 }
 
 // Unset a property on a keyframe at a specific time
-// If all properties are unset, removes the keyframe entirely
+// Keeps the keyframe even if empty (user can delete explicitly via Delete Keyframe button)
 export function unsetKeyframeProperty(
   keyframes: PartAnimation,
   t: number,
@@ -148,13 +148,7 @@ export function unsetKeyframeProperty(
   const kf = { ...keyframes[index] };
   delete kf[property];
 
-  // Check if any properties remain
-  const hasProperties = ANIMATABLE_PROPERTIES.some((p) => kf[p] !== undefined);
-  if (!hasProperties) {
-    // Remove the keyframe entirely
-    return keyframes.filter((_, i) => i !== index);
-  }
-
+  // Keep the keyframe even if no properties remain (user can delete explicitly)
   const result = [...keyframes];
   result[index] = kf;
   return result;

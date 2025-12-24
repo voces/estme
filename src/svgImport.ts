@@ -778,12 +778,12 @@ function parseSvgPath(element: Element, index: number): ParsedPath[] {
 
 // Tolerance for detecting snapped points (in SVG units)
 // Using a small but reasonable tolerance to catch floating point imprecision
-const SNAP_TOLERANCE = 0.005;
+const SNAP_TOLERANCE = 0.0005;
 
 // Detect snap connections between paths
 // Returns snap connections for points that are at the same position
 function detectSnapConnections(paths: Path[]): SnapConnection[] {
-  // Collect all points with their references
+  // Collect all points (anchors and control points) with their references
   type PointWithRef = { x: number; y: number; ref: PointReference };
   const allPoints: PointWithRef[] = [];
 
@@ -808,43 +808,81 @@ function detectSnapConnections(paths: Path[]): SnapConnection[] {
         ref: { pathId: path.id, segmentIndex: segIdx, handleType: "c1" },
       });
     }
-    // For open paths, the last anchor (p1 of last segment) isn't represented as p0 of any segment
-    // We need a way to reference it. The snap system might use a special convention.
-    // For now, skip the last anchor of open paths - they can be snapped manually if needed.
+    // For open paths, also add the final anchor (p1 of last segment)
+    if (!path.closed && path.segments.length > 0) {
+      const lastSeg = path.segments[path.segments.length - 1];
+      allPoints.push({
+        x: lastSeg.p1.x,
+        y: lastSeg.p1.y,
+        ref: { pathId: path.id, segmentIndex: path.segments.length, handleType: "anchor" },
+      });
+    }
   }
 
   // Group points by position (using tolerance)
-  const connections: SnapConnection[] = [];
-  const used = new Set<number>(); // Track which points have been assigned to a connection
+  // First, cluster ALL points at the same position together
+  const clusters: number[][] = []; // Each cluster is a list of indices into allPoints
+  const pointToCluster = new Map<number, number>(); // Maps point index to cluster index
 
   for (let i = 0; i < allPoints.length; i++) {
-    if (used.has(i)) continue;
+    if (pointToCluster.has(i)) continue;
 
     const point = allPoints[i];
-    const matchingPoints: PointReference[] = [point.ref];
-    used.add(i);
+    const cluster: number[] = [i];
+    pointToCluster.set(i, clusters.length);
 
     for (let j = i + 1; j < allPoints.length; j++) {
-      if (used.has(j)) continue;
+      if (pointToCluster.has(j)) continue;
 
       const other = allPoints[j];
-      // Skip points from the same path (internal connections are handled by the path itself)
-      if (other.ref.pathId === point.ref.pathId) continue;
-
       const dx = Math.abs(other.x - point.x);
       const dy = Math.abs(other.y - point.y);
 
       if (dx < SNAP_TOLERANCE && dy < SNAP_TOLERANCE) {
-        matchingPoints.push(other.ref);
-        used.add(j);
+        cluster.push(j);
+        pointToCluster.set(j, clusters.length);
       }
     }
 
-    // Only create a connection if there are 2+ points from different paths
-    if (matchingPoints.length >= 2) {
+    clusters.push(cluster);
+  }
+
+  // Now create snap connections from clusters
+  // For each cluster, only include ONE point per path (prefer anchor over control points)
+  const connections: SnapConnection[] = [];
+
+  for (const cluster of clusters) {
+    if (cluster.length < 2) continue;
+
+    // Group points in cluster by path
+    const byPath = new Map<string, PointReference[]>();
+    for (const idx of cluster) {
+      const ref = allPoints[idx].ref;
+      if (!byPath.has(ref.pathId)) {
+        byPath.set(ref.pathId, []);
+      }
+      byPath.get(ref.pathId)!.push(ref);
+    }
+
+    // Skip if all points are from the same path
+    if (byPath.size < 2) continue;
+
+    // For each path, pick the best point (prefer anchor over control points)
+    const connectionPoints: PointReference[] = [];
+    for (const [_pathId, points] of byPath) {
+      // Sort: anchor first, then c0, then c1
+      points.sort((a, b) => {
+        const order = { anchor: 0, c0: 1, c1: 2 };
+        return order[a.handleType] - order[b.handleType];
+      });
+      // Take the first (highest priority) point
+      connectionPoints.push(points[0]);
+    }
+
+    if (connectionPoints.length >= 2) {
       connections.push({
         id: generateId(),
-        points: matchingPoints,
+        points: connectionPoints,
       });
     }
   }

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { store, useStore, PointSelection, Selection } from "./store/index.ts";
 import { InstanceProperties as InstancePropertiesType } from "./store/types.ts";
 import { Path, Point, PointReference, HandleType } from "./types.ts";
-import { AnimatableProperty, ANIMATABLE_PROPERTIES, propertyColors, UnifiedKeyframe, defaultPropertyValues } from "./animation.ts";
+import { AnimatableProperty, ANIMATABLE_PROPERTIES, propertyColors, UnifiedKeyframe, defaultPropertyValues, PartAnimation } from "./animation.ts";
 import {
   averageColors,
   getAnchorColor,
@@ -280,20 +280,30 @@ export const Properties = () => {
   const animationClips = useStore((s) => s.animationClips);
 
   // If a keyframe is selected, show unified keyframe editor
+  // Include all selected paths so edits apply to the whole selection
   if (selectedKeyframe && currentClipId) {
     const clip = animationClips.find((c) => c.id === currentClipId);
-    // Check both paths and groups for the item name
-    const path = paths.find((p) => p.id === selectedKeyframe.pathId);
-    const group = groups.find((g) => g.id === selectedKeyframe.pathId);
-    const itemName = path?.name ?? group?.name ?? "Unknown";
+
+    // Get all selected path IDs (the selectedKeyframe.pathId + any other selected paths)
+    const selectedPathIds = selection.pathIds.length > 0
+      ? selection.pathIds
+      : [selectedKeyframe.pathId];
+
+    // Get names for all selected paths
+    const selectedPathNames = selectedPathIds.map((id) => {
+      const path = paths.find((p) => p.id === id);
+      const group = groups.find((g) => g.id === id);
+      return path?.name ?? group?.name ?? "Unknown";
+    });
+
     const unifiedKeyframe = store.getSelectedKeyframe();
 
     if (unifiedKeyframe) {
       return (
         <UnifiedKeyframeProperties
           clipId={currentClipId}
-          pathId={selectedKeyframe.pathId}
-          pathName={itemName}
+          pathIds={selectedPathIds}
+          pathNames={selectedPathNames}
           clipName={clip?.name ?? ""}
           keyframe={unifiedKeyframe}
           clipDuration={clip?.duration ?? 1}
@@ -369,15 +379,20 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
   const center = getMultiSelectionCenter(paths, selection);
   const count = selection.pathIds.length + selection.points.length;
 
+  // Calculate average opacity for selected paths
+  const selectedPaths = paths.filter((p) => selection.pathIds.includes(p.id));
+  const avgOpacity = selectedPaths.length > 0
+    ? selectedPaths.reduce((sum, p) => sum + p.opacity, 0) / selectedPaths.length
+    : 1;
+  const allSameOpacity = selectedPaths.length > 0 && selectedPaths.every((p) => p.opacity === selectedPaths[0].opacity);
+
   const handleCenterChange = (axis: "x" | "y", value: number) => {
     if (!center) return;
     const dx = axis === "x" ? value - center.x : 0;
     const dy = axis === "y" ? value - center.y : 0;
     if (dx !== 0 || dy !== 0) {
-      // Translate all selected paths
-      for (const pathId of selection.pathIds) {
-        store.translatePathLive(pathId, dx, dy);
-      }
+      // Translate all selected paths and points
+      store.translateSelectionLive(dx, dy);
       // Commit as a batch
       store.commitTranslateSelection(dx, dy);
     }
@@ -443,6 +458,30 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
           </div>
         ) : (
           <div className={styles.hint}>No vertices selected</div>
+        )}
+        {selectedPaths.length > 0 && (
+          <>
+            <div className={styles.row} style={{ marginTop: 8 }}>
+              <label>Opacity</label>
+              <DraggableNumberInput
+                value={Math.round(avgOpacity * 100)}
+                min={0}
+                max={100}
+                step={1}
+                decimals={0}
+                suffix="%"
+                onChange={(v) => {
+                  const newOpacity = v / 100;
+                  for (const pathId of selection.pathIds) {
+                    store.setPathOpacity(pathId, newOpacity);
+                  }
+                }}
+              />
+            </div>
+            {!allSameOpacity && (
+              <div className={styles.hint}>Average of {selectedPaths.length} paths</div>
+            )}
+          </>
         )}
       </div>
 
@@ -721,6 +760,56 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
   const childPathCount = paths.filter((p) => p.parentId === group.id).length;
   const childGroupCount = groups.filter((g) => g.parentId === group.id).length;
 
+  // Get all descendant paths for editing
+  const descendantPathIds = store.getDescendantPathIds(group.id);
+  const descendantPaths = paths.filter((p) => descendantPathIds.includes(p.id));
+
+  // Calculate average opacity for descendant paths
+  const avgOpacity = descendantPaths.length > 0
+    ? descendantPaths.reduce((sum, p) => sum + p.opacity, 0) / descendantPaths.length
+    : 1;
+  const allSameOpacity = descendantPaths.length > 0 && descendantPaths.every((p) => p.opacity === descendantPaths[0].opacity);
+
+  // Collect all vertex colors from descendant paths
+  const vertexColors: string[] = [];
+  for (const path of descendantPaths) {
+    for (let i = 0; i < path.segments.length; i++) {
+      vertexColors.push(getAnchorColor(path, i));
+    }
+  }
+  const avgColor = averageColors(vertexColors);
+  const allSameColor = vertexColors.length > 0 && vertexColors.every(c => c === vertexColors[0]);
+
+  const handleCenterChange = (axis: "x" | "y", value: number) => {
+    const dx = axis === "x" ? value - center.x : 0;
+    const dy = axis === "y" ? value - center.y : 0;
+    if (dx !== 0 || dy !== 0) {
+      // Select all paths in group temporarily and translate
+      const prevSelection = store.getState().selection;
+      store.setSelection({ pathIds: descendantPathIds, points: [] });
+      store.translateSelectionLive(dx, dy);
+      store.commitTranslateSelection(dx, dy);
+      // Restore previous selection
+      store.setSelection(prevSelection);
+    }
+  };
+
+  const handleColorChange = (color: string) => {
+    // Set color for all vertices in all descendant paths
+    for (const path of descendantPaths) {
+      for (let i = 0; i < path.segments.length; i++) {
+        store.setAnchorColor(path.id, i, color);
+      }
+    }
+  };
+
+  const handleOpacityChange = (value: number) => {
+    const newOpacity = value / 100;
+    for (const pathId of descendantPathIds) {
+      store.setPathOpacity(pathId, newOpacity);
+    }
+  };
+
   return (
     <div className={styles.properties}>
       <div className={styles.section}>
@@ -737,17 +826,122 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
         </div>
       </div>
 
+      {vertexColors.length > 0 && (
+        <div className={styles.section}>
+          <div className={styles.sectionTitle}>Vertex Color</div>
+          {vertexColors.length > 1 && !allSameColor && (
+            <div className={styles.hint}>Average of {vertexColors.length} vertices</div>
+          )}
+          <div className={styles.colorRow}>
+            <input
+              type="color"
+              className={styles.colorInput}
+              value={avgColor}
+              onChange={(e) => handleColorChange(e.target.value)}
+            />
+            <span className={styles.colorValue}>{avgColor}</span>
+          </div>
+          {descendantPaths.length > 0 && (
+            <>
+              <div className={styles.row} style={{ marginTop: 8 }}>
+                <label>Opacity</label>
+                <DraggableNumberInput
+                  value={Math.round(avgOpacity * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  decimals={0}
+                  suffix="%"
+                  onChange={handleOpacityChange}
+                />
+              </div>
+              {!allSameOpacity && (
+                <div className={styles.hint}>Average of {descendantPaths.length} paths</div>
+              )}
+              <div className={styles.checkboxRow}>
+                <input
+                  type="checkbox"
+                  id={`playerMask-group-${group.id}`}
+                  checked={descendantPaths.every((p) => p.playerMask)}
+                  ref={(el) => {
+                    if (el) {
+                      const allChecked = descendantPaths.every((p) => p.playerMask);
+                      const noneChecked = descendantPaths.every((p) => !p.playerMask);
+                      el.indeterminate = !allChecked && !noneChecked;
+                    }
+                  }}
+                  onChange={(e) => {
+                    for (const pathId of descendantPathIds) {
+                      store.setPathPlayerMask(pathId, e.target.checked);
+                    }
+                  }}
+                />
+                <label htmlFor={`playerMask-group-${group.id}`}>Accent Color</label>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       <div className={styles.section}>
         <div className={styles.sectionTitle}>Center</div>
         <div className={styles.row}>
           <label>X</label>
-          <span className={styles.value}>{formatNumber(center.x, 3)}</span>
+          <DraggableNumberInput
+            value={center.x}
+            min={-100000}
+            max={100000}
+            step={0.1}
+            decimals={3}
+            onChange={(v) => handleCenterChange("x", v)}
+          />
         </div>
         <div className={styles.row}>
           <label>Y</label>
-          <span className={styles.value}>{formatNumber(center.y, 3)}</span>
+          <DraggableNumberInput
+            value={center.y}
+            min={-100000}
+            max={100000}
+            step={0.1}
+            decimals={3}
+            onChange={(v) => handleCenterChange("y", v)}
+          />
         </div>
       </div>
+
+      {descendantPaths.length > 1 && (
+        <div className={styles.section}>
+          <div className={styles.sectionTitle}>Align</div>
+          <div className={styles.buttonRow}>
+            <button
+              className={styles.smallButton}
+              onClick={() => {
+                // Temporarily select group paths for alignment
+                const prevSelection = store.getState().selection;
+                store.setSelection({ pathIds: descendantPathIds, points: [] });
+                store.alignHorizontally();
+                store.setSelection(prevSelection);
+              }}
+              title="Align transform points horizontally"
+            >
+              ⇔ Horizontal
+            </button>
+            <button
+              className={styles.smallButton}
+              onClick={() => {
+                // Temporarily select group paths for alignment
+                const prevSelection = store.getState().selection;
+                store.setSelection({ pathIds: descendantPathIds, points: [] });
+                store.alignVertically();
+                store.setSelection(prevSelection);
+              }}
+              title="Align transform points vertically"
+            >
+              ⇕ Vertical
+            </button>
+          </div>
+        </div>
+      )}
 
       <TransformPointSection
         itemId={group.id}
@@ -770,6 +964,14 @@ function SnapConnectionsSection({ pathId, segmentIndex, handleType }: { pathId: 
 
   if (connectedPoints.length === 0) return null;
 
+  const handleSelectPoint = (connPoint: PointReference) => {
+    // Select just this individual point
+    store.setSelection({
+      pathIds: [],
+      points: [connPoint],
+    });
+  };
+
   return (
     <div className={styles.section}>
       <div className={styles.sectionTitle}>Snapped With</div>
@@ -779,9 +981,13 @@ function SnapConnectionsSection({ pathId, segmentIndex, handleType }: { pathId: 
         const pointType = connPoint.handleType === "anchor" ? "anchor" : connPoint.handleType;
         return (
           <div key={idx} className={styles.snapRow}>
-            <span className={styles.snapInfo}>
+            <button
+              className={styles.snapInfoButton}
+              onClick={() => handleSelectPoint(connPoint)}
+              title="Click to select this point"
+            >
               {pathName} • {pointType} #{connPoint.segmentIndex}
-            </span>
+            </button>
             <button
               className={styles.unsnapButton}
               onClick={() => store.unsnapPoint(pointRef)}
@@ -866,7 +1072,7 @@ function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: 
   return (
     <div className={styles.properties}>
       <div className={styles.section}>
-        <div className={styles.sectionTitle}>Anchor</div>
+        <div className={styles.sectionTitle}>Anchor #{segmentIndex}</div>
         <div className={styles.row}>
           <label>X</label>
           <NumberInput
@@ -1083,7 +1289,7 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
   return (
     <div className={styles.properties}>
       <div className={styles.section}>
-        <div className={styles.sectionTitle}>Control Point ({handleType})</div>
+        <div className={styles.sectionTitle}>Control Point {handleType} #{segmentIndex}</div>
         <div className={styles.row}>
           <label>X</label>
           <NumberInput
@@ -1153,10 +1359,10 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
   );
 }
 
-// Keyframe property input with live updates during typing
+// Keyframe property input with live updates during typing (supports multi-selection)
 function KeyframePropertyInput({
   clipId,
-  pathId,
+  pathIds,
   property,
   keyframeTime,
   value,
@@ -1164,7 +1370,7 @@ function KeyframePropertyInput({
   decimals,
 }: {
   clipId: string;
-  pathId: string;
+  pathIds: string[];
   property: AnimatableProperty;
   keyframeTime: number;
   value: number;
@@ -1173,15 +1379,15 @@ function KeyframePropertyInput({
 }) {
   const [localValue, setLocalValue] = useState(formatNumber(value, decimals));
   const [isFocused, setIsFocused] = useState(false);
-  const prevAnimationRef = useRef<any>(null);
+  const prevAnimationsRef = useRef<Map<string, PartAnimation> | null>(null);
   // Track which keyframe we're editing to detect when it changes
-  const editingKeyframeRef = useRef<{ pathId: string; time: number } | null>(null);
+  const editingKeyframeRef = useRef<{ pathIds: string[]; time: number } | null>(null);
 
   // Update local value when external value changes (but not while focused on SAME keyframe)
   useEffect(() => {
-    // If keyframe changed (different path or time), always update even if focused
+    // If keyframe changed (different paths or time), always update even if focused
     const keyframeChanged = editingKeyframeRef.current &&
-      (editingKeyframeRef.current.pathId !== pathId ||
+      (JSON.stringify(editingKeyframeRef.current.pathIds) !== JSON.stringify(pathIds) ||
        Math.abs(editingKeyframeRef.current.time - keyframeTime) > 0.0001);
 
     if (!isFocused || keyframeChanged) {
@@ -1189,22 +1395,26 @@ function KeyframePropertyInput({
       // If keyframe changed while focused, commit any pending changes
       if (keyframeChanged && isFocused) {
         setIsFocused(false);
-        if (prevAnimationRef.current !== null) {
-          store.commitKeyframeProperty(clipId, editingKeyframeRef.current!.pathId, prevAnimationRef.current);
-          prevAnimationRef.current = null;
+        if (prevAnimationsRef.current !== null) {
+          store.commitKeyframePropertyMulti(clipId, prevAnimationsRef.current);
+          prevAnimationsRef.current = null;
         }
         editingKeyframeRef.current = null;
       }
     }
-  }, [value, decimals, isFocused, pathId, keyframeTime, clipId]);
+  }, [value, decimals, isFocused, pathIds, keyframeTime, clipId]);
 
   const handleFocus = () => {
     setIsFocused(true);
     // Track which keyframe we're editing
-    editingKeyframeRef.current = { pathId, time: keyframeTime };
-    // Capture the animation state before editing starts
+    editingKeyframeRef.current = { pathIds, time: keyframeTime };
+    // Capture the animation state before editing starts for all paths
     const clip = store.getState().animationClips.find((c) => c.id === clipId);
-    prevAnimationRef.current = clip?.parts[pathId] ?? [];
+    const prevAnimations = new Map<string, PartAnimation>();
+    for (const pathId of pathIds) {
+      prevAnimations.set(pathId, clip?.parts[pathId] ?? []);
+    }
+    prevAnimationsRef.current = prevAnimations;
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1213,16 +1423,16 @@ function KeyframePropertyInput({
     // Live update for immediate visual feedback
     const num = parseFloat(newValue);
     if (!isNaN(num)) {
-      store.setKeyframePropertyLive(clipId, pathId, property, keyframeTime, num);
+      store.setKeyframePropertyLiveMulti(clipId, pathIds, property, keyframeTime, num);
     }
   };
 
   const handleBlur = () => {
     setIsFocused(false);
     // Commit the change to undo stack
-    if (prevAnimationRef.current !== null) {
-      store.commitKeyframeProperty(clipId, pathId, prevAnimationRef.current);
-      prevAnimationRef.current = null;
+    if (prevAnimationsRef.current !== null) {
+      store.commitKeyframePropertyMulti(clipId, prevAnimationsRef.current);
+      prevAnimationsRef.current = null;
     }
     // Format on blur
     const num = parseFloat(localValue);
@@ -1244,7 +1454,7 @@ function KeyframePropertyInput({
         const newValue = String(negated);
         setLocalValue(newValue);
         // Live update
-        store.setKeyframePropertyLive(clipId, pathId, property, keyframeTime, negated);
+        store.setKeyframePropertyLiveMulti(clipId, pathIds, property, keyframeTime, negated);
         // Restore cursor position after React updates the input
         requestAnimationFrame(() => {
           // Adjust cursor position: if we added/removed a minus sign, shift accordingly
@@ -1280,17 +1490,18 @@ function KeyframePropertyInput({
 }
 
 // Unified keyframe properties editor - shows all properties in a single keyframe
+// Supports multi-selection: edits apply to all selected paths
 function UnifiedKeyframeProperties({
   clipId,
-  pathId,
-  pathName,
+  pathIds,
+  pathNames,
   clipName,
   keyframe,
   clipDuration,
 }: {
   clipId: string;
-  pathId: string;
-  pathName: string;
+  pathIds: string[];
+  pathNames: string[];
   clipName: string;
   keyframe: UnifiedKeyframe;
   clipDuration: number;
@@ -1307,24 +1518,24 @@ function UnifiedKeyframeProperties({
 
   const handlePropertyToggle = (property: AnimatableProperty, isSet: boolean) => {
     if (isSet) {
-      // Unset the property
-      store.unsetKeyframeProperty(clipId, pathId, property, keyframe.t);
+      // Unset the property on all selected paths
+      store.unsetKeyframePropertyMulti(clipId, pathIds, property, keyframe.t);
     } else {
-      // Set the property to its default value
-      store.setKeyframeProperty(clipId, pathId, property, keyframe.t, defaultPropertyValues[property]);
+      // Set the property to its default value on all selected paths
+      store.setKeyframePropertyMulti(clipId, pathIds, property, keyframe.t, defaultPropertyValues[property]);
     }
   };
 
   const handleTimeChange = () => {
     const newTime = parseFloat(timeValue);
     if (!isNaN(newTime) && newTime >= 0 && newTime <= clipDuration && Math.abs(newTime - keyframe.t) > 0.0001) {
-      store.changeKeyframeTime(clipId, pathId, keyframe.t, newTime);
+      store.changeKeyframeTimeMulti(clipId, pathIds, keyframe.t, newTime);
     }
     setEditingTime(false);
   };
 
   const handleDelete = () => {
-    store.deleteKeyframe(clipId, pathId, keyframe.t);
+    store.deleteKeyframeMulti(clipId, pathIds, keyframe.t);
     store.clearKeyframeSelection();
   };
 
@@ -1346,6 +1557,11 @@ function UnifiedKeyframeProperties({
     }
   };
 
+  const isMultiSelection = pathIds.length > 1;
+  const displayName = isMultiSelection
+    ? `${pathIds.length} paths`
+    : pathNames[0] ?? "Unknown";
+
   return (
     <div className={styles.properties}>
       <div className={styles.section}>
@@ -1355,8 +1571,8 @@ function UnifiedKeyframeProperties({
           <span className={styles.value}>{clipName}</span>
         </div>
         <div className={styles.row}>
-          <label>Path</label>
-          <span className={styles.value}>{pathName}</span>
+          <label>{isMultiSelection ? "Paths" : "Path"}</label>
+          <span className={styles.value} title={pathNames.join(", ")}>{displayName}</span>
         </div>
         <div className={styles.row}>
           <label>Time</label>
@@ -1412,7 +1628,7 @@ function UnifiedKeyframeProperties({
               {isSet ? (
                 <KeyframePropertyInput
                   clipId={clipId}
-                  pathId={pathId}
+                  pathIds={pathIds}
                   property={prop}
                   keyframeTime={keyframe.t}
                   value={value}
