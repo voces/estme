@@ -156,6 +156,11 @@
   flex-shrink: 0;
 }
 
+.rasterIcon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
 /* Drag and drop styles */
 .item.dragging {
   opacity: 0.5;

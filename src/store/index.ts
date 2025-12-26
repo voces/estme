@@ -1,9 +1,9 @@
 import { useCallback, useSyncExternalStore } from "react";
-import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, PathTransform, Point, PointReference, SnapConnection, Tool } from "../types.ts";
+import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
 import { booleanOperation, canBooleanOp, uniteMultiplePaths } from "../pathBool.ts";
-import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, getPathTransformPoint, getSelectionTransformPoint } from "../geometry.ts";
+import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, getPathTransformPoint, getSelectionTransformPoint, getPathBounds, getAnimatedPathBounds } from "../geometry.ts";
 import { applyCommand } from "./commands.ts";
-import { generateId, setCurrentDocumentId } from "../storage.ts";
+import { generateId, saveImage, setCurrentDocumentId } from "../storage.ts";
 import {
   Command,
   EditorState,
@@ -65,6 +65,27 @@ const loadCurrentClipId = (): string | null => {
     return localStorage.getItem("estme:currentClipId");
   } catch {
     return null;
+  }
+};
+
+const loadPlaybackTime = (): number => {
+  try {
+    const saved = localStorage.getItem("estme:playbackTime");
+    if (saved) {
+      const time = parseFloat(saved);
+      if (!isNaN(time) && time >= 0) return time;
+    }
+  } catch {
+    // Ignore
+  }
+  return 0;
+};
+
+const savePlaybackTime = (time: number) => {
+  try {
+    localStorage.setItem("estme:playbackTime", String(time));
+  } catch {
+    // Ignore
   }
 };
 
@@ -148,6 +169,7 @@ const initialState: EditorState = {
   tool: loadTool(),
   paths: [],
   groups: [],
+  rasters: [],
   currentPath: null,
   currentPathId: null,
   hoverPoint: null,
@@ -169,13 +191,14 @@ const initialState: EditorState = {
   clipboard: null,
   pathCounter: 1,
   groupCounter: 1,
+  rasterCounter: 1,
   snapConnections: [],
   pendingBooleanOp: null,
   animationClips: [],
   currentClipId: loadCurrentClipId(),
-  playbackTime: 0,
+  playbackTime: loadPlaybackTime(),
   isPlaying: false,
-  selectedKeyframe: null,
+  selectedKeyframes: [] as SelectedKeyframe[],
   instanceProperties: loadInstanceProperties(),
 };
 
@@ -1172,14 +1195,49 @@ export const store = {
   },
   // Align selected paths horizontally (move all transform points to same X as selection center)
   alignHorizontally: () => {
-    const { selection, paths } = state;
+    const { selection, paths, currentClipId, playbackTime } = state;
     if (selection.pathIds.length < 2) return;
 
     // Get the selection's transform point (target X coordinate)
     const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
     const targetX = selectionTP.x;
 
-    // Calculate deltas for each path
+    // In animation mode, set keyframe tx properties instead of moving geometry
+    if (currentClipId) {
+      const clip = state.animationClips.find((c) => c.id === currentClipId);
+      if (!clip) return;
+
+      const commands: Command[] = [];
+      for (const pathId of selection.pathIds) {
+        const path = paths.find((p) => p.id === pathId);
+        if (!path || path.locked) continue;
+        const pathTP = getPathTransformPoint(path);
+
+        // Get current tx value from animation
+        const prevAnimation = clip.parts[pathId] ?? [];
+        const currentTx = getPropertyValue(prevAnimation, "tx", playbackTime);
+
+        // Calculate required tx to align: targetX = pathTP.x + newTx
+        // So newTx = targetX - pathTP.x
+        const newTx = targetX - pathTP.x;
+        if (Math.abs(newTx - currentTx) > 0.0001) {
+          const newAnimation = setKeyframeProperty(prevAnimation, playbackTime, "tx", newTx);
+          commands.push({
+            type: "setPartAnimation",
+            clipId: currentClipId,
+            partId: pathId,
+            prevAnimation,
+            newAnimation,
+          });
+        }
+      }
+
+      if (commands.length === 0) return;
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+      return;
+    }
+
+    // Not in animation mode - move geometry directly
     const commands: Command[] = [];
     for (const pathId of selection.pathIds) {
       const path = paths.find((p) => p.id === pathId);
@@ -1207,7 +1265,7 @@ export const store = {
               : p
           ),
         };
-        commands.push({ type: "translatePath", id: pathId, dx, dy: 0 });
+        commands.push({ type: "translatePath", id: pathId, dx, dy: 0, skipSnap: true });
       }
     }
 
@@ -1223,14 +1281,49 @@ export const store = {
   },
   // Align selected paths vertically (move all transform points to same Y as selection center)
   alignVertically: () => {
-    const { selection, paths } = state;
+    const { selection, paths, currentClipId, playbackTime } = state;
     if (selection.pathIds.length < 2) return;
 
     // Get the selection's transform point (target Y coordinate)
     const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
     const targetY = selectionTP.y;
 
-    // Calculate deltas for each path
+    // In animation mode, set keyframe ty properties instead of moving geometry
+    if (currentClipId) {
+      const clip = state.animationClips.find((c) => c.id === currentClipId);
+      if (!clip) return;
+
+      const commands: Command[] = [];
+      for (const pathId of selection.pathIds) {
+        const path = paths.find((p) => p.id === pathId);
+        if (!path || path.locked) continue;
+        const pathTP = getPathTransformPoint(path);
+
+        // Get current ty value from animation
+        const prevAnimation = clip.parts[pathId] ?? [];
+        const currentTy = getPropertyValue(prevAnimation, "ty", playbackTime);
+
+        // Calculate required ty to align: targetY = pathTP.y + newTy
+        // So newTy = targetY - pathTP.y
+        const newTy = targetY - pathTP.y;
+        if (Math.abs(newTy - currentTy) > 0.0001) {
+          const newAnimation = setKeyframeProperty(prevAnimation, playbackTime, "ty", newTy);
+          commands.push({
+            type: "setPartAnimation",
+            clipId: currentClipId,
+            partId: pathId,
+            prevAnimation,
+            newAnimation,
+          });
+        }
+      }
+
+      if (commands.length === 0) return;
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+      return;
+    }
+
+    // Not in animation mode - move geometry directly
     const commands: Command[] = [];
     for (const pathId of selection.pathIds) {
       const path = paths.find((p) => p.id === pathId);
@@ -1258,7 +1351,7 @@ export const store = {
               : p
           ),
         };
-        commands.push({ type: "translatePath", id: pathId, dx: 0, dy });
+        commands.push({ type: "translatePath", id: pathId, dx: 0, dy, skipSnap: true });
       }
     }
 
@@ -1272,6 +1365,685 @@ export const store = {
     };
     notify();
   },
+  // Distribute selected paths horizontally with spacing
+  // spacing: 0-100 is percentage (0=aligned centers, 100=stacked end-to-end)
+  // spacing > 100: absolute gap = spacing - 100
+  distributeHorizontally: (spacing: number) => {
+    const { selection, paths, currentClipId, playbackTime } = state;
+    if (selection.pathIds.length < 2) return;
+
+    // Get path info: id, bounds, transform point, current tx
+    type PathInfo = {
+      id: string;
+      path: Path;
+      bounds: { minX: number; maxX: number; width: number };
+      tp: Point;
+      currentTx: number;
+    };
+
+    const clip = currentClipId
+      ? state.animationClips.find((c) => c.id === currentClipId)
+      : null;
+
+    const pathInfos: PathInfo[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue;
+      const tp = getPathTransformPoint(path);
+
+      // Get current animation values
+      const currentTx = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "tx", playbackTime)
+        : 0;
+      const currentTy = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "ty", playbackTime)
+        : 0;
+      const currentRot = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "rot", playbackTime)
+        : 0;
+      const currentScale = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "scale", playbackTime)
+        : 1;
+
+      // Get bounds with animation transforms applied (for rotation awareness)
+      const bounds = clip
+        ? getAnimatedPathBounds(path, currentTx, currentTy, currentRot, currentScale, tp)
+        : getPathBounds(path);
+
+      pathInfos.push({
+        id: pathId,
+        path,
+        bounds: { minX: bounds.minX, maxX: bounds.maxX, width: bounds.maxX - bounds.minX },
+        tp,
+        currentTx,
+      });
+    }
+
+    if (pathInfos.length < 2) return;
+
+    // Sort by current X position (use animated bounds center)
+    pathInfos.sort((a, b) => {
+      const aCenterX = (a.bounds.minX + a.bounds.maxX) / 2;
+      const bCenterX = (b.bounds.minX + b.bounds.maxX) / 2;
+      return aCenterX - bCenterX;
+    });
+
+    // Calculate total width
+    const totalWidth = pathInfos.reduce((sum, p) => sum + p.bounds.width, 0);
+
+    // Calculate target positions
+    let targetPositions: number[];
+
+    if (spacing <= 100) {
+      // Percentage mode: 0% = centers aligned, 100% = stacked end-to-end
+      // At 100%, paths are stacked with no gap
+      // Total span at 100% = totalWidth
+      // At 0%, all centers are at the same point (selection center)
+
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerX = selectionTP.x;
+
+      // At 100%, we stack them. Calculate where each path's center should be
+      // when stacked left-to-right starting from a position that keeps the overall center the same
+      const stackedCenters: number[] = [];
+      let x = 0;
+      for (const p of pathInfos) {
+        stackedCenters.push(x + p.bounds.width / 2);
+        x += p.bounds.width;
+      }
+      // Shift so the overall center is at centerX
+      const stackedCenter = x / 2;
+      const stackedOffset = centerX - stackedCenter;
+      for (let i = 0; i < stackedCenters.length; i++) {
+        stackedCenters[i] += stackedOffset;
+      }
+
+      // Interpolate between aligned (all at centerX) and stacked
+      const t = spacing / 100;
+      targetPositions = pathInfos.map((p, i) => {
+        const alignedCenter = centerX;
+        const stackedTargetCenter = stackedCenters[i];
+        return alignedCenter + (stackedTargetCenter - alignedCenter) * t;
+      });
+    } else {
+      // Absolute gap mode: gap = spacing - 100
+      const gap = spacing - 100;
+
+      // Stack paths with the specified gap, keeping overall center the same
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerX = selectionTP.x;
+
+      const centers: number[] = [];
+      let x = 0;
+      for (const p of pathInfos) {
+        centers.push(x + p.bounds.width / 2);
+        x += p.bounds.width + gap;
+      }
+      // Shift so the overall center is at centerX
+      const totalSpan = x - gap; // Remove last gap
+      const overallCenter = totalSpan / 2;
+      const offset = centerX - overallCenter;
+      targetPositions = centers.map((c) => c + offset);
+    }
+
+    // Apply translations
+    if (currentClipId && clip) {
+      // Animation mode: set keyframe tx properties
+      const commands: Command[] = [];
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        // The animated bounds already include currentTx, so pathCenter is the current animated position
+        // We want to move from current position to target: delta = targetCenter - currentCenter
+        // newTx = currentTx + delta = currentTx + (targetCenter - currentCenter)
+        const currentCenter = (p.bounds.minX + p.bounds.maxX) / 2;
+        const delta = targetCenter - currentCenter;
+        const newTx = p.currentTx + delta;
+        const prevAnimation = clip.parts[p.id] ?? [];
+        if (Math.abs(newTx - p.currentTx) > 0.0001) {
+          const newAnimation = setKeyframeProperty(prevAnimation, playbackTime, "tx", newTx);
+          commands.push({
+            type: "setPartAnimation",
+            clipId: currentClipId,
+            partId: p.id,
+            prevAnimation,
+            newAnimation,
+          });
+        }
+      }
+      if (commands.length === 0) return;
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+    } else {
+      // Geometry mode: translate paths directly
+      const commands: Command[] = [];
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        const pathCenter = (p.bounds.minX + p.bounds.maxX) / 2;
+        const dx = targetCenter - pathCenter;
+        if (Math.abs(dx) > 0.0001) {
+          state = {
+            ...state,
+            paths: state.paths.map((path) =>
+              path.id === p.id
+                ? {
+                    ...path,
+                    segments: path.segments.map((seg) => ({
+                      p0: { x: seg.p0.x + dx, y: seg.p0.y },
+                      c0: { x: seg.c0.x + dx, y: seg.c0.y },
+                      c1: { x: seg.c1.x + dx, y: seg.c1.y },
+                      p1: { x: seg.p1.x + dx, y: seg.p1.y },
+                    })),
+                    transformPoint: path.transformPoint
+                      ? { x: path.transformPoint.x + dx, y: path.transformPoint.y }
+                      : null,
+                  }
+                : path
+            ),
+          };
+          commands.push({ type: "translatePath", id: p.id, dx, dy: 0, skipSnap: true });
+        }
+      }
+      if (commands.length === 0) return;
+      const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+      state = {
+        ...state,
+        undoStack: [...state.undoStack, cmd],
+        redoStack: [],
+        isDirty: true,
+      };
+      notify();
+    }
+  },
+  // Distribute selected paths vertically with spacing
+  // spacing: 0-100 is percentage (0=aligned centers, 100=stacked end-to-end)
+  // spacing > 100: absolute gap = spacing - 100
+  distributeVertically: (spacing: number) => {
+    const { selection, paths, currentClipId, playbackTime } = state;
+    if (selection.pathIds.length < 2) return;
+
+    type PathInfo = {
+      id: string;
+      path: Path;
+      bounds: { minY: number; maxY: number; height: number };
+      tp: Point;
+      currentTy: number;
+    };
+
+    const clip = currentClipId
+      ? state.animationClips.find((c) => c.id === currentClipId)
+      : null;
+
+    const pathInfos: PathInfo[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue;
+      const tp = getPathTransformPoint(path);
+
+      // Get current animation values
+      const currentTx = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "tx", playbackTime)
+        : 0;
+      const currentTy = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "ty", playbackTime)
+        : 0;
+      const currentRot = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "rot", playbackTime)
+        : 0;
+      const currentScale = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "scale", playbackTime)
+        : 1;
+
+      // Get bounds with animation transforms applied (for rotation awareness)
+      const bounds = clip
+        ? getAnimatedPathBounds(path, currentTx, currentTy, currentRot, currentScale, tp)
+        : getPathBounds(path);
+
+      pathInfos.push({
+        id: pathId,
+        path,
+        bounds: { minY: bounds.minY, maxY: bounds.maxY, height: bounds.maxY - bounds.minY },
+        tp,
+        currentTy,
+      });
+    }
+
+    if (pathInfos.length < 2) return;
+
+    // Sort by current Y position (use animated bounds center)
+    pathInfos.sort((a, b) => {
+      const aCenterY = (a.bounds.minY + a.bounds.maxY) / 2;
+      const bCenterY = (b.bounds.minY + b.bounds.maxY) / 2;
+      return aCenterY - bCenterY;
+    });
+
+    // Calculate target positions
+    let targetPositions: number[];
+
+    if (spacing <= 100) {
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerY = selectionTP.y;
+
+      // Calculate stacked positions
+      const stackedCenters: number[] = [];
+      let y = 0;
+      for (const p of pathInfos) {
+        stackedCenters.push(y + p.bounds.height / 2);
+        y += p.bounds.height;
+      }
+      const stackedCenter = y / 2;
+      const stackedOffset = centerY - stackedCenter;
+      for (let i = 0; i < stackedCenters.length; i++) {
+        stackedCenters[i] += stackedOffset;
+      }
+
+      // Interpolate between aligned and stacked
+      const t = spacing / 100;
+      targetPositions = pathInfos.map((p, i) => {
+        const alignedCenter = centerY;
+        const stackedTargetCenter = stackedCenters[i];
+        return alignedCenter + (stackedTargetCenter - alignedCenter) * t;
+      });
+    } else {
+      const gap = spacing - 100;
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerY = selectionTP.y;
+
+      const centers: number[] = [];
+      let y = 0;
+      for (const p of pathInfos) {
+        centers.push(y + p.bounds.height / 2);
+        y += p.bounds.height + gap;
+      }
+      const totalSpan = y - gap;
+      const overallCenter = totalSpan / 2;
+      const offset = centerY - overallCenter;
+      targetPositions = centers.map((c) => c + offset);
+    }
+
+    // Apply translations
+    if (currentClipId && clip) {
+      const commands: Command[] = [];
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        // The animated bounds already include currentTy, so pathCenter is the current animated position
+        // We want to move from current position to target: delta = targetCenter - currentCenter
+        // newTy = currentTy + delta = currentTy + (targetCenter - currentCenter)
+        const currentCenter = (p.bounds.minY + p.bounds.maxY) / 2;
+        const delta = targetCenter - currentCenter;
+        const newTy = p.currentTy + delta;
+        const prevAnimation = clip.parts[p.id] ?? [];
+        if (Math.abs(newTy - p.currentTy) > 0.0001) {
+          const newAnimation = setKeyframeProperty(prevAnimation, playbackTime, "ty", newTy);
+          commands.push({
+            type: "setPartAnimation",
+            clipId: currentClipId,
+            partId: p.id,
+            prevAnimation,
+            newAnimation,
+          });
+        }
+      }
+      if (commands.length === 0) return;
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+    } else {
+      const commands: Command[] = [];
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        const currentCenter = (p.bounds.minY + p.bounds.maxY) / 2;
+        const dy = targetCenter - currentCenter;
+        if (Math.abs(dy) > 0.0001) {
+          state = {
+            ...state,
+            paths: state.paths.map((path) =>
+              path.id === p.id
+                ? {
+                    ...path,
+                    segments: path.segments.map((seg) => ({
+                      p0: { x: seg.p0.x, y: seg.p0.y + dy },
+                      c0: { x: seg.c0.x, y: seg.c0.y + dy },
+                      c1: { x: seg.c1.x, y: seg.c1.y + dy },
+                      p1: { x: seg.p1.x, y: seg.p1.y + dy },
+                    })),
+                    transformPoint: path.transformPoint
+                      ? { x: path.transformPoint.x, y: path.transformPoint.y + dy }
+                      : null,
+                  }
+                : path
+            ),
+          };
+          commands.push({ type: "translatePath", id: p.id, dx: 0, dy, skipSnap: true });
+        }
+      }
+      if (commands.length === 0) return;
+      const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+      state = {
+        ...state,
+        undoStack: [...state.undoStack, cmd],
+        redoStack: [],
+        isDirty: true,
+      };
+      notify();
+    }
+  },
+
+  // Snapshot for distribute preview - captures paths and animation clips
+  getDistributeSnapshot: () => {
+    return {
+      paths: JSON.parse(JSON.stringify(state.paths)),
+      animationClips: JSON.parse(JSON.stringify(state.animationClips)),
+    };
+  },
+
+  // Restore from distribute snapshot (no undo, just silently restore)
+  restoreDistributeSnapshot: (snapshot: { paths: Path[]; animationClips: AnimationClip[] }) => {
+    state = {
+      ...state,
+      paths: snapshot.paths,
+      animationClips: snapshot.animationClips,
+    };
+    notify();
+  },
+
+  // Preview versions of distribute - apply changes without adding to undo stack
+  distributeHorizontallyPreview: (spacing: number) => {
+    const { selection, paths, currentClipId, playbackTime } = state;
+    if (selection.pathIds.length < 2) return;
+
+    type PathInfo = {
+      id: string;
+      path: Path;
+      bounds: { minX: number; maxX: number; width: number };
+      tp: Point;
+      currentTx: number;
+    };
+
+    const clip = currentClipId
+      ? state.animationClips.find((c) => c.id === currentClipId)
+      : null;
+
+    const pathInfos: PathInfo[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue;
+      const tp = getPathTransformPoint(path);
+
+      // Get current animation values
+      const currentTx = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "tx", playbackTime)
+        : 0;
+      const currentTy = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "ty", playbackTime)
+        : 0;
+      const currentRot = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "rot", playbackTime)
+        : 0;
+      const currentScale = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "scale", playbackTime)
+        : 1;
+
+      // Get bounds with animation transforms applied (for rotation awareness)
+      const bounds = clip
+        ? getAnimatedPathBounds(path, currentTx, currentTy, currentRot, currentScale, tp)
+        : getPathBounds(path);
+
+      pathInfos.push({
+        id: pathId,
+        path,
+        bounds: { minX: bounds.minX, maxX: bounds.maxX, width: bounds.maxX - bounds.minX },
+        tp,
+        currentTx,
+      });
+    }
+
+    if (pathInfos.length < 2) return;
+
+    // Sort by current X position (use animated bounds center)
+    pathInfos.sort((a, b) => {
+      const aCenterX = (a.bounds.minX + a.bounds.maxX) / 2;
+      const bCenterX = (b.bounds.minX + b.bounds.maxX) / 2;
+      return aCenterX - bCenterX;
+    });
+
+    const totalWidth = pathInfos.reduce((sum, p) => sum + p.bounds.width, 0);
+    let targetPositions: number[];
+
+    if (spacing <= 100) {
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerX = selectionTP.x;
+      const stackedCenters: number[] = [];
+      let x = 0;
+      for (const p of pathInfos) {
+        stackedCenters.push(x + p.bounds.width / 2);
+        x += p.bounds.width;
+      }
+      const stackedCenter = x / 2;
+      const stackedOffset = centerX - stackedCenter;
+      for (let i = 0; i < stackedCenters.length; i++) {
+        stackedCenters[i] += stackedOffset;
+      }
+      const t = spacing / 100;
+      targetPositions = pathInfos.map((p, i) => {
+        const alignedCenter = centerX;
+        const stackedTargetCenter = stackedCenters[i];
+        return alignedCenter + (stackedTargetCenter - alignedCenter) * t;
+      });
+    } else {
+      const gap = spacing - 100;
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerX = selectionTP.x;
+      const centers: number[] = [];
+      let x = 0;
+      for (const p of pathInfos) {
+        centers.push(x + p.bounds.width / 2);
+        x += p.bounds.width + gap;
+      }
+      const totalSpan = x - gap;
+      const overallCenter = totalSpan / 2;
+      const offset = centerX - overallCenter;
+      targetPositions = centers.map((c) => c + offset);
+    }
+
+    // Apply translations without undo
+    if (currentClipId && clip) {
+      let newClips = state.animationClips;
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        const currentCenter = (p.bounds.minX + p.bounds.maxX) / 2;
+        const delta = targetCenter - currentCenter;
+        const newTx = p.currentTx + delta;
+        const currentClip = newClips.find((c) => c.id === currentClipId)!;
+        const prevAnimation = currentClip.parts[p.id] ?? [];
+        const newAnimation = setKeyframeProperty(prevAnimation, playbackTime, "tx", newTx);
+        newClips = newClips.map((c) =>
+          c.id === currentClipId
+            ? { ...c, parts: { ...c.parts, [p.id]: newAnimation } }
+            : c
+        );
+      }
+      state = { ...state, animationClips: newClips };
+    } else {
+      let newPaths = state.paths;
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        const currentCenter = (p.bounds.minX + p.bounds.maxX) / 2;
+        const dx = targetCenter - currentCenter;
+        if (Math.abs(dx) > 0.0001) {
+          newPaths = newPaths.map((path) =>
+            path.id === p.id
+              ? {
+                  ...path,
+                  segments: path.segments.map((seg) => ({
+                    p0: { x: seg.p0.x + dx, y: seg.p0.y },
+                    c0: { x: seg.c0.x + dx, y: seg.c0.y },
+                    c1: { x: seg.c1.x + dx, y: seg.c1.y },
+                    p1: { x: seg.p1.x + dx, y: seg.p1.y },
+                  })),
+                  transformPoint: path.transformPoint
+                    ? { x: path.transformPoint.x + dx, y: path.transformPoint.y }
+                    : null,
+                }
+              : path
+          );
+        }
+      }
+      state = { ...state, paths: newPaths };
+    }
+    notify();
+  },
+
+  distributeVerticallyPreview: (spacing: number) => {
+    const { selection, paths, currentClipId, playbackTime } = state;
+    if (selection.pathIds.length < 2) return;
+
+    type PathInfo = {
+      id: string;
+      path: Path;
+      bounds: { minY: number; maxY: number; height: number };
+      tp: Point;
+      currentTy: number;
+    };
+
+    const clip = currentClipId
+      ? state.animationClips.find((c) => c.id === currentClipId)
+      : null;
+
+    const pathInfos: PathInfo[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue;
+      const tp = getPathTransformPoint(path);
+
+      // Get current animation values
+      const currentTx = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "tx", playbackTime)
+        : 0;
+      const currentTy = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "ty", playbackTime)
+        : 0;
+      const currentRot = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "rot", playbackTime)
+        : 0;
+      const currentScale = clip
+        ? getPropertyValue(clip.parts[pathId] ?? [], "scale", playbackTime)
+        : 1;
+
+      // Get bounds with animation transforms applied (for rotation awareness)
+      const bounds = clip
+        ? getAnimatedPathBounds(path, currentTx, currentTy, currentRot, currentScale, tp)
+        : getPathBounds(path);
+
+      pathInfos.push({
+        id: pathId,
+        path,
+        bounds: { minY: bounds.minY, maxY: bounds.maxY, height: bounds.maxY - bounds.minY },
+        tp,
+        currentTy,
+      });
+    }
+
+    if (pathInfos.length < 2) return;
+
+    // Sort by current Y position (use animated bounds center)
+    pathInfos.sort((a, b) => {
+      const aCenterY = (a.bounds.minY + a.bounds.maxY) / 2;
+      const bCenterY = (b.bounds.minY + b.bounds.maxY) / 2;
+      return aCenterY - bCenterY;
+    });
+
+    const totalHeight = pathInfos.reduce((sum, p) => sum + p.bounds.height, 0);
+    let targetPositions: number[];
+
+    if (spacing <= 100) {
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerY = selectionTP.y;
+      const stackedCenters: number[] = [];
+      let y = 0;
+      for (const p of pathInfos) {
+        stackedCenters.push(y + p.bounds.height / 2);
+        y += p.bounds.height;
+      }
+      const stackedCenter = y / 2;
+      const stackedOffset = centerY - stackedCenter;
+      for (let i = 0; i < stackedCenters.length; i++) {
+        stackedCenters[i] += stackedOffset;
+      }
+      const t = spacing / 100;
+      targetPositions = pathInfos.map((p, i) => {
+        const alignedCenter = centerY;
+        const stackedTargetCenter = stackedCenters[i];
+        return alignedCenter + (stackedTargetCenter - alignedCenter) * t;
+      });
+    } else {
+      const gap = spacing - 100;
+      const selectionTP = getSelectionTransformPoint(paths, selection.pathIds);
+      const centerY = selectionTP.y;
+      const centers: number[] = [];
+      let y = 0;
+      for (const p of pathInfos) {
+        centers.push(y + p.bounds.height / 2);
+        y += p.bounds.height + gap;
+      }
+      const totalSpan = y - gap;
+      const overallCenter = totalSpan / 2;
+      const offset = centerY - overallCenter;
+      targetPositions = centers.map((c) => c + offset);
+    }
+
+    // Apply translations without undo
+    if (currentClipId && clip) {
+      let newClips = state.animationClips;
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        const currentCenter = (p.bounds.minY + p.bounds.maxY) / 2;
+        const delta = targetCenter - currentCenter;
+        const newTy = p.currentTy + delta;
+        const currentClip = newClips.find((c) => c.id === currentClipId)!;
+        const prevAnimation = currentClip.parts[p.id] ?? [];
+        const newAnimation = setKeyframeProperty(prevAnimation, playbackTime, "ty", newTy);
+        newClips = newClips.map((c) =>
+          c.id === currentClipId
+            ? { ...c, parts: { ...c.parts, [p.id]: newAnimation } }
+            : c
+        );
+      }
+      state = { ...state, animationClips: newClips };
+    } else {
+      let newPaths = state.paths;
+      for (let i = 0; i < pathInfos.length; i++) {
+        const p = pathInfos[i];
+        const targetCenter = targetPositions[i];
+        const currentCenter = (p.bounds.minY + p.bounds.maxY) / 2;
+        const dy = targetCenter - currentCenter;
+        if (Math.abs(dy) > 0.0001) {
+          newPaths = newPaths.map((path) =>
+            path.id === p.id
+              ? {
+                  ...path,
+                  segments: path.segments.map((seg) => ({
+                    p0: { x: seg.p0.x, y: seg.p0.y + dy },
+                    c0: { x: seg.c0.x, y: seg.c0.y + dy },
+                    c1: { x: seg.c1.x, y: seg.c1.y + dy },
+                    p1: { x: seg.p1.x, y: seg.p1.y + dy },
+                  })),
+                  transformPoint: path.transformPoint
+                    ? { x: path.transformPoint.x, y: path.transformPoint.y + dy }
+                    : null,
+                }
+              : path
+          );
+        }
+      }
+      state = { ...state, paths: newPaths };
+    }
+    notify();
+  },
+
   // Bake transform - apply animation transforms to geometry and reset them
   bakeTransform: (id: string) => {
     const path = state.paths.find((p) => p.id === id);
@@ -1722,8 +2494,8 @@ export const store = {
       throttledNotify();
     }
   },
-  commitMoveHandle: (id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number, snapConnection?: { points: PointReference[] }) => {
-    const moveCmd: Command = { type: "moveHandle", id, segmentIndex, handleType, dx, dy };
+  commitMoveHandle: (id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number, snapConnection?: { points: PointReference[] }, mirrorMove?: { segmentIndex: number; handleType: HandleType; dx: number; dy: number }) => {
+    const moveCmd: Command = { type: "moveHandle", id, segmentIndex, handleType, dx, dy, mirrorMove };
 
     // If snapping, batch the move with the snap connection creation
     if (snapConnection) {
@@ -1860,9 +2632,10 @@ export const store = {
       const c0Active = prevMeta.rightActive;
       const c1Active = prevMeta.leftActive;
 
-      // If a specific handle is selected, adjust it to mirror the other one
+      // If a specific handle is selected, move the SELECTED handle to mirror the other one
+      // (the other handle stays fixed, the selected one moves)
       if (selectedHandle === "c0" && c1Active) {
-        // c0 is selected - adjust c0 to mirror c1's angle (keep c0's distance)
+        // c0 is selected - move c0 to mirror c1's angle (keep c0's distance)
         const vecX = prevC1.x - anchor.x;
         const vecY = prevC1.y - anchor.y;
         const dist = Math.sqrt(vecX * vecX + vecY * vecY);
@@ -1879,7 +2652,7 @@ export const store = {
           newMeta.rightActive = true;
         }
       } else if (selectedHandle === "c1" && c0Active) {
-        // c1 is selected - adjust c1 to mirror c0's angle (keep c1's distance)
+        // c1 is selected - move c1 to mirror c0's angle (keep c1's distance)
         const vecX = prevC0.x - anchor.x;
         const vecY = prevC0.y - anchor.y;
         const dist = Math.sqrt(vecX * vecX + vecY * vecY);
@@ -1894,6 +2667,30 @@ export const store = {
             y: anchor.y - (vecY / dist) * useDist,
           };
           newMeta.leftActive = true;
+        }
+      } else if (selectedHandle === "c0" && !c1Active) {
+        // c0 is selected but c1 doesn't exist - create c1 by mirroring c0
+        const vecX = prevC0.x - anchor.x;
+        const vecY = prevC0.y - anchor.y;
+        const dist = Math.sqrt(vecX * vecX + vecY * vecY);
+        if (dist > 0.001) {
+          newC1 = {
+            x: anchor.x - (vecX / dist) * dist,
+            y: anchor.y - (vecY / dist) * dist,
+          };
+          newMeta.leftActive = true;
+        }
+      } else if (selectedHandle === "c1" && !c0Active) {
+        // c1 is selected but c0 doesn't exist - create c0 by mirroring c1
+        const vecX = prevC1.x - anchor.x;
+        const vecY = prevC1.y - anchor.y;
+        const dist = Math.sqrt(vecX * vecX + vecY * vecY);
+        if (dist > 0.001) {
+          newC0 = {
+            x: anchor.x - (vecX / dist) * dist,
+            y: anchor.y - (vecY / dist) * dist,
+          };
+          newMeta.rightActive = true;
         }
       } else if (c0Active && !c1Active) {
         // No specific handle selected, c0 is active but c1 is not - mirror c0 to create c1
@@ -2366,6 +3163,49 @@ export const store = {
     if (!path || path.name === name) return;
     executeCommand({ type: "setPathName", id: pathId, prevName: path.name, newName: name });
   },
+  // Raster visibility/lock/name methods
+  setRasterVisible: (rasterId: string, visible: boolean) => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster || raster.visible === visible) return;
+    executeCommand({ type: "setRasterVisible", id: rasterId, visible });
+  },
+  setRasterLocked: (rasterId: string, locked: boolean) => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster || raster.locked === locked) return;
+    executeCommand({ type: "setRasterLocked", id: rasterId, locked });
+  },
+  setRasterName: (rasterId: string, name: string) => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster || raster.name === name) return;
+    executeCommand({ type: "setRasterName", id: rasterId, prevName: raster.name, newName: name });
+  },
+  setRasterOpacity: (rasterId: string, opacity: number) => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster || raster.opacity === opacity) return;
+    executeCommand({ type: "setRasterOpacity", id: rasterId, prevOpacity: raster.opacity, newOpacity: opacity });
+  },
+  setRasterPosition: (rasterId: string, x: number, y: number) => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster || (raster.x === x && raster.y === y)) return;
+    executeCommand({ type: "setRasterPosition", id: rasterId, prevX: raster.x, prevY: raster.y, newX: x, newY: y });
+  },
+  setRasterSize: (rasterId: string, width: number, height: number) => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster || (raster.width === width && raster.height === height)) return;
+    executeCommand({ type: "setRasterSize", id: rasterId, prevWidth: raster.width, prevHeight: raster.height, newWidth: width, newHeight: height });
+  },
+  setRasterTransform: (rasterId: string, transform: PathTransform) => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster) return;
+    const prev = raster.transform;
+    if (prev.tx === transform.tx && prev.ty === transform.ty && prev.rot === transform.rot && prev.scale === transform.scale) return;
+    executeCommand({ type: "setRasterTransform", id: rasterId, prevTransform: prev, newTransform: transform });
+  },
+  setRasterRenderOrder: (rasterId: string, renderOrder: "front" | "back") => {
+    const raster = state.rasters.find((r) => r.id === rasterId);
+    if (!raster || raster.renderOrder === renderOrder) return;
+    executeCommand({ type: "setRasterRenderOrder", id: rasterId, renderOrder });
+  },
   // Set transform point for a path or group (with undo)
   setTransformPoint: (itemId: string, itemType: "path" | "group", point: Point | null) => {
     if (itemType === "path") {
@@ -2758,7 +3598,77 @@ export const store = {
 
   // System clipboard operations (async, uses navigator.clipboard API)
   copyToClipboard: async () => {
-    const { selection, paths } = state;
+    const { selection, paths, selectedKeyframes, currentClipId, animationClips } = state;
+
+    // If keyframes are selected, copy them instead of paths
+    if (selectedKeyframes.length > 0 && currentClipId) {
+      const clip = animationClips.find((c) => c.id === currentClipId);
+      if (clip) {
+        // Find the minimum time among selected keyframes (as base reference)
+        const times = selectedKeyframes.map((kf) => kf.time);
+        const baseTime = Math.min(...times);
+
+        // Collect keyframe data for each selected keyframe
+        const keyframeData: { partId: string; keyframe: { t: number; tx?: number; ty?: number; rot?: number; scale?: number; opacity?: number } }[] = [];
+
+        for (const sel of selectedKeyframes) {
+          const partAnim = clip.parts[sel.pathId];
+          if (!partAnim) continue;
+
+          // Find the keyframe at this time
+          const kf = partAnim.find((k) => Math.abs(k.t - sel.time) < 0.0001);
+          if (!kf) continue;
+
+          // Store with relative time offset from base time
+          keyframeData.push({
+            partId: sel.pathId,
+            keyframe: {
+              t: kf.t - baseTime, // Relative time offset
+              tx: kf.tx,
+              ty: kf.ty,
+              rot: kf.rot,
+              scale: kf.scale,
+              opacity: kf.opacity,
+            },
+          });
+        }
+
+        if (keyframeData.length > 0) {
+          const clipboardData = {
+            type: "estme-keyframes" as const,
+            version: 1,
+            keyframes: keyframeData,
+            baseTime,
+          };
+
+          try {
+            await navigator.clipboard.writeText(JSON.stringify(clipboardData, null, 2));
+            // Also update internal clipboard for fallback
+            state = {
+              ...state,
+              clipboard: {
+                type: "keyframes",
+                keyframes: keyframeData,
+                baseTime,
+              },
+            };
+            notify();
+          } catch (e) {
+            console.warn("Failed to write to system clipboard, using internal clipboard:", e);
+            state = {
+              ...state,
+              clipboard: {
+                type: "keyframes",
+                keyframes: keyframeData,
+                baseTime,
+              },
+            };
+            notify();
+          }
+        }
+        return;
+      }
+    }
 
     // If full paths are selected, copy them
     if (selection.pathIds.length > 0) {
@@ -2806,6 +3716,22 @@ export const store = {
 
   pasteFromClipboard: async () => {
     try {
+      // First, try to read clipboard items (for images)
+      try {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          // Check for image types
+          const imageType = item.types.find((t) => t.startsWith("image/"));
+          if (imageType) {
+            const blob = await item.getType(imageType);
+            await store._pasteImageBlob(blob);
+            return;
+          }
+        }
+      } catch {
+        // Clipboard.read() not supported or no items, try text
+      }
+
       const text = await navigator.clipboard.readText();
 
       // Try to parse as estme JSON format
@@ -2813,6 +3739,10 @@ export const store = {
         const data = JSON.parse(text);
         if (data.type === "estme-paths" && Array.isArray(data.paths)) {
           store._pasteEstmePaths(data.paths);
+          return;
+        }
+        if (data.type === "estme-keyframes" && Array.isArray(data.keyframes)) {
+          store._pasteEstmeKeyframes(data.keyframes);
           return;
         }
       } catch {
@@ -2862,16 +3792,75 @@ export const store = {
       }
 
       // Fallback to internal paste
-      if (store.canPaste()) {
-        store.paste();
-      }
+      store._pasteFromInternalClipboard();
     } catch (e) {
       // Clipboard read failed, fallback to internal paste
       console.warn("Failed to read system clipboard, using internal clipboard:", e);
-      if (store.canPaste()) {
-        store.paste();
-      }
+      store._pasteFromInternalClipboard();
     }
+  },
+
+  // Internal helper to paste from internal clipboard
+  _pasteFromInternalClipboard: () => {
+    const { clipboard } = state;
+    if (!clipboard) return;
+
+    if (clipboard.type === "keyframes") {
+      store._pasteEstmeKeyframes(clipboard.keyframes);
+    } else if (clipboard.type === "paths") {
+      store.paste();
+    }
+  },
+
+  // Internal helper to paste an image blob as a raster
+  _pasteImageBlob: async (blob: Blob) => {
+    // Load the image to get dimensions
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = url;
+    });
+
+    const width = img.naturalWidth;
+    const height = img.naturalHeight;
+    URL.revokeObjectURL(url);
+
+    // Generate IDs
+    const rasterId = crypto.randomUUID();
+    const imageId = crypto.randomUUID();
+
+    // Save the image blob to IndexedDB
+    await saveImage(imageId, blob);
+
+    // Create the raster
+    const raster: Raster = {
+      id: rasterId,
+      name: `Raster ${state.rasterCounter}`,
+      parentId: null,
+      imageId,
+      x: 0,
+      y: 0,
+      width,
+      height,
+      opacity: 1,
+      visible: true,
+      locked: false,
+      transform: defaultTransform(),
+      transformPoint: null,
+      renderOrder: "back",
+    };
+
+    // Execute command and update state
+    executeCommand({ type: "addRaster", raster });
+    state = {
+      ...state,
+      rasterCounter: state.rasterCounter + 1,
+      selection: { pathIds: [rasterId], points: [] },
+    };
+    notify();
   },
 
   // Internal helper to paste estme-format paths
@@ -2946,6 +3935,87 @@ export const store = {
       ...state,
       pathCounter: pCounter,
       selection: { pathIds: pastedPaths.map((p) => p.id), points: [] },
+    };
+    notify();
+  },
+
+  // Internal helper to paste keyframes at current playback time
+  _pasteEstmeKeyframes: (keyframesData: Array<{
+    partId: string;
+    keyframe: { t: number; tx?: number; ty?: number; rot?: number; scale?: number; opacity?: number };
+  }>) => {
+    const { currentClipId, animationClips, playbackTime, paths, groups } = state;
+    if (!currentClipId) return;
+
+    const clip = animationClips.find((c) => c.id === currentClipId);
+    if (!clip) return;
+
+    // Validate that the partIds exist (either as paths or groups)
+    const validPartIds = new Set([...paths.map((p) => p.id), ...groups.map((g) => g.id)]);
+    const validKeyframes = keyframesData.filter((kf) => validPartIds.has(kf.partId));
+
+    if (validKeyframes.length === 0) return;
+
+    // Paste keyframes at current playback time (adjusting for relative time offsets)
+    const commands: Command[] = [];
+    const newSelectedKeyframes: SelectedKeyframe[] = [];
+
+    for (const kfData of validKeyframes) {
+      const { partId, keyframe } = kfData;
+      const targetTime = Math.max(0, Math.min(clip.duration, playbackTime + keyframe.t));
+
+      const prevAnimation = clip.parts[partId] ?? [];
+
+      // Check if there's already a keyframe at this time
+      const existingIdx = prevAnimation.findIndex((k) => Math.abs(k.t - targetTime) < 0.0001);
+
+      let newAnimation: PartAnimation;
+      if (existingIdx >= 0) {
+        // Merge with existing keyframe
+        newAnimation = prevAnimation.map((k, i) => {
+          if (i !== existingIdx) return k;
+          return {
+            ...k,
+            t: targetTime,
+            tx: keyframe.tx ?? k.tx,
+            ty: keyframe.ty ?? k.ty,
+            rot: keyframe.rot ?? k.rot,
+            scale: keyframe.scale ?? k.scale,
+            opacity: keyframe.opacity ?? k.opacity,
+          };
+        });
+      } else {
+        // Add new keyframe
+        newAnimation = [...prevAnimation, {
+          t: targetTime,
+          tx: keyframe.tx,
+          ty: keyframe.ty,
+          rot: keyframe.rot,
+          scale: keyframe.scale,
+          opacity: keyframe.opacity,
+        }].sort((a, b) => a.t - b.t);
+      }
+
+      commands.push({
+        type: "setPartAnimation",
+        clipId: currentClipId,
+        partId,
+        prevAnimation,
+        newAnimation,
+      });
+
+      newSelectedKeyframes.push({ pathId: partId, time: targetTime });
+    }
+
+    if (commands.length === 0) return;
+
+    const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+    executeCommand(cmd);
+
+    // Select the pasted keyframes
+    state = {
+      ...state,
+      selectedKeyframes: newSelectedKeyframes,
     };
     notify();
   },
@@ -3034,13 +4104,24 @@ export const store = {
 
     // Deep copy helper for anchor meta
     const copyMeta = (meta: AnchorMeta): AnchorMeta => ({ ...meta });
+    // Copy meta but reset mirroring (for split point anchors)
+    const copyMetaNoMirror = (meta: AnchorMeta): AnchorMeta => ({
+      ...meta,
+      mirrorAngle: false,
+      mirrorDistance: false,
+    });
 
     // Path 1: segments from idx1 to idx2-1, plus a closing segment from idx2 back to idx1
     const segments1: CubicSegment[] = [];
     const meta1: AnchorMeta[] = [];
     for (let i = idx1; i < idx2; i++) {
       segments1.push(copySegment(path.segments[i]));
-      meta1.push(copyMeta(path.anchorMeta[i]));
+      // Reset mirroring on the first anchor (idx1) since it's a split point
+      if (i === idx1) {
+        meta1.push(copyMetaNoMirror(path.anchorMeta[i]));
+      } else {
+        meta1.push(copyMeta(path.anchorMeta[i]));
+      }
     }
     // Add closing segment from anchor at idx2 back to anchor at idx1
     const closingSeg1 = lineSegment(
@@ -3048,14 +4129,22 @@ export const store = {
       path.segments[idx1].p0 // Position of anchor idx1
     );
     segments1.push(closingSeg1);
-    meta1.push(copyMeta(path.anchorMeta[idx2]));
+    // Reset mirroring on the last anchor (idx2) since it's a split point
+    meta1.push(copyMetaNoMirror(path.anchorMeta[idx2]));
 
     // Path 2: segments from idx2 wrapping to idx1, plus a closing segment from idx1 back to idx2
     const segments2: CubicSegment[] = [];
     const meta2: AnchorMeta[] = [];
+    let isFirst = true;
     for (let i = idx2; i !== idx1; i = (i + 1) % n) {
       segments2.push(copySegment(path.segments[i]));
-      meta2.push(copyMeta(path.anchorMeta[i]));
+      // Reset mirroring on the first anchor (idx2) since it's a split point
+      if (isFirst) {
+        meta2.push(copyMetaNoMirror(path.anchorMeta[i]));
+        isFirst = false;
+      } else {
+        meta2.push(copyMeta(path.anchorMeta[i]));
+      }
     }
     // Add closing segment from anchor at idx1 back to anchor at idx2
     const closingSeg2 = lineSegment(
@@ -3063,11 +4152,12 @@ export const store = {
       path.segments[idx2 === n ? 0 : idx2].p0 // Position of anchor idx2
     );
     segments2.push(closingSeg2);
-    meta2.push(copyMeta(path.anchorMeta[idx1]));
+    // Reset mirroring on the last anchor (idx1) since it's a split point
+    meta2.push(copyMetaNoMirror(path.anchorMeta[idx1]));
 
     const newPath1: Path = {
       id: crypto.randomUUID(),
-      name: store.getNextPathName(),
+      name: `${path.name} 1`,
       parentId: path.parentId, // Inherit parent from original path
       segments: segments1,
       anchorMeta: meta1,
@@ -3083,7 +4173,7 @@ export const store = {
 
     const newPath2: Path = {
       id: crypto.randomUUID(),
-      name: store.getNextPathName(),
+      name: `${path.name} 2`,
       parentId: path.parentId, // Inherit parent from original path
       segments: segments2,
       anchorMeta: meta2,
@@ -3107,7 +4197,7 @@ export const store = {
 
     // Batch the split command with the snap connection commands for proper undo/redo
     const commands: Command[] = [
-      { type: "splitPath", originalPath: path, newPath1, newPath2 },
+      { type: "splitPath", originalPath: path, newPath1, newPath2, idx1, idx2 },
     ];
 
     // Connect the two anchors at idx1's original position
@@ -3405,6 +4495,54 @@ export const store = {
     return chain;
   },
 
+  // Check if a path/raster/group is effectively selected (directly or via ancestor group)
+  isEffectivelySelected: (id: string): boolean => {
+    const { selection } = state;
+    // Directly selected
+    if (selection.pathIds.includes(id)) return true;
+
+    // Check if any ancestor group is selected
+    const path = state.paths.find((p) => p.id === id);
+    const raster = state.rasters.find((r) => r.id === id);
+    const group = state.groups.find((g) => g.id === id);
+
+    let parentId: string | null = null;
+    if (path) parentId = path.parentId;
+    else if (raster) parentId = raster.parentId;
+    else if (group) parentId = group.parentId;
+
+    while (parentId) {
+      if (selection.pathIds.includes(parentId)) return true;
+      const parentGroup = state.groups.find((g) => g.id === parentId);
+      parentId = parentGroup?.parentId ?? null;
+    }
+    return false;
+  },
+
+  // Get the selected ancestor group ID if the item is selected via an ancestor
+  // Returns null if the item is directly selected or not selected at all
+  getSelectedAncestorGroupId: (id: string): string | null => {
+    const { selection } = state;
+    // Directly selected - no ancestor
+    if (selection.pathIds.includes(id)) return null;
+
+    const path = state.paths.find((p) => p.id === id);
+    const raster = state.rasters.find((r) => r.id === id);
+    const group = state.groups.find((g) => g.id === id);
+
+    let parentId: string | null = null;
+    if (path) parentId = path.parentId;
+    else if (raster) parentId = raster.parentId;
+    else if (group) parentId = group.parentId;
+
+    while (parentId) {
+      if (selection.pathIds.includes(parentId)) return parentId;
+      const parentGroup = state.groups.find((g) => g.id === parentId);
+      parentId = parentGroup?.parentId ?? null;
+    }
+    return null;
+  },
+
   // Find the lowest common ancestor of multiple parent chains
   findLowestCommonAncestor: (parentIds: (string | null)[]): string | null => {
     if (parentIds.length === 0) return null;
@@ -3657,11 +4795,15 @@ export const store = {
   },
 
   // Move item to a different parent group (or root if null)
-  moveItemToGroup: (itemId: string, itemType: "path" | "group", newParentId: string | null) => {
+  moveItemToGroup: (itemId: string, itemType: "path" | "group" | "raster", newParentId: string | null) => {
     if (itemType === "path") {
       const path = state.paths.find((p) => p.id === itemId);
       if (!path || path.parentId === newParentId) return;
       executeCommand({ type: "moveToGroup", itemId, itemType: "path", prevParentId: path.parentId, newParentId });
+    } else if (itemType === "raster") {
+      const raster = state.rasters.find((r) => r.id === itemId);
+      if (!raster || raster.parentId === newParentId) return;
+      executeCommand({ type: "moveToGroup", itemId, itemType: "raster", prevParentId: raster.parentId, newParentId });
     } else {
       const group = state.groups.find((g) => g.id === itemId);
       if (!group || group.parentId === newParentId) return;
@@ -3676,13 +4818,33 @@ export const store = {
 
   // Reposition paths to be before or after a target path in the array
   // When moving a group, moves all its descendant paths together
+  // For rasters, reorders in the rasters array
   repositionItem: (
     itemId: string,
-    itemType: "path" | "group",
+    itemType: "path" | "group" | "raster",
     targetId: string,
-    targetType: "path" | "group",
+    targetType: "path" | "group" | "raster",
     position: "before" | "after"
   ) => {
+    // Handle raster repositioning separately (rasters can only be repositioned relative to rasters)
+    if (itemType === "raster") {
+      if (targetType !== "raster") return; // Can't mix rasters with paths/groups for now
+      const fromIndex = state.rasters.findIndex((r) => r.id === itemId);
+      let toIndex = state.rasters.findIndex((r) => r.id === targetId);
+      if (fromIndex === -1 || toIndex === -1) return;
+      if (position === "after") toIndex++;
+      // Adjust for removal
+      if (fromIndex < toIndex) toIndex--;
+      if (fromIndex === toIndex) return;
+      executeCommand({
+        type: "reorderItem",
+        itemId,
+        itemType: "raster",
+        prevIndex: fromIndex,
+        newIndex: toIndex,
+      });
+      return;
+    }
     // Get the path IDs that need to be moved (preserving their relative order)
     let pathIdsToMove: string[];
     if (itemType === "path") {
@@ -4248,7 +5410,7 @@ export const store = {
     state = {
       ...state,
       currentClipId: clipWithDefaults.id,
-      selectedKeyframe: firstPath ? { pathId: firstPath.id, time: 0 } : null,
+      selectedKeyframes: firstPath ? [{ pathId: firstPath.id, time: 0 }] : [],
     };
     notify();
   },
@@ -4398,18 +5560,18 @@ export const store = {
   // ============================================================================
 
   // Set a property on keyframes for multiple paths at once
+  // pathTimes maps each pathId to the time at which to set the property
   setKeyframePropertyMulti: (
     clipId: string,
-    partIds: string[],
+    pathTimes: Map<string, number>,
     property: AnimatableProperty,
-    t: number,
     value: number,
   ) => {
     const clip = state.animationClips.find((c) => c.id === clipId);
-    if (!clip || partIds.length === 0) return;
+    if (!clip || pathTimes.size === 0) return;
 
     const commands: Command[] = [];
-    for (const partId of partIds) {
+    for (const [partId, t] of pathTimes) {
       const prevAnimation = clip.parts[partId] ?? [];
       const newAnimation = setKeyframeProperty(prevAnimation, t, property, value);
       commands.push({
@@ -4425,18 +5587,18 @@ export const store = {
   },
 
   // Set a property on keyframes for multiple paths LIVE (no undo entry)
+  // pathTimes maps each pathId to the time at which to set the property
   setKeyframePropertyLiveMulti: (
     clipId: string,
-    partIds: string[],
+    pathTimes: Map<string, number>,
     property: AnimatableProperty,
-    t: number,
     value: number,
   ) => {
     const clip = state.animationClips.find((c) => c.id === clipId);
-    if (!clip || partIds.length === 0) return;
+    if (!clip || pathTimes.size === 0) return;
 
     const newParts = { ...clip.parts };
-    for (const partId of partIds) {
+    for (const [partId, t] of pathTimes) {
       const prevAnimation = newParts[partId] ?? [];
       newParts[partId] = setKeyframeProperty(prevAnimation, t, property, value);
     }
@@ -4478,17 +5640,17 @@ export const store = {
   },
 
   // Unset a property on keyframes for multiple paths
+  // pathTimes maps each pathId to the time at which to unset the property
   unsetKeyframePropertyMulti: (
     clipId: string,
-    partIds: string[],
+    pathTimes: Map<string, number>,
     property: AnimatableProperty,
-    t: number,
   ) => {
     const clip = state.animationClips.find((c) => c.id === clipId);
-    if (!clip || partIds.length === 0) return;
+    if (!clip || pathTimes.size === 0) return;
 
     const commands: Command[] = [];
-    for (const partId of partIds) {
+    for (const [partId, t] of pathTimes) {
       const partAnim = clip.parts[partId];
       if (!partAnim) continue;
 
@@ -4568,11 +5730,500 @@ export const store = {
       executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
     }
 
-    // Update selected keyframe time
-    if (state.selectedKeyframe && Math.abs(state.selectedKeyframe.time - oldTime) < 0.0001) {
-      state = { ...state, selectedKeyframe: { ...state.selectedKeyframe, time: newTime } };
+    // Update selected keyframe times
+    const updatedKeyframes = state.selectedKeyframes.map((kf) =>
+      Math.abs(kf.time - oldTime) < 0.0001 ? { ...kf, time: newTime } : kf
+    );
+    if (JSON.stringify(updatedKeyframes) !== JSON.stringify(state.selectedKeyframes)) {
+      state = { ...state, selectedKeyframes: updatedKeyframes };
       notify();
     }
+  },
+
+  // Change keyframe time LIVE for multiple keyframes (no undo entry - used during drag)
+  // Takes the original animations (before drag started) and applies a time delta
+  changeKeyframeTimeLive: (
+    clipId: string,
+    originalAnimations: Map<string, PartAnimation>,
+    keyframes: { pathId: string; originalTime: number }[],
+    timeDelta: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || keyframes.length === 0) return;
+
+    // Group keyframes by pathId so we can apply all changes for each path sequentially
+    const keyframesByPath = new Map<string, { originalTime: number; newTime: number }[]>();
+    for (const { pathId, originalTime } of keyframes) {
+      if (!keyframesByPath.has(pathId)) {
+        keyframesByPath.set(pathId, []);
+      }
+      const newTime = Math.max(0, Math.min(clip.duration, originalTime + timeDelta));
+      keyframesByPath.get(pathId)!.push({ originalTime, newTime });
+    }
+
+    const newParts = { ...clip.parts };
+    for (const [pathId, kfChanges] of keyframesByPath) {
+      // Start from the ORIGINAL animation
+      let anim = originalAnimations.get(pathId);
+      if (!anim) continue;
+      // Apply all time changes for this path sequentially
+      for (const { originalTime, newTime } of kfChanges) {
+        anim = changeKeyframeTime(anim, originalTime, newTime);
+      }
+      newParts[pathId] = anim;
+    }
+
+    // Calculate new selected keyframe times - match by both pathId AND originalTime
+    const newSelectedKeyframes = state.selectedKeyframes.map((kf) => {
+      const match = keyframes.find((k) =>
+        k.pathId === kf.pathId && Math.abs(k.originalTime - kf.time) < 0.0001
+      );
+      if (match) {
+        const newTime = Math.max(0, Math.min(clip.duration, match.originalTime + timeDelta));
+        return { ...kf, time: newTime };
+      }
+      return kf;
+    });
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === clipId ? { ...c, parts: newParts } : c
+      ),
+      selectedKeyframes: newSelectedKeyframes,
+    };
+    throttledNotify();
+  },
+
+  // Commit keyframe time changes (adds undo entry after live dragging)
+  commitKeyframeTimeChange: (
+    clipId: string,
+    prevAnimations: Map<string, PartAnimation>,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const commands: Command[] = [];
+    for (const [partId, prevAnimation] of prevAnimations) {
+      const newAnimation = clip.parts[partId];
+      if (!newAnimation) continue;
+      // Only create command if animation actually changed
+      if (JSON.stringify(prevAnimation) !== JSON.stringify(newAnimation)) {
+        commands.push({
+          type: "setPartAnimation",
+          clipId,
+          partId,
+          prevAnimation,
+          newAnimation,
+        });
+      }
+    }
+
+    if (commands.length > 0) {
+      executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+    }
+  },
+
+  // Align keyframes to center time (for quick click)
+  alignKeyframesToCenter: (
+    clipId: string,
+    originalAnimations: Map<string, PartAnimation>,
+    keyframes: { pathId: string; originalTime: number }[],
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || keyframes.length < 2) return;
+
+    // Find the center time (average of min and max)
+    const times = keyframes.map((kf) => kf.originalTime);
+    const minTime = Math.min(...times);
+    const maxTime = Math.max(...times);
+    const centerTime = (minTime + maxTime) / 2;
+
+    // Move all keyframes to the center time
+    const newParts = { ...clip.parts };
+    for (const kf of keyframes) {
+      const originalAnim = originalAnimations.get(kf.pathId);
+      if (!originalAnim) continue;
+
+      const newTime = Math.max(0, Math.min(clip.duration, centerTime));
+      newParts[kf.pathId] = changeKeyframeTime(originalAnim, kf.originalTime, newTime);
+    }
+
+    // Update selected keyframes
+    const clampedCenterTime = Math.max(0, Math.min(clip.duration, centerTime));
+    const newSelectedKeyframes = keyframes.map((kf) => ({
+      pathId: kf.pathId,
+      time: clampedCenterTime,
+    }));
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === clipId ? { ...c, parts: newParts } : c
+      ),
+      selectedKeyframes: newSelectedKeyframes,
+    };
+    throttledNotify();
+  },
+
+  // Distribute keyframes with time gap (live preview, no undo)
+  // First and last time groups stay in place, others are distributed between them
+  // Keyframes at the same original time stay together
+  distributeKeyframesLive: (
+    clipId: string,
+    originalAnimations: Map<string, PartAnimation>,
+    keyframes: { pathId: string; originalTime: number }[],
+    timeGap: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || keyframes.length < 2) return;
+
+    // Group keyframes by their original time (keyframes at same time stay together)
+    const timeGroups = new Map<number, { pathId: string; originalTime: number }[]>();
+    for (const kf of keyframes) {
+      // Round to avoid floating point issues
+      const roundedTime = Math.round(kf.originalTime * 10000) / 10000;
+      if (!timeGroups.has(roundedTime)) {
+        timeGroups.set(roundedTime, []);
+      }
+      timeGroups.get(roundedTime)!.push(kf);
+    }
+
+    // Sort groups by time
+    const sortedTimes = [...timeGroups.keys()].sort((a, b) => a - b);
+    if (sortedTimes.length < 2) return;
+
+    const firstTime = sortedTimes[0];
+
+    // Build a mapping of originalTime -> newTime
+    const timeMapping = new Map<number, number>();
+    for (let i = 0; i < sortedTimes.length; i++) {
+      const originalTime = sortedTimes[i];
+      let newTime = firstTime + i * timeGap;
+      newTime = Math.max(0, Math.min(clip.duration, newTime));
+      newTime = Math.round(newTime * 1000) / 1000;
+      timeMapping.set(originalTime, newTime);
+    }
+
+    // Group keyframes by pathId so we can apply all changes for each path sequentially
+    const keyframesByPath = new Map<string, { originalTime: number; newTime: number }[]>();
+    for (const kf of keyframes) {
+      if (!keyframesByPath.has(kf.pathId)) {
+        keyframesByPath.set(kf.pathId, []);
+      }
+      const roundedTime = Math.round(kf.originalTime * 10000) / 10000;
+      const newTime = timeMapping.get(roundedTime)!;
+      keyframesByPath.get(kf.pathId)!.push({ originalTime: kf.originalTime, newTime });
+    }
+
+    const newParts = { ...clip.parts };
+    const newSelectedKeyframes: { pathId: string; time: number }[] = [];
+
+    for (const [pathId, kfChanges] of keyframesByPath) {
+      // Start from the ORIGINAL animation
+      let anim = originalAnimations.get(pathId);
+      if (!anim) continue;
+      // Apply all time changes for this path sequentially
+      for (const { originalTime, newTime } of kfChanges) {
+        anim = changeKeyframeTime(anim, originalTime, newTime);
+        newSelectedKeyframes.push({ pathId, time: newTime });
+      }
+      newParts[pathId] = anim;
+    }
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === clipId ? { ...c, parts: newParts } : c
+      ),
+      selectedKeyframes: newSelectedKeyframes,
+    };
+    throttledNotify();
+  },
+
+  // Restore keyframes from snapshot (for cancel)
+  restoreKeyframesFromSnapshot: (
+    clipId: string,
+    snapshot: Map<string, PartAnimation>,
+    originalSelectedKeyframes: { pathId: string; time: number }[],
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const newParts = { ...clip.parts };
+    for (const [pathId, anim] of snapshot) {
+      newParts[pathId] = anim;
+    }
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === clipId ? { ...c, parts: newParts } : c
+      ),
+      selectedKeyframes: originalSelectedKeyframes,
+    };
+    throttledNotify();
+  },
+
+  // Shift selected keyframes left or right
+  // Calculates the minimum gap from immediate neighbor keyframes, then positions each keyframe
+  // at that gap distance from its own anchor point
+  shiftKeyframes: (
+    clipId: string,
+    direction: "left" | "right",
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || state.selectedKeyframes.length === 0) return;
+
+    // Collect all selected keyframe times (unique)
+    const selectedTimes = new Set<number>();
+    for (const kf of state.selectedKeyframes) {
+      selectedTimes.add(Math.round(kf.time * 10000) / 10000);
+    }
+
+    // For each selected keyframe, find its anchor point (closest non-selected keyframe in direction)
+    // and calculate the offset. Store anchor per keyframe for later use.
+    let minOffset = Infinity;
+    const keyframeAnchors = new Map<string, number>(); // key: "pathId:time" -> anchor
+
+    for (const sel of state.selectedKeyframes) {
+      const partAnim = clip.parts[sel.pathId] ?? [];
+      const selTime = Math.round(sel.time * 10000) / 10000;
+      const key = `${sel.pathId}:${selTime}`;
+
+      if (direction === "left") {
+        // Find the closest keyframe to the left that is NOT selected
+        let closestLeft: number | null = null;
+        for (const kf of partAnim) {
+          const kfTime = Math.round(kf.t * 10000) / 10000;
+          if (kfTime < selTime && !selectedTimes.has(kfTime)) {
+            if (closestLeft === null || kfTime > closestLeft) {
+              closestLeft = kfTime;
+            }
+          }
+        }
+        // If no keyframe to the left, use clip start (0)
+        const anchor = closestLeft ?? 0;
+        keyframeAnchors.set(key, anchor);
+        const offset = selTime - anchor;
+        if (offset < minOffset) minOffset = offset;
+      } else {
+        // Find the closest keyframe to the right that is NOT selected
+        let closestRight: number | null = null;
+        for (const kf of partAnim) {
+          const kfTime = Math.round(kf.t * 10000) / 10000;
+          if (kfTime > selTime && !selectedTimes.has(kfTime)) {
+            if (closestRight === null || kfTime < closestRight) {
+              closestRight = kfTime;
+            }
+          }
+        }
+        // If no keyframe to the right, use clip end
+        const anchor = closestRight ?? clip.duration;
+        keyframeAnchors.set(key, anchor);
+        const offset = anchor - selTime;
+        if (offset < minOffset) minOffset = offset;
+      }
+    }
+
+    // If no valid offset found (all keyframes have no neighbors), use 0
+    if (minOffset === Infinity) minOffset = 0;
+    if (minOffset === 0) return; // Nothing to shift
+
+    // Save prev animations for undo
+    const prevAnimations = new Map<string, PartAnimation>();
+    for (const sel of state.selectedKeyframes) {
+      if (!prevAnimations.has(sel.pathId)) {
+        prevAnimations.set(sel.pathId, clip.parts[sel.pathId] ?? []);
+      }
+    }
+
+    // Apply the shift - position each keyframe at minOffset from its own anchor
+    const newParts = { ...clip.parts };
+    const newSelectedKeyframes: { pathId: string; time: number }[] = [];
+
+    for (const sel of state.selectedKeyframes) {
+      const originalAnim = prevAnimations.get(sel.pathId);
+      if (!originalAnim) continue;
+
+      const selTime = Math.round(sel.time * 10000) / 10000;
+      const key = `${sel.pathId}:${selTime}`;
+      const anchor = keyframeAnchors.get(key) ?? (direction === "left" ? 0 : clip.duration);
+
+      // Position keyframe at minOffset distance from its anchor
+      let newTime = direction === "left"
+        ? anchor + minOffset
+        : anchor - minOffset;
+
+      // Clamp to clip bounds
+      newTime = Math.max(0, Math.min(clip.duration, newTime));
+      // Round to 3 decimal places
+      newTime = Math.round(newTime * 1000) / 1000;
+
+      newParts[sel.pathId] = changeKeyframeTime(
+        newParts[sel.pathId] ?? originalAnim,
+        sel.time,
+        newTime
+      );
+      newSelectedKeyframes.push({ pathId: sel.pathId, time: newTime });
+    }
+
+    // Execute as batch command for single undo
+    const commands: Command[] = [];
+    for (const [pathId, prevAnim] of prevAnimations) {
+      commands.push({
+        type: "setPartAnimation",
+        clipId,
+        partId: pathId,
+        prevAnimation: prevAnim,
+        newAnimation: newParts[pathId] ?? [],
+      });
+    }
+    executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+
+    state = {
+      ...state,
+      selectedKeyframes: newSelectedKeyframes,
+    };
+    notify();
+  },
+
+  // Reverse the time order of selected keyframes
+  reverseKeyframes: (clipId: string) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || state.selectedKeyframes.length < 2) return;
+
+    // Get unique times from selected keyframes, sorted
+    const times = [...new Set(state.selectedKeyframes.map((kf) =>
+      Math.round(kf.time * 10000) / 10000
+    ))].sort((a, b) => a - b);
+
+    if (times.length < 2) return;
+
+    // Create a mapping from old time to new time (reverse)
+    const timeMapping = new Map<number, number>();
+    for (let i = 0; i < times.length; i++) {
+      timeMapping.set(times[i], times[times.length - 1 - i]);
+    }
+
+    // Save previous animations for undo
+    const prevAnimations = new Map<string, PartAnimation>();
+    for (const sel of state.selectedKeyframes) {
+      if (!prevAnimations.has(sel.pathId)) {
+        prevAnimations.set(sel.pathId, clip.parts[sel.pathId] ?? []);
+      }
+    }
+
+    // Apply the time reversal
+    const newParts = { ...clip.parts };
+    const newSelectedKeyframes: { pathId: string; time: number }[] = [];
+
+    for (const sel of state.selectedKeyframes) {
+      const originalAnim = prevAnimations.get(sel.pathId);
+      if (!originalAnim) continue;
+
+      const selTime = Math.round(sel.time * 10000) / 10000;
+      const newTime = timeMapping.get(selTime) ?? sel.time;
+
+      newParts[sel.pathId] = changeKeyframeTime(
+        newParts[sel.pathId] ?? originalAnim,
+        sel.time,
+        newTime
+      );
+      newSelectedKeyframes.push({ pathId: sel.pathId, time: newTime });
+    }
+
+    // Execute as batch command for single undo
+    const commands: Command[] = [];
+    for (const [pathId, prevAnim] of prevAnimations) {
+      commands.push({
+        type: "setPartAnimation",
+        clipId,
+        partId: pathId,
+        prevAnimation: prevAnim,
+        newAnimation: newParts[pathId] ?? [],
+      });
+    }
+    executeCommand(commands.length === 1 ? commands[0] : { type: "batch", commands });
+
+    state = {
+      ...state,
+      selectedKeyframes: newSelectedKeyframes,
+    };
+    notify();
+  },
+
+  // Scale selected keyframes to fit within a new duration (live preview, no undo)
+  scaleKeyframesLive: (
+    clipId: string,
+    originalAnimations: Map<string, PartAnimation>,
+    keyframes: { pathId: string; originalTime: number }[],
+    newDuration: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip || keyframes.length < 2) return;
+
+    // Get unique sorted times from original keyframes
+    const sortedTimes = [...new Set(keyframes.map((kf) =>
+      Math.round(kf.originalTime * 10000) / 10000
+    ))].sort((a, b) => a - b);
+
+    if (sortedTimes.length < 2) return;
+
+    const firstTime = sortedTimes[0];
+    const lastTime = sortedTimes[sortedTimes.length - 1];
+    const originalDuration = lastTime - firstTime;
+
+    if (originalDuration === 0) return;
+
+    const scale = newDuration / originalDuration;
+
+    // Build a mapping of originalTime -> newTime for each keyframe
+    const timeMapping = new Map<number, number>();
+    for (const kf of keyframes) {
+      const roundedTime = Math.round(kf.originalTime * 10000) / 10000;
+      if (!timeMapping.has(roundedTime)) {
+        let newTime = firstTime + (roundedTime - firstTime) * scale;
+        newTime = Math.max(0, Math.min(clip.duration, newTime));
+        newTime = Math.round(newTime * 1000) / 1000;
+        timeMapping.set(roundedTime, newTime);
+      }
+    }
+
+    // Group keyframes by pathId so we can apply all changes for each path sequentially
+    const keyframesByPath = new Map<string, { originalTime: number; newTime: number }[]>();
+    for (const kf of keyframes) {
+      if (!keyframesByPath.has(kf.pathId)) {
+        keyframesByPath.set(kf.pathId, []);
+      }
+      const roundedTime = Math.round(kf.originalTime * 10000) / 10000;
+      const newTime = timeMapping.get(roundedTime)!;
+      keyframesByPath.get(kf.pathId)!.push({ originalTime: kf.originalTime, newTime });
+    }
+
+    const newParts = { ...clip.parts };
+    const newSelectedKeyframes: { pathId: string; time: number }[] = [];
+
+    for (const [pathId, kfChanges] of keyframesByPath) {
+      // Start from the ORIGINAL animation
+      let anim = originalAnimations.get(pathId);
+      if (!anim) continue;
+      // Apply all time changes for this path sequentially
+      for (const { originalTime, newTime } of kfChanges) {
+        anim = changeKeyframeTime(anim, originalTime, newTime);
+        newSelectedKeyframes.push({ pathId, time: newTime });
+      }
+      newParts[pathId] = anim;
+    }
+
+    state = {
+      ...state,
+      animationClips: state.animationClips.map((c) =>
+        c.id === clipId ? { ...c, parts: newParts } : c
+      ),
+      selectedKeyframes: newSelectedKeyframes,
+    };
+    throttledNotify();
   },
 
   // Create an empty keyframe (no properties set) at a specific time
@@ -4671,17 +6322,21 @@ export const store = {
       newAnimation,
     });
 
-    // Update selected keyframe time if it was the one being moved
-    if (state.selectedKeyframe &&
-        state.selectedKeyframe.pathId === partId &&
-        Math.abs(state.selectedKeyframe.time - oldTime) < 0.0001) {
-      state = { ...state, selectedKeyframe: { pathId: partId, time: newTime } };
+    // Update selected keyframe times if any were being moved
+    const updatedKeyframes = state.selectedKeyframes.map((kf) =>
+      kf.pathId === partId && Math.abs(kf.time - oldTime) < 0.0001
+        ? { pathId: partId, time: newTime }
+        : kf
+    );
+    if (JSON.stringify(updatedKeyframes) !== JSON.stringify(state.selectedKeyframes)) {
+      state = { ...state, selectedKeyframes: updatedKeyframes };
       notify();
     }
   },
 
   setPlaybackTime: (time: number) => {
     state = { ...state, playbackTime: time };
+    savePlaybackTime(time);
     notify();
   },
 
@@ -4695,11 +6350,14 @@ export const store = {
     notify();
   },
 
-  // Transform-based path manipulation (for animation)
+  // Transform-based path/group/raster manipulation (for animation)
   // Updates animation keyframes if a clip is active for live visual feedback
   translatePathTransform: (id: string, dx: number, dy: number) => {
+    // Check if this is a path, group, or raster
     const path = state.paths.find((p) => p.id === id);
-    if (!path) return;
+    const group = state.groups.find((g) => g.id === id);
+    const raster = state.rasters.find((r) => r.id === id);
+    if (!path && !group && !raster) return;
 
     // If we have an active animation clip, update keyframes directly for live feedback
     if (state.currentClipId) {
@@ -4723,26 +6381,40 @@ export const store = {
               ? { ...c, parts: { ...c.parts, [id]: newAnimation } }
               : c
           ),
-          selectedKeyframe: { pathId: id, time: t },
+          selectedKeyframes: [{ pathId: id, time: t }],
         };
         throttledNotify();
         return;
       }
     }
 
-    // Fallback: update path transform directly (no animation clip active)
-    const newTransform = {
-      ...path.transform,
-      tx: path.transform.tx + dx,
-      ty: path.transform.ty + dy,
-    };
-
-    state = {
-      ...state,
-      paths: state.paths.map((p) =>
-        p.id === id ? { ...p, transform: newTransform } : p
-      ),
-    };
+    // Fallback: update transform directly (no animation clip active)
+    if (path) {
+      const newTransform = {
+        ...path.transform,
+        tx: path.transform.tx + dx,
+        ty: path.transform.ty + dy,
+      };
+      state = {
+        ...state,
+        paths: state.paths.map((p) =>
+          p.id === id ? { ...p, transform: newTransform } : p
+        ),
+      };
+    } else if (raster) {
+      const newTransform = {
+        ...raster.transform,
+        tx: raster.transform.tx + dx,
+        ty: raster.transform.ty + dy,
+      };
+      state = {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === id ? { ...r, transform: newTransform } : r
+        ),
+      };
+    }
+    // Groups don't have transforms outside of animation mode, so nothing to do
     throttledNotify();
   },
 
@@ -4769,8 +6441,11 @@ export const store = {
   },
 
   rotatePathTransform: (id: string, angle: number) => {
+    // Check if this is a path, group, or raster
     const path = state.paths.find((p) => p.id === id);
-    if (!path) return;
+    const group = state.groups.find((g) => g.id === id);
+    const raster = state.rasters.find((r) => r.id === id);
+    if (!path && !group && !raster) return;
 
     // If we have an active animation clip, update keyframes directly for live feedback
     if (state.currentClipId) {
@@ -4792,25 +6467,38 @@ export const store = {
               ? { ...c, parts: { ...c.parts, [id]: newAnimation } }
               : c
           ),
-          selectedKeyframe: { pathId: id, time: t },
+          selectedKeyframes: [{ pathId: id, time: t }],
         };
         throttledNotify();
         return;
       }
     }
 
-    // Fallback: update path transform directly (no animation clip active)
-    const newTransform = {
-      ...path.transform,
-      rot: path.transform.rot + angle,
-    };
-
-    state = {
-      ...state,
-      paths: state.paths.map((p) =>
-        p.id === id ? { ...p, transform: newTransform } : p
-      ),
-    };
+    // Fallback: update transform directly (no animation clip active)
+    if (path) {
+      const newTransform = {
+        ...path.transform,
+        rot: path.transform.rot + angle,
+      };
+      state = {
+        ...state,
+        paths: state.paths.map((p) =>
+          p.id === id ? { ...p, transform: newTransform } : p
+        ),
+      };
+    } else if (raster) {
+      const newTransform = {
+        ...raster.transform,
+        rot: raster.transform.rot + angle,
+      };
+      state = {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === id ? { ...r, transform: newTransform } : r
+        ),
+      };
+    }
+    // Groups don't have transforms outside of animation mode, so nothing to do
     throttledNotify();
   },
 
@@ -4836,7 +6524,7 @@ export const store = {
     }
   },
 
-  // Translate all selected paths in animation mode
+  // Translate all selected paths/groups/rasters in animation mode
   translateSelectionTransform: (dx: number, dy: number) => {
     if (!state.currentClipId) return;
 
@@ -4844,22 +6532,43 @@ export const store = {
     if (!clip) return;
 
     const t = state.playbackTime;
-    const selectedPathIds = state.selection.pathIds;
-    if (selectedPathIds.length === 0) return;
+    const selectedIds = state.selection.pathIds;
+    if (selectedIds.length === 0) return;
 
-    // Update keyframes for all selected paths
+    // Collect all animatable part IDs: paths, groups, and rasters
+    const partIds: string[] = [];
+    for (const id of selectedIds) {
+      // Check if it's a group - if so, add the group ID (groups can be animated)
+      const group = state.groups.find((g) => g.id === id);
+      if (group) {
+        partIds.push(id);
+        continue;
+      }
+      // Check if it's a raster
+      const raster = state.rasters.find((r) => r.id === id);
+      if (raster) {
+        partIds.push(id);
+        continue;
+      }
+      // Otherwise it's a path
+      const path = state.paths.find((p) => p.id === id);
+      if (path) {
+        partIds.push(id);
+      }
+    }
+
+    if (partIds.length === 0) return;
+
+    // Update keyframes for all selected parts
     const newParts = { ...clip.parts };
-    for (const pathId of selectedPathIds) {
-      const path = state.paths.find((p) => p.id === pathId);
-      if (!path) continue;
-
-      const prevAnimation = newParts[pathId] ?? [];
+    for (const partId of partIds) {
+      const prevAnimation = newParts[partId] ?? [];
       const currentTx = getPropertyValue(prevAnimation, "tx", t);
       const currentTy = getPropertyValue(prevAnimation, "ty", t);
 
       let newAnimation = setKeyframeProperty(prevAnimation, t, "tx", currentTx + dx);
       newAnimation = setKeyframeProperty(newAnimation, t, "ty", currentTy + dy);
-      newParts[pathId] = newAnimation;
+      newParts[partId] = newAnimation;
     }
 
     state = {
@@ -4867,15 +6576,13 @@ export const store = {
       animationClips: state.animationClips.map((c) =>
         c.id === state.currentClipId ? { ...c, parts: newParts } : c
       ),
-      // Select keyframe of first path in selection
-      selectedKeyframe: selectedPathIds.length > 0
-        ? { pathId: selectedPathIds[0], time: t }
-        : state.selectedKeyframe,
+      // Select keyframes for all parts in selection
+      selectedKeyframes: partIds.map((partId) => ({ pathId: partId, time: t })),
     };
     throttledNotify();
   },
 
-  // Rotate all selected paths in animation mode
+  // Rotate all selected paths/groups/rasters in animation mode
   rotateSelectionTransform: (angle: number) => {
     if (!state.currentClipId) return;
 
@@ -4883,20 +6590,38 @@ export const store = {
     if (!clip) return;
 
     const t = state.playbackTime;
-    const selectedPathIds = state.selection.pathIds;
-    if (selectedPathIds.length === 0) return;
+    const selectedIds = state.selection.pathIds;
+    if (selectedIds.length === 0) return;
 
-    // Update keyframes for all selected paths
+    // Collect all animatable part IDs: paths, groups, and rasters
+    const partIds: string[] = [];
+    for (const id of selectedIds) {
+      const group = state.groups.find((g) => g.id === id);
+      if (group) {
+        partIds.push(id);
+        continue;
+      }
+      const raster = state.rasters.find((r) => r.id === id);
+      if (raster) {
+        partIds.push(id);
+        continue;
+      }
+      const path = state.paths.find((p) => p.id === id);
+      if (path) {
+        partIds.push(id);
+      }
+    }
+
+    if (partIds.length === 0) return;
+
+    // Update keyframes for all selected parts
     const newParts = { ...clip.parts };
-    for (const pathId of selectedPathIds) {
-      const path = state.paths.find((p) => p.id === pathId);
-      if (!path) continue;
-
-      const prevAnimation = newParts[pathId] ?? [];
+    for (const partId of partIds) {
+      const prevAnimation = newParts[partId] ?? [];
       const currentRot = getPropertyValue(prevAnimation, "rot", t);
 
       const newAnimation = setKeyframeProperty(prevAnimation, t, "rot", currentRot + angle);
-      newParts[pathId] = newAnimation;
+      newParts[partId] = newAnimation;
     }
 
     state = {
@@ -4904,10 +6629,8 @@ export const store = {
       animationClips: state.animationClips.map((c) =>
         c.id === state.currentClipId ? { ...c, parts: newParts } : c
       ),
-      // Select keyframe of first path in selection
-      selectedKeyframe: selectedPathIds.length > 0
-        ? { pathId: selectedPathIds[0], time: t }
-        : state.selectedKeyframe,
+      // Select keyframes for all parts in selection
+      selectedKeyframes: partIds.map((partId) => ({ pathId: partId, time: t })),
     };
     throttledNotify();
   },
@@ -4978,26 +6701,125 @@ export const store = {
   },
 
   // Keyframe selection
-  selectKeyframe: (keyframe: { pathId: string; time: number }) => {
-    // Also select the path so property edits apply to the correct path
+  selectKeyframe: (keyframe: { pathId: string; time: number }, addToSelection = false) => {
+    // Build new keyframes array
+    let newKeyframes: SelectedKeyframe[];
+    if (addToSelection) {
+      // Check if this keyframe is already selected
+      const existing = state.selectedKeyframes.find(
+        (kf) => kf.pathId === keyframe.pathId && Math.abs(kf.time - keyframe.time) < 0.0001
+      );
+      if (existing) {
+        // Remove it (toggle off)
+        newKeyframes = state.selectedKeyframes.filter((kf) => kf !== existing);
+      } else {
+        // Add it
+        newKeyframes = [...state.selectedKeyframes, keyframe];
+      }
+    } else {
+      // Replace selection
+      newKeyframes = [keyframe];
+    }
+
+    // Also select the paths/groups so property edits apply
+    // Keep only the actual IDs - don't expand groups to descendants
+    // Visual highlighting of group descendants is handled in Hierarchy/Canvas
+    const uniqueIds = [...new Set(newKeyframes.map((kf) => kf.pathId))];
     const newSelection = {
-      pathIds: [keyframe.pathId],
+      pathIds: uniqueIds,
       points: [],
     };
-    state = { ...state, selectedKeyframe: keyframe, selection: newSelection };
+    state = { ...state, selectedKeyframes: newKeyframes, selection: newSelection };
+    saveSelection(newSelection);
+    notify();
+  },
+
+  // Select multiple keyframes at once (for marquee selection)
+  selectKeyframes: (keyframes: { pathId: string; time: number }[], addToSelection = false) => {
+    let newKeyframes: SelectedKeyframe[];
+    if (addToSelection) {
+      // Add new keyframes that aren't already selected
+      const toAdd = keyframes.filter(
+        (kf) => !state.selectedKeyframes.some(
+          (existing) => existing.pathId === kf.pathId && Math.abs(existing.time - kf.time) < 0.0001
+        )
+      );
+      newKeyframes = [...state.selectedKeyframes, ...toAdd];
+    } else {
+      newKeyframes = keyframes;
+    }
+
+    // Keep only the actual IDs - don't expand groups to descendants
+    // Visual highlighting of group descendants is handled in Hierarchy/Canvas
+    const uniqueIds = [...new Set(newKeyframes.map((kf) => kf.pathId))];
+    const newSelection = {
+      pathIds: uniqueIds,
+      points: [],
+    };
+    state = { ...state, selectedKeyframes: newKeyframes, selection: newSelection };
     saveSelection(newSelection);
     notify();
   },
 
   clearKeyframeSelection: () => {
-    state = { ...state, selectedKeyframe: null };
+    state = { ...state, selectedKeyframes: [] };
     notify();
   },
 
-  // Get the unified keyframe at the selected time
+  // Narrow selection to first keyframe per track (or Nth if repeated)
+  // Returns the depth used (1 = first, 2 = second, etc.)
+  narrowToFirst: (depth = 1): number => {
+    if (state.selectedKeyframes.length === 0) return 0;
+
+    // Group keyframes by pathId
+    const byPath = new Map<string, number[]>();
+    for (const kf of state.selectedKeyframes) {
+      if (!byPath.has(kf.pathId)) byPath.set(kf.pathId, []);
+      byPath.get(kf.pathId)!.push(kf.time);
+    }
+
+    // Sort each group and pick the Nth (depth-1 index)
+    const newKeyframes: { pathId: string; time: number }[] = [];
+    for (const [pathId, times] of byPath) {
+      times.sort((a, b) => a - b);
+      const index = Math.min(depth - 1, times.length - 1);
+      newKeyframes.push({ pathId, time: times[index] });
+    }
+
+    state = { ...state, selectedKeyframes: newKeyframes };
+    notify();
+    return depth;
+  },
+
+  // Narrow selection to last keyframe per track (or Nth from end if repeated)
+  // Returns the depth used (1 = last, 2 = second-to-last, etc.)
+  narrowToLast: (depth = 1): number => {
+    if (state.selectedKeyframes.length === 0) return 0;
+
+    // Group keyframes by pathId
+    const byPath = new Map<string, number[]>();
+    for (const kf of state.selectedKeyframes) {
+      if (!byPath.has(kf.pathId)) byPath.set(kf.pathId, []);
+      byPath.get(kf.pathId)!.push(kf.time);
+    }
+
+    // Sort each group and pick the Nth from end
+    const newKeyframes: { pathId: string; time: number }[] = [];
+    for (const [pathId, times] of byPath) {
+      times.sort((a, b) => a - b);
+      const index = Math.max(0, times.length - depth);
+      newKeyframes.push({ pathId, time: times[index] });
+    }
+
+    state = { ...state, selectedKeyframes: newKeyframes };
+    notify();
+    return depth;
+  },
+
+  // Get the unified keyframe at the first selected keyframe's time
   getSelectedKeyframe: () => {
-    if (!state.selectedKeyframe || !state.currentClipId) return null;
-    const { pathId, time } = state.selectedKeyframe;
+    if (state.selectedKeyframes.length === 0 || !state.currentClipId) return null;
+    const { pathId, time } = state.selectedKeyframes[0];
     const clip = state.animationClips.find((c) => c.id === state.currentClipId);
     if (!clip) return null;
     const partAnim = clip.parts[pathId];
@@ -5017,10 +6839,12 @@ export const store = {
       name: state.documentName,
       paths: state.paths,
       groups: state.groups,
+      rasters: state.rasters,
       snapConnections: state.snapConnections,
       animationClips: state.animationClips,
       pathCounter: state.pathCounter,
       groupCounter: state.groupCounter,
+      rasterCounter: state.rasterCounter,
     };
   },
 
@@ -5034,10 +6858,12 @@ export const store = {
     name?: string;
     paths: Path[];
     groups: Group[];
+    rasters?: Raster[];
     snapConnections?: SnapConnection[];
     animationClips?: AnimationClip[];
     pathCounter?: number;
     groupCounter?: number;
+    rasterCounter?: number;
   }, documentId?: string | null) => {
     // undefined = preserve existing, null = use file's id or generate new, string = use provided
     const id = documentId === undefined
@@ -5051,12 +6877,18 @@ export const store = {
       visible: p.visible ?? true,
       locked: p.locked ?? false,
     }));
+    // Migrate rasters: ensure newer properties exist with defaults
+    const migratedRasters = (data.rasters || []).map((r) => ({
+      ...r,
+      renderOrder: r.renderOrder ?? "back",
+    })) as Raster[];
     // Load selection and filter to only include paths that exist in this document
     const pathIdSet = new Set(migratedPaths.map((p) => p.id));
     const groupIdSet = new Set((data.groups || []).map((g) => g.id));
+    const rasterIdSet = new Set(migratedRasters.map((r) => r.id));
     const savedSelection = loadSelection();
     const validSelection: Selection = {
-      pathIds: savedSelection.pathIds.filter((id) => pathIdSet.has(id) || groupIdSet.has(id)),
+      pathIds: savedSelection.pathIds.filter((id) => pathIdSet.has(id) || groupIdSet.has(id) || rasterIdSet.has(id)),
       points: [],
     };
     // Validate currentClipId exists in loaded document's clips
@@ -5072,11 +6904,13 @@ export const store = {
       isDirty: !isFromStorage, // Dirty if loaded from file (not yet in storage)
       paths: migratedPaths,
       groups: data.groups || [],
+      rasters: migratedRasters,
       snapConnections: data.snapConnections || [],
       animationClips: loadedClips,
       currentClipId: validCurrentClipId,
       pathCounter: data.pathCounter || (data.paths?.length || 0) + 1,
       groupCounter: data.groupCounter || (data.groups?.length || 0) + 1,
+      rasterCounter: data.rasterCounter || (data.rasters?.length || 0) + 1,
       // Preserve UI settings
       showAllPoints: state.showAllPoints,
       showAllControlPoints: state.showAllControlPoints,

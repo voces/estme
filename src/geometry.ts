@@ -224,10 +224,13 @@ export function splitBezierAt(
 // Path utilities
 // ============================================================================
 
-// Get path center (bounding box center including control points)
-export function getPathCenter(path: Path): Point {
+// Bounding box type
+export type BoundingBox = { minX: number; minY: number; maxX: number; maxY: number };
+
+// Get path bounding box (including control points)
+export function getPathBounds(path: Path): BoundingBox {
   if (path.segments.length === 0) {
-    return { x: 0, y: 0 };
+    return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
   }
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const seg of path.segments) {
@@ -238,7 +241,59 @@ export function getPathCenter(path: Path): Point {
       maxY = Math.max(maxY, pt.y);
     }
   }
-  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  return { minX, minY, maxX, maxY };
+}
+
+// Get path center (bounding box center including control points)
+export function getPathCenter(path: Path): Point {
+  const bounds = getPathBounds(path);
+  return { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 };
+}
+
+// Get path bounding box with animation transforms applied (tx, ty, rot, scale)
+export function getAnimatedPathBounds(
+  path: Path,
+  tx: number,
+  ty: number,
+  rot: number,
+  scale: number,
+  transformPoint: Point
+): BoundingBox {
+  if (path.segments.length === 0) {
+    return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  }
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+  for (const seg of path.segments) {
+    for (const pt of [seg.p0, seg.c0, seg.c1, seg.p1]) {
+      // Apply transforms in order: scale, rotate, translate
+      // First scale around transform point
+      let x = transformPoint.x + (pt.x - transformPoint.x) * scale;
+      let y = transformPoint.y + (pt.y - transformPoint.y) * scale;
+
+      // Then rotate around transform point
+      if (rot !== 0) {
+        const cos = Math.cos(rot);
+        const sin = Math.sin(rot);
+        const dx = x - transformPoint.x;
+        const dy = y - transformPoint.y;
+        x = transformPoint.x + dx * cos - dy * sin;
+        y = transformPoint.y + dx * sin + dy * cos;
+      }
+
+      // Then translate
+      x += tx;
+      y += ty;
+
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+
+  return { minX, minY, maxX, maxY };
 }
 
 // Get effective transform point for a path (custom if set, otherwise dynamic center)
@@ -416,13 +471,77 @@ export function getSelectionBoundingCenter(paths: Path[], pathIds: string[]): Po
   return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
 }
 
-// Get path angle (from center to first anchor, in degrees)
+// Get path angle using PCA (Principal Component Analysis)
+// Returns the angle of the major axis in degrees, with "down" determined by the lowest point
 export function getPathAngle(path: Path): number {
-  const center = getPathCenter(path);
-  const firstAnchor = path.segments[0].p0;
-  const dx = firstAnchor.x - center.x;
-  const dy = firstAnchor.y - center.y;
-  return Math.atan2(dy, dx) * (180 / Math.PI);
+  if (path.segments.length === 0) return 0;
+
+  // Collect all anchor points
+  const points: Point[] = path.segments.map(seg => seg.p0);
+
+  if (points.length < 2) return 0;
+
+  // Compute centroid
+  let cx = 0, cy = 0;
+  for (const p of points) {
+    cx += p.x;
+    cy += p.y;
+  }
+  cx /= points.length;
+  cy /= points.length;
+
+  // Compute covariance matrix elements
+  // Cov = | cxx  cxy |
+  //       | cxy  cyy |
+  let cxx = 0, cyy = 0, cxy = 0;
+  for (const p of points) {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    cxx += dx * dx;
+    cyy += dy * dy;
+    cxy += dx * dy;
+  }
+
+  // Find the angle of the major eigenvector
+  // For a 2x2 symmetric matrix, the eigenvector angle is:
+  // theta = 0.5 * atan2(2 * cxy, cxx - cyy)
+  const majorAxisAngle = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+
+  // Major axis direction vector
+  const majorX = Math.cos(majorAxisAngle);
+  const majorY = Math.sin(majorAxisAngle);
+
+  // Minor axis is perpendicular to major axis
+  const minorX = -majorY;
+  const minorY = majorX;
+
+  // Project all points onto the minor axis to find the "lowest" point
+  // (most extreme in the minor axis direction)
+  let minProj = Infinity;
+  let maxProj = -Infinity;
+  for (const p of points) {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    const proj = dx * minorX + dy * minorY;
+    minProj = Math.min(minProj, proj);
+    maxProj = Math.max(maxProj, proj);
+  }
+
+  // The "down" direction should be where the most extreme point is
+  // If the max projection is larger in magnitude, flip the axis
+  // This makes the minor axis point "down" toward the lowest point
+  let angle = majorAxisAngle;
+  if (Math.abs(maxProj) > Math.abs(minProj)) {
+    // The positive minor axis direction has the extreme point, flip by 180°
+    angle += Math.PI;
+  }
+
+  // Convert to degrees and normalize to -180 to 180
+  let degrees = angle * (180 / Math.PI);
+  while (degrees > 180) degrees -= 360;
+  while (degrees <= -180) degrees += 360;
+
+  return degrees;
 }
 
 // Get anchor position handling open paths correctly

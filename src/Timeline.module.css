@@ -10,7 +10,7 @@
 .header {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.25rem;
   padding: 0 0.5rem 0.25rem 0.5rem;
   background: #252525;
   border-bottom: 1px solid #333;
@@ -51,9 +51,14 @@
   color: #ccc;
   border: 1px solid #444;
   border-radius: 3px;
-  padding: 0.25rem 0.5rem;
+  padding: 0 6px;
   font-size: 12px;
   cursor: pointer;
+  height: 24px;
+  min-width: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .headerBtn:hover {
@@ -64,9 +69,27 @@
   background: #555;
 }
 
-.playBtn {
-  width: 28px;
-  padding: 0.25rem;
+.headerBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.headerBtn.active {
+  background: #4488ff;
+  border-color: #5599ff;
+  color: #fff;
+}
+
+.buttonGroup {
+  display: flex;
+  gap: 4px;
+}
+
+.separator {
+  width: 1px;
+  height: 18px;
+  background: #444;
+  margin: 0 2px;
 }
 
 .timeDisplay {
@@ -106,11 +129,15 @@
   overflow: hidden;
 }
 
-/* Ruler header row - fixed at top */
+/* Ruler header row - sticky at top of scroll container */
 .rulerRow {
   display: flex;
   flex-shrink: 0;
   border-bottom: 1px solid #333;
+  position: sticky;
+  top: 0;
+  z-index: 15;
+  background: #252525;
 }
 
 .rulerLabelSpace {
@@ -123,6 +150,14 @@
 .unifiedRow {
   display: flex;
   border-bottom: 1px solid #333;
+}
+
+.unifiedRowSelected {
+  background: rgba(68, 136, 255, 0.04);
+}
+
+.unifiedRowSelected .rowKeyframes {
+  background: rgba(68, 136, 255, 0.025);
 }
 
 /* Label portion of unified row */
@@ -283,34 +318,75 @@
 
 .ruler {
   flex: 1;
-  height: 20px;
+  height: 18px;
   background: #252525;
   position: relative;
-  overflow: hidden;
+  overflow: visible;
   cursor: pointer;
 }
 
 .rulerTick {
   position: absolute;
-  top: 0;
+  bottom: 0;
   width: 1px;
-  height: 100%;
   background: #444;
+}
+
+/* Major ticks - full height with label */
+.rulerTickMajor {
+  height: 100%;
+  background: #555;
+}
+
+/* Minor ticks - medium height */
+.rulerTickMinor {
+  height: 60%;
+  background: #444;
+}
+
+/* Micro ticks - short */
+.rulerTickMicro {
+  height: 30%;
+  background: #3a3a3a;
 }
 
 .rulerLabel {
   position: absolute;
-  top: 2px;
-  font-size: 9px;
-  color: #666;
+  bottom: 6px;
+  font-size: 10px;
+  color: #888;
   transform: translateX(-50%);
+  white-space: nowrap;
+  font-family: monospace;
+}
+
+.rulerLabelMinor {
+  position: absolute;
+  bottom: 4px;
+  font-size: 8px;
+  color: #555;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+/* Edge label adjustments to prevent overflow */
+.rulerLabelFirst {
+  transform: translateX(0);
+}
+
+.rulerLabelLast {
+  transform: translateX(-100%);
 }
 
 .tracksContainer {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+}
+
+.tracksContent {
   position: relative;
+  min-height: 100%;
 }
 
 .trackRow {
@@ -378,6 +454,10 @@
   box-shadow: 0 0 0 2px #ffaa44;
 }
 
+.keyframeAffected {
+  box-shadow: 0 0 0 1px #ffaa44;
+}
+
 .playhead {
   position: absolute;
   top: 0;
@@ -390,13 +470,39 @@
 
 .playheadHandle {
   position: absolute;
-  top: -20px;
-  left: -5px;
-  width: 10px;
-  height: 20px;
-  background: #ff4444;
+  top: 0;
+  bottom: 0;
+  width: 11px;
+  background: transparent;
   cursor: ew-resize;
   pointer-events: auto;
+  transform: translateX(-50%);
+}
+
+/* Visible playhead line */
+.playheadHandle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 1px;
+  background: #ff4444;
+}
+
+/* Playhead triangle */
+.playheadHandle::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid #ff4444;
 }
 
 .emptyState {
@@ -406,4 +512,117 @@
   flex: 1;
   color: #666;
   font-size: 12px;
+}
+
+/* Marquee selection box */
+.marquee {
+  position: absolute;
+  border: 1px solid #4488ff;
+  background: rgba(68, 136, 255, 0.15);
+  pointer-events: none;
+  z-index: 20;
+}
+
+/* Prevent text selection during marquee drag */
+.tracksContainer.selecting {
+  user-select: none;
+}
+
+.tracksContainer.selecting * {
+  user-select: none;
+}
+
+/* Alignment popup */
+.alignPopup {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 12px;
+  z-index: 100;
+  min-width: 100px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.popupTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ccc;
+  margin-bottom: 10px;
+}
+
+.popupRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.popupRow label {
+  font-size: 11px;
+  color: #888;
+  min-width: 50px;
+}
+
+.popupRow input[type="number"] {
+  width: 70px;
+  background: #333;
+  border: 1px solid #444;
+  border-radius: 3px;
+  color: #ccc;
+  padding: 4px 6px;
+  font-size: 11px;
+  text-align: right;
+  -moz-appearance: textfield;
+}
+
+.popupRow input[type="number"]::-webkit-outer-spin-button,
+.popupRow input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.popupRow .unit {
+  font-size: 11px;
+  color: #666;
+}
+
+.popupRow input[type="number"]:focus {
+  outline: none;
+  border-color: #4488ff;
+}
+
+.popupButtons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.popupButton {
+  padding: 4px 12px;
+  border: 1px solid #444;
+  border-radius: 3px;
+  background: #3a3a3a;
+  color: #aaa;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.popupButton:hover {
+  background: #4a4a4a;
+  color: #fff;
+}
+
+.applyButton {
+  background: #4488ff;
+  border-color: #5599ff;
+  color: #fff;
+}
+
+.applyButton:hover {
+  background: #5599ff;
 }

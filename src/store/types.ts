@@ -1,12 +1,14 @@
-import { AnchorMeta, Group, HandleType, Path, PathTransform, Point, PointReference, SnapConnection, Tool } from "../types.ts";
+import { AnchorMeta, Group, HandleType, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
 import { BooleanOperation } from "../pathBool.ts";
 import { AnimationClip, PartAnimation } from "../animation.ts";
 
-// Selected keyframe in timeline (a unified keyframe at a time)
+// Selected keyframe in timeline (can be multiple keyframes)
 export type SelectedKeyframe = {
   pathId: string;
   time: number;
-} | null;
+};
+
+export type SelectedKeyframes = SelectedKeyframe[];
 
 // Re-export HandleType for convenience
 export type { HandleType } from "../types.ts";
@@ -29,11 +31,11 @@ export type Command =
   | { type: "addPath"; path: Path }
   | { type: "deletePath"; path: Path }
   | { type: "selectPath"; prevId: string | null; newId: string | null }
-  | { type: "translatePath"; id: string; dx: number; dy: number }
+  | { type: "translatePath"; id: string; dx: number; dy: number; skipSnap?: boolean }
   | { type: "rotatePath"; id: string; angle: number; center: Point }
   | { type: "scalePath"; id: string; scale: number; center: Point }
   | { type: "movePoint"; id: string; pointIndex: number; dx: number; dy: number }
-  | { type: "moveHandle"; id: string; segmentIndex: number; handleType: HandleType; dx: number; dy: number }
+  | { type: "moveHandle"; id: string; segmentIndex: number; handleType: HandleType; dx: number; dy: number; mirrorMove?: { segmentIndex: number; handleType: HandleType; dx: number; dy: number } }
   | { type: "setAnchorMeta"; id: string; anchorIndex: number; prevMeta: AnchorMeta; newMeta: AnchorMeta }
   | { type: "toggleControl"; id: string; anchorIndex: number; handleType: "left" | "right"; prevMeta: AnchorMeta; newMeta: AnchorMeta; prevControlPos: Point; newControlPos: Point }
   | { type: "setMirror"; id: string; anchorIndex: number; prevMeta: AnchorMeta; newMeta: AnchorMeta; prevC0: Point; newC0: Point; prevC1: Point; newC1: Point }
@@ -45,7 +47,7 @@ export type Command =
   | { type: "setPathLocked"; id: string; locked: boolean }
   | { type: "setPathPlayerMask"; id: string; playerMask: boolean }
   | { type: "setPathName"; id: string; prevName: string; newName: string }
-  | { type: "splitPath"; originalPath: Path; newPath1: Path; newPath2: Path }
+  | { type: "splitPath"; originalPath: Path; newPath1: Path; newPath2: Path; idx1: number; idx2: number }
   | { type: "joinPaths"; originalPaths: Path[]; newPath: Path }
   | { type: "booleanOp"; originalPaths: Path[]; resultPaths: Path[]; operation: BooleanOperation }
   | { type: "batch"; commands: Command[] }
@@ -54,9 +56,20 @@ export type Command =
   | { type: "deleteGroup"; group: Group; childPathIds: string[]; childGroupIds: string[] }
   | { type: "setGroupName"; id: string; prevName: string; newName: string }
   | { type: "setGroupCollapsed"; id: string; collapsed: boolean }
-  | { type: "moveToGroup"; itemId: string; itemType: "path" | "group"; prevParentId: string | null; newParentId: string | null }
+  | { type: "moveToGroup"; itemId: string; itemType: "path" | "group" | "raster"; prevParentId: string | null; newParentId: string | null }
   // Reorder commands (for z-order / hierarchy position)
-  | { type: "reorderItem"; itemId: string; itemType: "path" | "group"; prevIndex: number; newIndex: number }
+  | { type: "reorderItem"; itemId: string; itemType: "path" | "group" | "raster"; prevIndex: number; newIndex: number }
+  // Raster commands
+  | { type: "addRaster"; raster: Raster }
+  | { type: "deleteRaster"; raster: Raster }
+  | { type: "setRasterVisible"; id: string; visible: boolean }
+  | { type: "setRasterLocked"; id: string; locked: boolean }
+  | { type: "setRasterName"; id: string; prevName: string; newName: string }
+  | { type: "setRasterOpacity"; id: string; prevOpacity: number; newOpacity: number }
+  | { type: "setRasterTransform"; id: string; prevTransform: PathTransform; newTransform: PathTransform }
+  | { type: "setRasterPosition"; id: string; prevX: number; prevY: number; newX: number; newY: number }
+  | { type: "setRasterSize"; id: string; prevWidth: number; prevHeight: number; newWidth: number; newHeight: number }
+  | { type: "setRasterRenderOrder"; id: string; renderOrder: "front" | "back" }
   | { type: "reorderPaths"; prevPathIds: string[]; newPathIds: string[] }
   // Snap connection commands
   | { type: "addSnapConnection"; connection: SnapConnection }
@@ -75,7 +88,7 @@ export type Command =
   // Bake transform commands
   | { type: "bakeTransform"; id: string; prevPath: Path };
 
-// Clipboard content - can hold full paths or individual anchors
+// Clipboard content - can hold full paths, individual anchors, or keyframes
 export type ClipboardContent = {
   type: "paths";
   paths: Path[];
@@ -86,6 +99,12 @@ export type ClipboardContent = {
   // Store anchor data with relative positions from clipboard center
   anchors: { pathId: string; segmentIndex: number; point: Point; meta: AnchorMeta }[];
   center: Point;
+} | {
+  type: "keyframes";
+  // Store keyframe data from selected keyframes
+  // Each entry is a keyframe with its property values (relative time offset from first keyframe)
+  keyframes: { partId: string; keyframe: { t: number; tx?: number; ty?: number; rot?: number; scale?: number; opacity?: number } }[];
+  baseTime: number; // The time of the first selected keyframe (used as reference for relative time)
 } | null;
 
 // Hovered edge info
@@ -130,6 +149,7 @@ export type EditorState = {
   tool: Tool;
   paths: Path[];
   groups: Group[];
+  rasters: Raster[];
   currentPath: Point[] | null;
   currentPathId: string | null;
   hoverPoint: Point | null;
@@ -155,6 +175,8 @@ export type EditorState = {
   pathCounter: number;
   // Group naming counter
   groupCounter: number;
+  // Raster naming counter
+  rasterCounter: number;
   // Snap connections between points
   snapConnections: SnapConnection[];
   // Pending boolean operation (when drawing a new path to apply against selection)
@@ -168,7 +190,7 @@ export type EditorState = {
   // Is animation playing?
   isPlaying: boolean;
   // Selected keyframe in timeline (for editing in Properties panel)
-  selectedKeyframe: SelectedKeyframe;
+  selectedKeyframes: SelectedKeyframes;
   // Instance rendering properties (not part of document, stored separately in localStorage)
   instanceProperties: InstanceProperties;
 };

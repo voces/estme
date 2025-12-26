@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { store, useStore } from "./store/index.ts";
-import { saveDocument, loadDocument, listDocuments, deleteDocument, generateId, findDocumentByName, getCurrentDocumentId, setCurrentDocumentId, StoredDocument, saveAutosave, loadAutosave, clearAutosave } from "./storage.ts";
+import { saveDocument, loadDocument, loadDocumentById, listDocuments, deleteDocument, generateId, getCurrentDocumentId, setCurrentDocumentId, StoredDocument, saveAutosave, loadAutosave, clearAutosave } from "./storage.ts";
 import { importSvg } from "./svgImport.ts";
 import { exportBinary } from "./exportBinary.ts";
 import styles from "./MenuBar.module.css";
@@ -37,10 +37,10 @@ export const MenuBar = () => {
           return;
         }
 
-        // No autosave, try to load the last opened document
+        // No autosave, try to load the last opened document by ID
         const currentId = getCurrentDocumentId();
         if (currentId) {
-          const doc = await loadDocument(currentId);
+          const doc = await loadDocumentById(currentId);
           if (doc) {
             store.loadDocument(doc.data as Parameters<typeof store.loadDocument>[0], doc.id);
             return;
@@ -71,6 +71,11 @@ export const MenuBar = () => {
     }
   }, [openMenu]);
 
+  // Store refs to handlers to avoid stale closures in keyboard shortcut effect
+  const handleSaveRef = useRef<() => void>(() => {});
+  const handleOpenRef = useRef<() => void>(() => {});
+  const handleNewRef = useRef<() => void>(() => {});
+
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -82,13 +87,13 @@ export const MenuBar = () => {
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
         if (e.key === "s") {
           e.preventDefault();
-          handleSaveToStorage();
+          handleSaveRef.current();
         } else if (e.key === "o") {
           e.preventDefault();
-          handleOpenFromStorage();
+          handleOpenRef.current();
         } else if (e.key === "n") {
           e.preventDefault();
-          handleNew();
+          handleNewRef.current();
         }
       }
     };
@@ -152,6 +157,7 @@ export const MenuBar = () => {
     }
     setOpenMenu(null);
   };
+  handleNewRef.current = handleNew;
 
   // Discard unsaved changes - reload last saved version or create new if never saved
   const handleDiscardChanges = async () => {
@@ -276,18 +282,18 @@ export const MenuBar = () => {
       const data = store.getDocumentData();
       const now = Date.now();
 
-      // Check if another document with the same name exists
-      const existingDoc = await findDocumentByName(documentName);
+      // Check if a document with this name already exists
+      // Name is the primary key, so saving will overwrite any existing doc with the same name
+      const existingDoc = await loadDocument(documentName);
       if (existingDoc && existingDoc.id !== id) {
+        // A different document has this name - ask to overwrite
         if (!confirm(`A document named "${documentName}" already exists. Overwrite it?`)) {
           return;
         }
-        // Delete the existing document with that name
-        await deleteDocument(existingDoc.id);
       }
 
-      // Try to get existing createdAt if this document was previously saved
-      const existingCreatedAt = (await loadDocument(id))?.createdAt;
+      // Use existing createdAt if this name was previously saved
+      const existingCreatedAt = existingDoc?.createdAt;
 
       await saveDocument({
         id,
@@ -320,6 +326,10 @@ export const MenuBar = () => {
     }
   };
 
+  // Keep refs updated for keyboard shortcuts
+  handleSaveRef.current = handleSaveToStorage;
+  handleOpenRef.current = handleOpenFromStorage;
+
   const handleSelectDocument = async (doc: StoredDocument) => {
     try {
       await clearAutosave(); // Clear autosave when opening a different document
@@ -330,14 +340,14 @@ export const MenuBar = () => {
     }
   };
 
-  const handleDeleteDocument = async (id: string, e: React.MouseEvent) => {
+  const handleDeleteDocument = async (doc: StoredDocument, e: React.MouseEvent) => {
     e.stopPropagation();
     if (confirm("Delete this document permanently?")) {
       try {
-        await deleteDocument(id);
-        setSavedDocuments(savedDocuments.filter((d) => d.id !== id));
+        await deleteDocument(doc.name);
+        setSavedDocuments(savedDocuments.filter((d) => d.name !== doc.name));
         // If we deleted the current document, clear the ID
-        if (documentId === id) {
+        if (documentId === doc.id) {
           store.setDocumentId(null);
         }
       } catch (err) {
@@ -470,7 +480,7 @@ export const MenuBar = () => {
                       </div>
                       <button
                         className={styles.deleteDocButton}
-                        onClick={(e) => handleDeleteDocument(doc.id, e)}
+                        onClick={(e) => handleDeleteDocument(doc, e)}
                         title="Delete"
                       >
                         ×

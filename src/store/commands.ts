@@ -24,6 +24,15 @@ function getConnectedPoints(state: EditorState, point: PointReference): PointRef
   return [];
 }
 
+// Clean up snap connections that reference paths not in the given paths array
+// Removes any snap connections where any point references a non-existent path
+function cleanupSnapConnections(snapConnections: EditorState["snapConnections"], paths: EditorState["paths"]): EditorState["snapConnections"] {
+  const pathIds = new Set(paths.map((p) => p.id));
+  return snapConnections.filter((conn) =>
+    conn.points.every((p) => pathIds.has(p.pathId))
+  );
+}
+
 // Internal helper: move a single control handle (returns new paths array)
 function moveHandleInternal(paths: EditorState["paths"], id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number): EditorState["paths"] {
   return paths.map((p) => {
@@ -119,10 +128,12 @@ export function applyCommand(
           selection: { pathIds: [cmd.path.id], points: [] },
         };
       } else {
-        // Delete the path
+        // Delete the path and clean up snap connections
+        const newPaths = state.paths.filter((p) => p.id !== cmd.path.id);
         return {
           ...state,
-          paths: state.paths.filter((p) => p.id !== cmd.path.id),
+          paths: newPaths,
+          snapConnections: cleanupSnapConnections(state.snapConnections, newPaths),
           selection: {
             pathIds: state.selection.pathIds.filter((id) => id !== cmd.path.id),
             points: state.selection.points.filter((pt) => pt.pathId !== cmd.path.id),
@@ -158,16 +169,18 @@ export function applyCommand(
         };
       });
 
-      // Then, move all connected points on OTHER paths
-      const movedPoints = new Set<string>();
-      for (let i = 0; i < path.segments.length; i++) {
-        const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
-        for (const connPoint of connectedPoints) {
-          if (connPoint.pathId !== cmd.id) {
-            const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
-            if (!movedPoints.has(key)) {
-              movedPoints.add(key);
-              newPaths = movePointInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, dx, dy);
+      // Then, move all connected points on OTHER paths (unless skipSnap is set)
+      if (!cmd.skipSnap) {
+        const movedPoints = new Set<string>();
+        for (let i = 0; i < path.segments.length; i++) {
+          const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
+          for (const connPoint of connectedPoints) {
+            if (connPoint.pathId !== cmd.id) {
+              const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+              if (!movedPoints.has(key)) {
+                movedPoints.add(key);
+                newPaths = movePointInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, dx, dy);
+              }
             }
           }
         }
@@ -308,6 +321,35 @@ export function applyCommand(
           if (!movedHandles.has(key)) {
             movedHandles.add(key);
             newPaths = moveHandleInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, connPoint.handleType, dx, dy);
+          }
+        }
+      }
+
+      // If there was a mirror movement, also undo/redo that
+      if (cmd.mirrorMove) {
+        const mirrorDx = isUndo ? -cmd.mirrorMove.dx : cmd.mirrorMove.dx;
+        const mirrorDy = isUndo ? -cmd.mirrorMove.dy : cmd.mirrorMove.dy;
+
+        // Move the mirrored handle
+        const mirrorKey = `${cmd.id}:${cmd.mirrorMove.segmentIndex}:${cmd.mirrorMove.handleType}`;
+        if (!movedHandles.has(mirrorKey)) {
+          movedHandles.add(mirrorKey);
+          newPaths = moveHandleInternal(newPaths, cmd.id, cmd.mirrorMove.segmentIndex, cmd.mirrorMove.handleType, mirrorDx, mirrorDy);
+        }
+
+        // Move all connected handles of the mirrored handle
+        const mirrorConnectedPoints = getConnectedPoints({ ...state, paths: newPaths }, {
+          pathId: cmd.id,
+          segmentIndex: cmd.mirrorMove.segmentIndex,
+          handleType: cmd.mirrorMove.handleType,
+        });
+        for (const connPoint of mirrorConnectedPoints) {
+          if (connPoint.handleType === "c0" || connPoint.handleType === "c1") {
+            const key = `${connPoint.pathId}:${connPoint.segmentIndex}:${connPoint.handleType}`;
+            if (!movedHandles.has(key)) {
+              movedHandles.add(key);
+              newPaths = moveHandleInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, connPoint.handleType, mirrorDx, mirrorDy);
+            }
           }
         }
       }
@@ -553,16 +595,40 @@ export function applyCommand(
     }
     case "insertAnchor": {
       if (isUndo) {
-        // Restore the previous path state
+        // Restore the previous path state and shift snap connection indices back down
+        const newSnapConnections = state.snapConnections.map((conn) => ({
+          ...conn,
+          points: conn.points.map((p) => {
+            if (p.pathId !== cmd.id) return p;
+            // Decrement indices that were shifted up by the insertion
+            if (p.segmentIndex > cmd.segmentIndex + 1) {
+              return { ...p, segmentIndex: p.segmentIndex - 1 };
+            }
+            return p;
+          }),
+        }));
         return {
           ...state,
           paths: state.paths.map((p) =>
             p.id === cmd.id ? cmd.prevPath : p
           ),
+          snapConnections: newSnapConnections,
           selection: { pathIds: state.selection.pathIds, points: [] },
         };
       } else {
         // Insert a new anchor by splitting a segment at parameter t
+        // Shift snap connection indices: anything after the insertion point needs to be incremented
+        const newSnapConnections = state.snapConnections.map((conn) => ({
+          ...conn,
+          points: conn.points.map((p) => {
+            if (p.pathId !== cmd.id) return p;
+            // Increment indices at or after the new segment position
+            if (p.segmentIndex > cmd.segmentIndex) {
+              return { ...p, segmentIndex: p.segmentIndex + 1 };
+            }
+            return p;
+          }),
+        }));
         return {
           ...state,
           paths: state.paths.map((p) => {
@@ -602,6 +668,7 @@ export function applyCommand(
               anchorMeta: newAnchorMeta,
             };
           }),
+          snapConnections: newSnapConnections,
           // Select the newly inserted anchor
           selection: {
             pathIds: [],
@@ -616,17 +683,123 @@ export function applyCommand(
     }
     case "splitPath": {
       if (isUndo) {
-        // Remove the two new paths and restore the original
+        // Find the position of the first new path to restore original at same position
+        const idx = state.paths.findIndex((p) => p.id === cmd.newPath1.id || p.id === cmd.newPath2.id);
+        const filteredPaths = state.paths.filter((p) => p.id !== cmd.newPath1.id && p.id !== cmd.newPath2.id);
+
+        // Insert original path at the found position (or end if not found)
+        const newPaths = idx >= 0
+          ? [...filteredPaths.slice(0, idx), cmd.originalPath, ...filteredPaths.slice(idx)]
+          : [...filteredPaths, cmd.originalPath];
+
+        const n = cmd.originalPath.segments.length;
+        const path1SegCount = cmd.idx2 - cmd.idx1 + 1; // includes closing segment
+        const path2SegCount = n - (cmd.idx2 - cmd.idx1) + 1; // includes closing segment
+
+        // Remap snap connections back: references to newPath1/newPath2 -> originalPath
+        // Handle closing segments properly - they map to the split point anchors
+        const remappedSnapConnections = state.snapConnections.map((conn) => ({
+          ...conn,
+          points: conn.points.map((p) => {
+            if (p.pathId === cmd.newPath1.id) {
+              // Path1's closing segment is at index idx2-idx1, skip it
+              if (p.segmentIndex >= path1SegCount - 1) {
+                // This is a closing segment, map to idx2's anchor
+                return {
+                  ...p,
+                  pathId: cmd.originalPath.id,
+                  segmentIndex: cmd.idx2,
+                };
+              }
+              // Path1 segments [0..idx2-idx1-1] map back to [idx1..idx2-1]
+              return {
+                ...p,
+                pathId: cmd.originalPath.id,
+                segmentIndex: p.segmentIndex + cmd.idx1,
+              };
+            }
+            if (p.pathId === cmd.newPath2.id) {
+              // Path2's closing segment is at index path2SegCount-1
+              if (p.segmentIndex >= path2SegCount - 1) {
+                // This is a closing segment, map to idx1's anchor
+                return {
+                  ...p,
+                  pathId: cmd.originalPath.id,
+                  segmentIndex: cmd.idx1,
+                };
+              }
+              // Path2 segments [0..path2SegCount-2] map back to [idx2..idx1-1 wrapping]
+              return {
+                ...p,
+                pathId: cmd.originalPath.id,
+                segmentIndex: (p.segmentIndex + cmd.idx2) % n,
+              };
+            }
+            return p;
+          }),
+        }));
+        // Clean up any orphaned snap connections
+        const newSnapConnections = cleanupSnapConnections(remappedSnapConnections, newPaths);
+
         return {
           ...state,
-          paths: state.paths.filter((p) => p.id !== cmd.newPath1.id && p.id !== cmd.newPath2.id).concat(cmd.originalPath),
+          paths: newPaths,
+          snapConnections: newSnapConnections,
           selection: { pathIds: [cmd.originalPath.id], points: [] },
         };
       } else {
-        // Remove the original path and add the two new paths
+        // Find the position of the original path to insert new paths at same position
+        const idx = state.paths.findIndex((p) => p.id === cmd.originalPath.id);
+        const filteredPaths = state.paths.filter((p) => p.id !== cmd.originalPath.id);
+
+        // Insert new paths at the found position (or end if not found)
+        const newPaths = idx >= 0
+          ? [...filteredPaths.slice(0, idx), cmd.newPath1, cmd.newPath2, ...filteredPaths.slice(idx)]
+          : [...filteredPaths, cmd.newPath1, cmd.newPath2];
+
+        // Remap snap connections: references to originalPath -> newPath1 or newPath2
+        const n = cmd.originalPath.segments.length;
+        const newSnapConnections = state.snapConnections.map((conn) => ({
+          ...conn,
+          points: conn.points.map((p) => {
+            if (p.pathId !== cmd.originalPath.id) return p;
+
+            // Determine which path this segment ended up in
+            // Path1 gets segments [idx1..idx2-1] which become [0..idx2-idx1-1]
+            // Path2 gets segments [idx2..idx1-1 wrapping] which become [0..n-(idx2-idx1)-1]
+            const segIdx = p.segmentIndex;
+
+            if (segIdx >= cmd.idx1 && segIdx < cmd.idx2) {
+              // This segment is in path1
+              return {
+                ...p,
+                pathId: cmd.newPath1.id,
+                segmentIndex: segIdx - cmd.idx1,
+              };
+            } else {
+              // This segment is in path2 (wraps around)
+              // Original: idx2, idx2+1, ..., n-1, 0, 1, ..., idx1-1
+              // New:      0,    1,      ..., n-idx2-1, n-idx2, n-idx2+1, ..., n-idx2+idx1-1
+              let newIdx: number;
+              if (segIdx >= cmd.idx2) {
+                newIdx = segIdx - cmd.idx2;
+              } else {
+                // segIdx < idx1, so it wrapped
+                newIdx = (n - cmd.idx2) + segIdx;
+              }
+              return {
+                ...p,
+                pathId: cmd.newPath2.id,
+                segmentIndex: newIdx,
+              };
+            }
+          }),
+        }));
+
         return {
           ...state,
-          paths: state.paths.filter((p) => p.id !== cmd.originalPath.id).concat(cmd.newPath1, cmd.newPath2),
+          paths: newPaths,
+          snapConnections: newSnapConnections,
           selection: { pathIds: [cmd.newPath1.id, cmd.newPath2.id], points: [] },
         };
       }
@@ -634,18 +807,22 @@ export function applyCommand(
     case "joinPaths": {
       if (isUndo) {
         // Remove the joined path and restore the original paths
-        const originalIds = cmd.originalPaths.map((p) => p.id);
+        const originalPathIds = cmd.originalPaths.map((p) => p.id);
+        const newPaths = state.paths.filter((p) => p.id !== cmd.newPath.id).concat(cmd.originalPaths);
         return {
           ...state,
-          paths: state.paths.filter((p) => p.id !== cmd.newPath.id).concat(cmd.originalPaths),
-          selection: { pathIds: originalIds, points: [] },
+          paths: newPaths,
+          snapConnections: cleanupSnapConnections(state.snapConnections, newPaths),
+          selection: { pathIds: originalPathIds, points: [] },
         };
       } else {
         // Remove the original paths and add the joined path
         const originalIds = new Set(cmd.originalPaths.map((p) => p.id));
+        const newPaths = state.paths.filter((p) => !originalIds.has(p.id)).concat(cmd.newPath);
         return {
           ...state,
-          paths: state.paths.filter((p) => !originalIds.has(p.id)).concat(cmd.newPath),
+          paths: newPaths,
+          snapConnections: cleanupSnapConnections(state.snapConnections, newPaths),
           selection: { pathIds: [cmd.newPath.id], points: [] },
         };
       }
@@ -654,17 +831,21 @@ export function applyCommand(
       if (isUndo) {
         // Remove result paths and restore original paths
         const resultIds = new Set(cmd.resultPaths.map((p) => p.id));
+        const newPaths = state.paths.filter((p) => !resultIds.has(p.id)).concat(cmd.originalPaths);
         return {
           ...state,
-          paths: state.paths.filter((p) => !resultIds.has(p.id)).concat(cmd.originalPaths),
+          paths: newPaths,
+          snapConnections: cleanupSnapConnections(state.snapConnections, newPaths),
           selection: { pathIds: cmd.originalPaths.map((p) => p.id), points: [] },
         };
       } else {
         // Remove original paths and add result paths
         const originalIds = new Set(cmd.originalPaths.map((p) => p.id));
+        const newPaths = state.paths.filter((p) => !originalIds.has(p.id)).concat(cmd.resultPaths);
         return {
           ...state,
-          paths: state.paths.filter((p) => !originalIds.has(p.id)).concat(cmd.resultPaths),
+          paths: newPaths,
+          snapConnections: cleanupSnapConnections(state.snapConnections, newPaths),
           selection: { pathIds: cmd.resultPaths.map((p) => p.id), points: [] },
         };
       }
@@ -751,6 +932,13 @@ export function applyCommand(
             p.id === cmd.itemId ? { ...p, parentId } : p
           ),
         };
+      } else if (cmd.itemType === "raster") {
+        return {
+          ...state,
+          rasters: state.rasters.map((r) =>
+            r.id === cmd.itemId ? { ...r, parentId } : r
+          ),
+        };
       } else {
         return {
           ...state,
@@ -768,6 +956,11 @@ export function applyCommand(
         const [item] = newPaths.splice(fromIndex, 1);
         newPaths.splice(toIndex, 0, item);
         return { ...state, paths: newPaths };
+      } else if (cmd.itemType === "raster") {
+        const newRasters = [...state.rasters];
+        const [item] = newRasters.splice(fromIndex, 1);
+        newRasters.splice(toIndex, 0, item);
+        return { ...state, rasters: newRasters };
       } else {
         const newGroups = [...state.groups];
         const [item] = newGroups.splice(fromIndex, 1);
@@ -912,6 +1105,109 @@ export function applyCommand(
         // (the bake operation should have already modified the path)
         return state;
       }
+    }
+    // Raster commands
+    case "addRaster": {
+      if (isUndo) {
+        return {
+          ...state,
+          rasters: state.rasters.filter((r) => r.id !== cmd.raster.id),
+        };
+      } else {
+        return {
+          ...state,
+          rasters: [...state.rasters, cmd.raster],
+        };
+      }
+    }
+    case "deleteRaster": {
+      if (isUndo) {
+        return {
+          ...state,
+          rasters: [...state.rasters, cmd.raster],
+        };
+      } else {
+        return {
+          ...state,
+          rasters: state.rasters.filter((r) => r.id !== cmd.raster.id),
+        };
+      }
+    }
+    case "setRasterVisible": {
+      const visible = isUndo ? !cmd.visible : cmd.visible;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, visible } : r
+        ),
+      };
+    }
+    case "setRasterLocked": {
+      const locked = isUndo ? !cmd.locked : cmd.locked;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, locked } : r
+        ),
+      };
+    }
+    case "setRasterName": {
+      const name = isUndo ? cmd.prevName : cmd.newName;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, name } : r
+        ),
+      };
+    }
+    case "setRasterOpacity": {
+      const opacity = isUndo ? cmd.prevOpacity : cmd.newOpacity;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, opacity } : r
+        ),
+      };
+    }
+    case "setRasterTransform": {
+      const transform = isUndo ? cmd.prevTransform : cmd.newTransform;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, transform } : r
+        ),
+      };
+    }
+    case "setRasterPosition": {
+      const x = isUndo ? cmd.prevX : cmd.newX;
+      const y = isUndo ? cmd.prevY : cmd.newY;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, x, y } : r
+        ),
+      };
+    }
+    case "setRasterSize": {
+      const width = isUndo ? cmd.prevWidth : cmd.newWidth;
+      const height = isUndo ? cmd.prevHeight : cmd.newHeight;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, width, height } : r
+        ),
+      };
+    }
+    case "setRasterRenderOrder": {
+      const renderOrder = isUndo
+        ? (cmd.renderOrder === "front" ? "back" : "front")
+        : cmd.renderOrder;
+      return {
+        ...state,
+        rasters: state.rasters.map((r) =>
+          r.id === cmd.id ? { ...r, renderOrder } : r
+        ),
+      };
     }
   }
 }

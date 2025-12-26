@@ -1,17 +1,24 @@
-import { useState, useEffect, useRef } from "react";
-import { store, useStore, PointSelection, Selection } from "./store/index.ts";
+import { useEffect, useRef, useState } from "react";
+import { PointSelection, Selection, store, useStore } from "./store/index.ts";
 import { InstanceProperties as InstancePropertiesType } from "./store/types.ts";
-import { Path, Point, PointReference, HandleType } from "./types.ts";
-import { AnimatableProperty, ANIMATABLE_PROPERTIES, propertyColors, UnifiedKeyframe, defaultPropertyValues, PartAnimation } from "./animation.ts";
+import { HandleType, Path, Point, PointReference, Raster } from "./types.ts";
+import {
+  ANIMATABLE_PROPERTIES,
+  AnimatableProperty,
+  defaultPropertyValues,
+  PartAnimation,
+  propertyColors,
+  UnifiedKeyframe,
+} from "./animation.ts";
 import {
   averageColors,
   getAnchorColor,
   getAnchorPosition,
+  getGroupCenter,
+  getGroupTransformPoint,
   getPathAngle,
   getPathCenter,
   getPathTransformPoint,
-  getGroupTransformPoint,
-  getGroupCenter,
 } from "./geometry.ts";
 import { Group } from "./types.ts";
 import styles from "./Properties.module.css";
@@ -66,15 +73,17 @@ function NumberInput({ value, onChange, step, decimals = 3 }: {
 }
 
 // Number input with drag-to-adjust behavior (like a scrubber/slider)
-function DraggableNumberInput({ value, onChange, min, max, step = 1, decimals = 0, suffix = "" }: {
-  value: number;
-  onChange: (value: number) => void;
-  min: number;
-  max: number;
-  step?: number;
-  decimals?: number;
-  suffix?: string;
-}) {
+function DraggableNumberInput(
+  { value, onChange, min, max, step = 1, decimals = 0, suffix = "" }: {
+    value: number;
+    onChange: (value: number) => void;
+    min: number;
+    max: number;
+    step?: number;
+    decimals?: number;
+    suffix?: string;
+  },
+) {
   const [localValue, setLocalValue] = useState(formatNumber(value, decimals));
   const [isFocused, setIsFocused] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -117,7 +126,10 @@ function DraggableNumberInput({ value, onChange, min, max, step = 1, decimals = 
   };
 
   return (
-    <div className={styles.draggableInput} style={{ cursor: isDragging ? "ew-resize" : "ew-resize" }}>
+    <div
+      className={styles.draggableInput}
+      style={{ cursor: isDragging ? "ew-resize" : "ew-resize" }}
+    >
       <input
         type="number"
         step={step}
@@ -148,7 +160,10 @@ function DraggableNumberInput({ value, onChange, min, max, step = 1, decimals = 
 }
 
 // Calculate center of multiple paths/points as bounding box center (includes individual point selections)
-function getMultiSelectionCenter(paths: Path[], selection: Selection): Point | null {
+function getMultiSelectionCenter(
+  paths: Path[],
+  selection: Selection,
+): Point | null {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   let hasPoints = false;
 
@@ -209,7 +224,9 @@ function InstancePropertiesSection() {
     <>
       <div className={styles.section}>
         <div className={styles.sectionTitle}>Instance Properties</div>
-        <div className={styles.hint}>Rendering properties (not saved with document)</div>
+        <div className={styles.hint}>
+          Rendering properties (not saved with document)
+        </div>
       </div>
 
       <div className={styles.section}>
@@ -236,7 +253,9 @@ function InstancePropertiesSection() {
             value={instanceProperties.vertexColor}
             onChange={(e) => store.setInstanceVertexColor(e.target.value)}
           />
-          <span className={styles.colorValue}>{instanceProperties.vertexColor}</span>
+          <span className={styles.colorValue}>
+            {instanceProperties.vertexColor}
+          </span>
         </div>
         <div className={styles.hint}>Multiplied with per-vertex colors</div>
       </div>
@@ -250,7 +269,9 @@ function InstancePropertiesSection() {
             value={instanceProperties.accentColor}
             onChange={(e) => store.setInstanceAccentColor(e.target.value)}
           />
-          <span className={styles.colorValue}>{instanceProperties.accentColor}</span>
+          <span className={styles.colorValue}>
+            {instanceProperties.accentColor}
+          </span>
         </div>
         <div className={styles.hint}>For player-masked vertices</div>
       </div>
@@ -265,7 +286,9 @@ function InstancePropertiesSection() {
           />
           <label htmlFor="minimapMask">Minimap Mask</label>
         </div>
-        <div className={styles.hint}>Render as solid accent color silhouette</div>
+        <div className={styles.hint}>
+          Render as solid accent color silhouette
+        </div>
       </div>
     </>
   );
@@ -275,25 +298,46 @@ export const Properties = () => {
   const selection = useStore((s) => s.selection);
   const paths = useStore((s) => s.paths);
   const groups = useStore((s) => s.groups);
-  const selectedKeyframe = useStore((s) => s.selectedKeyframe);
+  const rasters = useStore((s) => s.rasters);
+  const selectedKeyframes = useStore((s) => s.selectedKeyframes);
   const currentClipId = useStore((s) => s.currentClipId);
   const animationClips = useStore((s) => s.animationClips);
 
-  // If a keyframe is selected, show unified keyframe editor
+  // If keyframes are selected, show unified keyframe editor
   // Include all selected paths so edits apply to the whole selection
-  if (selectedKeyframe && currentClipId) {
+  if (selectedKeyframes.length > 0 && currentClipId) {
     const clip = animationClips.find((c) => c.id === currentClipId);
 
-    // Get all selected path IDs (the selectedKeyframe.pathId + any other selected paths)
+    // Build a map of pathId -> selected keyframe time
+    // Each path uses its own selected keyframe time for edits
+    const pathTimeMap = new Map<string, number>();
+    for (const kf of selectedKeyframes) {
+      // If path already has a time, keep the first one (could be multiple keyframes for same path)
+      if (!pathTimeMap.has(kf.pathId)) {
+        pathTimeMap.set(kf.pathId, kf.time);
+      }
+    }
+
+    // Get all selected path IDs from keyframes + any other selected paths
+    const keyframePathIds = [...new Set(selectedKeyframes.map((kf) => kf.pathId))];
     const selectedPathIds = selection.pathIds.length > 0
       ? selection.pathIds
-      : [selectedKeyframe.pathId];
+      : keyframePathIds;
+
+    // For paths without keyframes selected, use the first keyframe's time as fallback
+    const fallbackTime = selectedKeyframes[0].time;
+    for (const pathId of selectedPathIds) {
+      if (!pathTimeMap.has(pathId)) {
+        pathTimeMap.set(pathId, fallbackTime);
+      }
+    }
 
     // Get names for all selected paths
     const selectedPathNames = selectedPathIds.map((id) => {
       const path = paths.find((p) => p.id === id);
       const group = groups.find((g) => g.id === id);
-      return path?.name ?? group?.name ?? "Unknown";
+      const raster = rasters.find((r) => r.id === id);
+      return path?.name ?? group?.name ?? raster?.name ?? "Unknown";
     });
 
     const unifiedKeyframe = store.getSelectedKeyframe();
@@ -306,13 +350,15 @@ export const Properties = () => {
           pathNames={selectedPathNames}
           clipName={clip?.name ?? ""}
           keyframe={unifiedKeyframe}
+          pathTimeMap={pathTimeMap}
           clipDuration={clip?.duration ?? 1}
         />
       );
     }
   }
 
-  const hasSelection = selection.pathIds.length > 0 || selection.points.length > 0;
+  const hasSelection = selection.pathIds.length > 0 ||
+    selection.points.length > 0;
 
   if (!hasSelection) {
     return (
@@ -328,6 +374,11 @@ export const Properties = () => {
     const group = groups.find((g) => g.id === selection.pathIds[0]);
     if (group) {
       return <GroupProperties group={group} paths={paths} groups={groups} />;
+    }
+    // Check if this is a raster
+    const raster = rasters.find((r) => r.id === selection.pathIds[0]);
+    if (raster) {
+      return <RasterProperties raster={raster} />;
     }
     // Otherwise it's a path
     const path = paths.find((p) => p.id === selection.pathIds[0]);
@@ -349,9 +400,11 @@ export const Properties = () => {
       const allChildIds = [...childPathIds, ...childGroupIds];
 
       // Check if selection matches exactly the children of this group
-      if (allChildIds.length === selection.pathIds.length &&
-          selection.pathIds.every((id) => allChildIds.includes(id)) &&
-          allChildIds.every((id) => selection.pathIds.includes(id))) {
+      if (
+        allChildIds.length === selection.pathIds.length &&
+        selection.pathIds.every((id) => allChildIds.includes(id)) &&
+        allChildIds.every((id) => selection.pathIds.includes(id))
+      ) {
         return <GroupProperties group={group} paths={paths} groups={groups} />;
       }
     }
@@ -363,9 +416,22 @@ export const Properties = () => {
     const path = paths.find((p) => p.id === point.pathId);
     if (path) {
       if (point.handleType === "anchor") {
-        return <AnchorProperties path={path} pathId={point.pathId} segmentIndex={point.segmentIndex} />;
+        return (
+          <AnchorProperties
+            path={path}
+            pathId={point.pathId}
+            segmentIndex={point.segmentIndex}
+          />
+        );
       } else {
-        return <ControlPointProperties path={path} pathId={point.pathId} segmentIndex={point.segmentIndex} handleType={point.handleType} />;
+        return (
+          <ControlPointProperties
+            path={path}
+            pathId={point.pathId}
+            segmentIndex={point.segmentIndex}
+            handleType={point.handleType}
+          />
+        );
       }
     }
   }
@@ -375,16 +441,20 @@ export const Properties = () => {
 };
 
 // Multi-selection properties (shows center only)
-function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selection: Selection }) {
+function MultiSelectionProperties(
+  { paths, selection }: { paths: Path[]; selection: Selection },
+) {
   const center = getMultiSelectionCenter(paths, selection);
   const count = selection.pathIds.length + selection.points.length;
 
   // Calculate average opacity for selected paths
   const selectedPaths = paths.filter((p) => selection.pathIds.includes(p.id));
   const avgOpacity = selectedPaths.length > 0
-    ? selectedPaths.reduce((sum, p) => sum + p.opacity, 0) / selectedPaths.length
+    ? selectedPaths.reduce((sum, p) => sum + p.opacity, 0) /
+      selectedPaths.length
     : 1;
-  const allSameOpacity = selectedPaths.length > 0 && selectedPaths.every((p) => p.opacity === selectedPaths[0].opacity);
+  const allSameOpacity = selectedPaths.length > 0 &&
+    selectedPaths.every((p) => p.opacity === selectedPaths[0].opacity);
 
   const handleCenterChange = (axis: "x" | "y", value: number) => {
     if (!center) return;
@@ -412,7 +482,9 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
   }
 
   // Add colors of individually selected anchor points
-  const anchorPoints = selection.points.filter(p => p.handleType === "anchor");
+  const anchorPoints = selection.points.filter((p) =>
+    p.handleType === "anchor"
+  );
   for (const point of anchorPoints) {
     const path = paths.find((p) => p.id === point.pathId);
     if (path) {
@@ -421,7 +493,8 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
   }
 
   const avgColor = averageColors(vertexColors);
-  const allSameColor = vertexColors.length > 0 && vertexColors.every(c => c === vertexColors[0]);
+  const allSameColor = vertexColors.length > 0 &&
+    vertexColors.every((c) => c === vertexColors[0]);
 
   if (!center) {
     return (
@@ -444,21 +517,23 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
       <div className={styles.section}>
         <div className={styles.sectionTitle}>Vertex Color</div>
         {vertexColors.length > 1 && !allSameColor && (
-          <div className={styles.hint}>Average of {vertexColors.length} vertices</div>
-        )}
-        {vertexColors.length > 0 ? (
-          <div className={styles.colorRow}>
-            <input
-              type="color"
-              className={styles.colorInput}
-              value={avgColor}
-              onChange={(e) => store.setSelectionColorLive(e.target.value)}
-            />
-            <span className={styles.colorValue}>{avgColor}</span>
+          <div className={styles.hint}>
+            Average of {vertexColors.length} vertices
           </div>
-        ) : (
-          <div className={styles.hint}>No vertices selected</div>
         )}
+        {vertexColors.length > 0
+          ? (
+            <div className={styles.colorRow}>
+              <input
+                type="color"
+                className={styles.colorInput}
+                value={avgColor}
+                onChange={(e) => store.setSelectionColorLive(e.target.value)}
+              />
+              <span className={styles.colorValue}>{avgColor}</span>
+            </div>
+          )
+          : <div className={styles.hint}>No vertices selected</div>}
         {selectedPaths.length > 0 && (
           <>
             <div className={styles.row} style={{ marginTop: 8 }}>
@@ -479,7 +554,9 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
               />
             </div>
             {!allSameOpacity && (
-              <div className={styles.hint}>Average of {selectedPaths.length} paths</div>
+              <div className={styles.hint}>
+                Average of {selectedPaths.length} paths
+              </div>
             )}
           </>
         )}
@@ -510,26 +587,6 @@ function MultiSelectionProperties({ paths, selection }: { paths: Path[]; selecti
           />
         </div>
       </div>
-
-      <div className={styles.section}>
-        <div className={styles.sectionTitle}>Align</div>
-        <div className={styles.buttonRow}>
-          <button
-            className={styles.smallButton}
-            onClick={() => store.alignHorizontally()}
-            title="Align transform points horizontally"
-          >
-            ⇔ Horizontal
-          </button>
-          <button
-            className={styles.smallButton}
-            onClick={() => store.alignVertically()}
-            title="Align transform points vertically"
-          >
-            ⇕ Vertical
-          </button>
-        </div>
-      </div>
     </div>
   );
 }
@@ -544,7 +601,7 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
   const avgColor = averageColors(vertexColors);
   const isAverage = path.segments.length > 1;
   // Check if all colors are the same
-  const allSameColor = vertexColors.every(c => c === vertexColors[0]);
+  const allSameColor = vertexColors.every((c) => c === vertexColors[0]);
 
   const handleCenterChange = (axis: "x" | "y", value: string) => {
     const num = parseFloat(value);
@@ -588,7 +645,9 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
       <div className={styles.section}>
         <div className={styles.sectionTitle}>Vertex Color</div>
         {isAverage && !allSameColor && (
-          <div className={styles.hint}>Average of {path.segments.length} vertices</div>
+          <div className={styles.hint}>
+            Average of {path.segments.length} vertices
+          </div>
         )}
         <div className={styles.colorRow}>
           <input
@@ -662,15 +721,20 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
           <div className={styles.sectionTitle}>Animation Transform</div>
           <div className={styles.row}>
             <label>Rot</label>
-            <span className={styles.value}>{formatNumber(path.transform.rot * (180 / Math.PI), 1)}°</span>
+            <span className={styles.value}>
+              {formatNumber(path.transform.rot * (180 / Math.PI), 1)}°
+            </span>
           </div>
           <div className={styles.row}>
             <label>Scale</label>
-            <span className={styles.value}>{formatNumber(path.transform.scale * 100, 0)}%</span>
+            <span className={styles.value}>
+              {formatNumber(path.transform.scale * 100, 0)}%
+            </span>
           </div>
           <button
             className={styles.resetButton}
-            onClick={() => store.bakeTransform(pathId)}
+            onClick={() =>
+              store.bakeTransform(pathId)}
             title="Apply rotation and scale to geometry, resetting them to identity"
             style={{ width: "100%", marginTop: "4px" }}
           >
@@ -682,15 +746,153 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
   );
 }
 
+// Raster properties panel
+function RasterProperties({ raster }: { raster: Raster }) {
+  const handlePositionChange = (axis: "x" | "y", value: string) => {
+    const num = parseFloat(value);
+    if (isNaN(num)) return;
+    store.setRasterPosition(raster.id,
+      axis === "x" ? num : raster.x,
+      axis === "y" ? num : raster.y
+    );
+  };
+
+  const handleSizeChange = (axis: "width" | "height", value: string) => {
+    const num = parseFloat(value);
+    if (isNaN(num) || num <= 0) return;
+    store.setRasterSize(raster.id,
+      axis === "width" ? num : raster.width,
+      axis === "height" ? num : raster.height
+    );
+  };
+
+  return (
+    <div className={styles.properties}>
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Raster</div>
+        <div className={styles.row}>
+          <label>Size</label>
+          <span className={styles.value}>
+            {Math.round(raster.width)} × {Math.round(raster.height)}
+          </span>
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Position</div>
+        <div className={styles.row}>
+          <label>X</label>
+          <NumberInput
+            value={raster.x}
+            step="0.1"
+            onChange={(v) => handlePositionChange("x", v)}
+          />
+        </div>
+        <div className={styles.row}>
+          <label>Y</label>
+          <NumberInput
+            value={raster.y}
+            step="0.1"
+            onChange={(v) => handlePositionChange("y", v)}
+          />
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Size</div>
+        <div className={styles.row}>
+          <label>W</label>
+          <NumberInput
+            value={raster.width}
+            step="0.1"
+            onChange={(v) => handleSizeChange("width", v)}
+          />
+        </div>
+        <div className={styles.row}>
+          <label>H</label>
+          <NumberInput
+            value={raster.height}
+            step="0.1"
+            onChange={(v) => handleSizeChange("height", v)}
+          />
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Appearance</div>
+        <div className={styles.row}>
+          <label>Opacity</label>
+          <DraggableNumberInput
+            value={Math.round(raster.opacity * 100)}
+            min={0}
+            max={100}
+            step={1}
+            decimals={0}
+            suffix="%"
+            onChange={(v) => store.setRasterOpacity(raster.id, v / 100)}
+          />
+        </div>
+        <div className={styles.row}>
+          <label>Layer</label>
+          <select
+            value={raster.renderOrder}
+            onChange={(e) => store.setRasterRenderOrder(raster.id, e.target.value as "front" | "back")}
+          >
+            <option value="back">Back</option>
+            <option value="front">Front</option>
+          </select>
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Transform</div>
+        <div className={styles.row}>
+          <label>Rotation</label>
+          <NumberInput
+            value={raster.transform.rot * (180 / Math.PI)}
+            step="1"
+            decimals={1}
+            onChange={(v) => {
+              const num = parseFloat(v);
+              if (isNaN(num)) return;
+              store.setRasterTransform(raster.id, {
+                ...raster.transform,
+                rot: num * (Math.PI / 180)
+              });
+            }}
+          />
+        </div>
+        <div className={styles.row}>
+          <label>Scale</label>
+          <DraggableNumberInput
+            value={Math.round(raster.transform.scale * 100)}
+            min={1}
+            max={1000}
+            step={1}
+            decimals={0}
+            suffix="%"
+            onChange={(v) => store.setRasterTransform(raster.id, {
+              ...raster.transform,
+              scale: v / 100
+            })}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Transform point editing section
-function TransformPointSection({ itemId, itemType, path, group, allPaths, allGroups }: {
-  itemId: string;
-  itemType: "path" | "group";
-  path?: Path;
-  group?: Group;
-  allPaths?: Path[];
-  allGroups?: Group[];
-}) {
+function TransformPointSection(
+  { itemId, itemType, path, group, allPaths, allGroups }: {
+    itemId: string;
+    itemType: "path" | "group";
+    path?: Path;
+    group?: Group;
+    allPaths?: Path[];
+    allGroups?: Group[];
+  },
+) {
   const currentPoint = itemType === "path" && path
     ? getPathTransformPoint(path)
     : itemType === "group" && group && allPaths && allGroups
@@ -724,7 +926,11 @@ function TransformPointSection({ itemId, itemType, path, group, allPaths, allGro
       <div className={styles.sectionTitle}>
         <span>Transform Point</span>
         {isCustom && (
-          <button className={styles.resetButton} onClick={handleReset} title="Reset to dynamic center">
+          <button
+            className={styles.resetButton}
+            onClick={handleReset}
+            title="Reset to dynamic center"
+          >
             Reset
           </button>
         )}
@@ -753,7 +959,9 @@ function TransformPointSection({ itemId, itemType, path, group, allPaths, allGro
 }
 
 // Group properties
-function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]; groups: Group[] }) {
+function GroupProperties(
+  { group, paths, groups }: { group: Group; paths: Path[]; groups: Group[] },
+) {
   const center = getGroupCenter(group, paths, groups);
 
   // Count direct children
@@ -766,9 +974,11 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
 
   // Calculate average opacity for descendant paths
   const avgOpacity = descendantPaths.length > 0
-    ? descendantPaths.reduce((sum, p) => sum + p.opacity, 0) / descendantPaths.length
+    ? descendantPaths.reduce((sum, p) => sum + p.opacity, 0) /
+      descendantPaths.length
     : 1;
-  const allSameOpacity = descendantPaths.length > 0 && descendantPaths.every((p) => p.opacity === descendantPaths[0].opacity);
+  const allSameOpacity = descendantPaths.length > 0 &&
+    descendantPaths.every((p) => p.opacity === descendantPaths[0].opacity);
 
   // Collect all vertex colors from descendant paths
   const vertexColors: string[] = [];
@@ -778,7 +988,8 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
     }
   }
   const avgColor = averageColors(vertexColors);
-  const allSameColor = vertexColors.length > 0 && vertexColors.every(c => c === vertexColors[0]);
+  const allSameColor = vertexColors.length > 0 &&
+    vertexColors.every((c) => c === vertexColors[0]);
 
   const handleCenterChange = (axis: "x" | "y", value: number) => {
     const dx = axis === "x" ? value - center.x : 0;
@@ -821,7 +1032,8 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
         <div className={styles.row}>
           <label>Children</label>
           <span className={styles.value}>
-            {childPathCount} path{childPathCount !== 1 ? "s" : ""}, {childGroupCount} group{childGroupCount !== 1 ? "s" : ""}
+            {childPathCount} path{childPathCount !== 1 ? "s" : ""},{" "}
+            {childGroupCount} group{childGroupCount !== 1 ? "s" : ""}
           </span>
         </div>
       </div>
@@ -830,7 +1042,9 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
         <div className={styles.section}>
           <div className={styles.sectionTitle}>Vertex Color</div>
           {vertexColors.length > 1 && !allSameColor && (
-            <div className={styles.hint}>Average of {vertexColors.length} vertices</div>
+            <div className={styles.hint}>
+              Average of {vertexColors.length} vertices
+            </div>
           )}
           <div className={styles.colorRow}>
             <input
@@ -856,7 +1070,9 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
                 />
               </div>
               {!allSameOpacity && (
-                <div className={styles.hint}>Average of {descendantPaths.length} paths</div>
+                <div className={styles.hint}>
+                  Average of {descendantPaths.length} paths
+                </div>
               )}
               <div className={styles.checkboxRow}>
                 <input
@@ -865,8 +1081,12 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
                   checked={descendantPaths.every((p) => p.playerMask)}
                   ref={(el) => {
                     if (el) {
-                      const allChecked = descendantPaths.every((p) => p.playerMask);
-                      const noneChecked = descendantPaths.every((p) => !p.playerMask);
+                      const allChecked = descendantPaths.every((p) =>
+                        p.playerMask
+                      );
+                      const noneChecked = descendantPaths.every((p) =>
+                        !p.playerMask
+                      );
                       el.indeterminate = !allChecked && !noneChecked;
                     }
                   }}
@@ -876,7 +1096,9 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
                     }
                   }}
                 />
-                <label htmlFor={`playerMask-group-${group.id}`}>Accent Color</label>
+                <label htmlFor={`playerMask-group-${group.id}`}>
+                  Accent Color
+                </label>
               </div>
             </>
           )}
@@ -955,7 +1177,13 @@ function GroupProperties({ group, paths, groups }: { group: Group; paths: Path[]
 }
 
 // Snap connections section for a point
-function SnapConnectionsSection({ pathId, segmentIndex, handleType }: { pathId: string; segmentIndex: number; handleType: HandleType }) {
+function SnapConnectionsSection(
+  { pathId, segmentIndex, handleType }: {
+    pathId: string;
+    segmentIndex: number;
+    handleType: HandleType;
+  },
+) {
   const paths = useStore((s) => s.paths);
   const snapConnections = useStore((s) => s.snapConnections);
 
@@ -978,7 +1206,9 @@ function SnapConnectionsSection({ pathId, segmentIndex, handleType }: { pathId: 
       {connectedPoints.map((connPoint, idx) => {
         const connPath = paths.find((p) => p.id === connPoint.pathId);
         const pathName = connPath?.name || "Unknown";
-        const pointType = connPoint.handleType === "anchor" ? "anchor" : connPoint.handleType;
+        const pointType = connPoint.handleType === "anchor"
+          ? "anchor"
+          : connPoint.handleType;
         return (
           <div key={idx} className={styles.snapRow}>
             <button
@@ -1011,19 +1241,30 @@ function SnapConnectionsSection({ pathId, segmentIndex, handleType }: { pathId: 
 }
 
 // Anchor properties
-function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: string; segmentIndex: number }) {
+function AnchorProperties(
+  { path, pathId, segmentIndex }: {
+    path: Path;
+    pathId: string;
+    segmentIndex: number;
+  },
+) {
   const meta = path.anchorMeta[segmentIndex];
 
   // For open paths, the final anchor (segmentIndex === segments.length) has no outgoing segment
-  const isFinalAnchorOfOpenPath = !path.closed && segmentIndex === path.segments.length;
+  const isFinalAnchorOfOpenPath = !path.closed &&
+    segmentIndex === path.segments.length;
   // For open paths, the first anchor (segmentIndex === 0) has no incoming segment
   const isFirstAnchorOfOpenPath = !path.closed && segmentIndex === 0;
 
   // Get the segment that starts at this anchor (if any)
   const segment = isFinalAnchorOfOpenPath ? null : path.segments[segmentIndex];
   // Get the segment that ends at this anchor (if any)
-  const prevSegIdx = segmentIndex === 0 ? path.segments.length - 1 : segmentIndex - 1;
-  const prevSegment = isFirstAnchorOfOpenPath ? null : path.segments[prevSegIdx];
+  const prevSegIdx = segmentIndex === 0
+    ? path.segments.length - 1
+    : segmentIndex - 1;
+  const prevSegment = isFirstAnchorOfOpenPath
+    ? null
+    : path.segments[prevSegIdx];
 
   // Get anchor position
   const anchorPos = isFinalAnchorOfOpenPath
@@ -1094,7 +1335,11 @@ function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: 
       {hasC0 && segment && (
         <div className={styles.section}>
           <div className={styles.sectionTitle}>
-            <span>Right Handle (c0)</span>
+            <span
+              className={styles.clickableHandle}
+              onClick={() => store.selectPoint({ pathId, segmentIndex, handleType: "c0" })}
+              title="Click to select this handle"
+            >Right Handle (c0)</span>
             <input
               type="checkbox"
               checked={meta.rightActive}
@@ -1127,7 +1372,11 @@ function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: 
       {hasC1 && prevSegment && (
         <div className={styles.section}>
           <div className={styles.sectionTitle}>
-            <span>Left Handle (c1)</span>
+            <span
+              className={styles.clickableHandle}
+              onClick={() => store.selectPoint({ pathId, segmentIndex: prevSegIdx, handleType: "c1" })}
+              title="Click to select this handle"
+            >Left Handle (c1)</span>
             <input
               type="checkbox"
               checked={meta.leftActive}
@@ -1166,7 +1415,8 @@ function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: 
               type="checkbox"
               id="mirrorAngle"
               checked={meta.mirrorAngle}
-              onChange={() => store.setMirrorAngle(pathId, segmentIndex, !meta.mirrorAngle)}
+              onChange={() =>
+                store.setMirrorAngle(pathId, segmentIndex, !meta.mirrorAngle)}
             />
             <label htmlFor="mirrorAngle">Lock angles (180°)</label>
           </div>
@@ -1175,7 +1425,12 @@ function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: 
               type="checkbox"
               id="mirrorDistance"
               checked={meta.mirrorDistance}
-              onChange={() => store.setMirrorDistance(pathId, segmentIndex, !meta.mirrorDistance)}
+              onChange={() =>
+                store.setMirrorDistance(
+                  pathId,
+                  segmentIndex,
+                  !meta.mirrorDistance,
+                )}
             />
             <label htmlFor="mirrorDistance">Lock magnitudes</label>
           </div>
@@ -1189,9 +1444,12 @@ function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: 
             type="color"
             className={styles.colorInput}
             value={meta.color || path.fill}
-            onChange={(e) => store.setAnchorColorLive(pathId, segmentIndex, e.target.value)}
+            onChange={(e) =>
+              store.setAnchorColorLive(pathId, segmentIndex, e.target.value)}
           />
-          <span className={styles.colorValue}>{meta.color || `(inherit: ${path.fill})`}</span>
+          <span className={styles.colorValue}>
+            {meta.color || `(inherit: ${path.fill})`}
+          </span>
           {meta.color && (
             <button
               className={styles.clearButton}
@@ -1203,13 +1461,24 @@ function AnchorProperties({ path, pathId, segmentIndex }: { path: Path; pathId: 
         </div>
       </div>
 
-      <SnapConnectionsSection pathId={pathId} segmentIndex={segmentIndex} handleType="anchor" />
+      <SnapConnectionsSection
+        pathId={pathId}
+        segmentIndex={segmentIndex}
+        handleType="anchor"
+      />
     </div>
   );
 }
 
 // Control point properties (c0 or c1)
-function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { path: Path; pathId: string; segmentIndex: number; handleType: "c0" | "c1" }) {
+function ControlPointProperties(
+  { path, pathId, segmentIndex, handleType }: {
+    path: Path;
+    pathId: string;
+    segmentIndex: number;
+    handleType: "c0" | "c1";
+  },
+) {
   const segment = path.segments[segmentIndex];
 
   // Determine which anchor this control point belongs to
@@ -1289,7 +1558,9 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
   return (
     <div className={styles.properties}>
       <div className={styles.section}>
-        <div className={styles.sectionTitle}>Control Point {handleType} #{segmentIndex}</div>
+        <div className={styles.sectionTitle}>
+          Control Point {handleType} #{segmentIndex}
+        </div>
         <div className={styles.row}>
           <label>X</label>
           <NumberInput
@@ -1309,7 +1580,13 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
       </div>
 
       <div className={styles.section}>
-        <div className={styles.sectionTitle}>Relative to Anchor</div>
+        <div className={styles.sectionTitle}>
+          <span>Relative to <span
+            className={styles.clickableHandle}
+            onClick={() => store.selectPoint({ pathId, segmentIndex: anchorIndex, handleType: "anchor" })}
+            title="Click to select the anchor"
+          >Anchor #{anchorIndex}</span></span>
+        </div>
         <div className={styles.row}>
           <label>Angle</label>
           <NumberInput
@@ -1332,14 +1609,22 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
       <div className={styles.section}>
         <div className={styles.sectionTitle}>Mirror to Other Handle</div>
         {!otherHandleActive && (
-          <div className={styles.hint}>Checking will create the other handle</div>
+          <div className={styles.hint}>
+            Checking will create the other handle
+          </div>
         )}
         <div className={styles.checkboxRow}>
           <input
             type="checkbox"
             id="mirrorAngle"
             checked={meta.mirrorAngle}
-            onChange={() => store.setMirrorAngle(pathId, anchorIndex, !meta.mirrorAngle, handleType)}
+            onChange={() =>
+              store.setMirrorAngle(
+                pathId,
+                anchorIndex,
+                !meta.mirrorAngle,
+                handleType,
+              )}
           />
           <label htmlFor="mirrorAngle">Lock angles (180°)</label>
         </div>
@@ -1348,23 +1633,59 @@ function ControlPointProperties({ path, pathId, segmentIndex, handleType }: { pa
             type="checkbox"
             id="mirrorDistance"
             checked={meta.mirrorDistance}
-            onChange={() => store.setMirrorDistance(pathId, anchorIndex, !meta.mirrorDistance, handleType)}
+            onChange={() =>
+              store.setMirrorDistance(
+                pathId,
+                anchorIndex,
+                !meta.mirrorDistance,
+                handleType,
+              )}
           />
           <label htmlFor="mirrorDistance">Lock magnitudes</label>
         </div>
       </div>
 
-      <SnapConnectionsSection pathId={pathId} segmentIndex={segmentIndex} handleType={handleType} />
+      <SnapConnectionsSection
+        pathId={pathId}
+        segmentIndex={segmentIndex}
+        handleType={handleType}
+      />
     </div>
   );
 }
 
 // Keyframe property input with live updates during typing (supports multi-selection)
+// Get the base value for a property (the value at t=0, or the path's inherent property)
+function getBasePropertyValue(
+  pathId: string,
+  property: AnimatableProperty,
+): number {
+  const { paths } = store.getState();
+  const path = paths.find((p) => p.id === pathId);
+  if (!path) return defaultPropertyValues[property];
+
+  switch (property) {
+    case "rot":
+      // Base rotation is the path's geometric angle (in radians for animation, but PCA returns degrees)
+      return getPathAngle(path) * (Math.PI / 180);
+    case "tx":
+    case "ty":
+      // Base translation is 0 (path is at its geometric position)
+      return 0;
+    case "scale":
+      return 1;
+    case "opacity":
+      return path.opacity;
+    default:
+      return defaultPropertyValues[property];
+  }
+}
+
 function KeyframePropertyInput({
   clipId,
   pathIds,
   property,
-  keyframeTime,
+  pathTimeMap,
   value,
   step,
   decimals,
@@ -1372,26 +1693,43 @@ function KeyframePropertyInput({
   clipId: string;
   pathIds: string[];
   property: AnimatableProperty;
-  keyframeTime: number;
+  pathTimeMap: Map<string, number>;
   value: number;
   step: string;
   decimals: number;
 }) {
   const [localValue, setLocalValue] = useState(formatNumber(value, decimals));
   const [isFocused, setIsFocused] = useState(false);
+  const [absoluteMode, setAbsoluteMode] = useState(false);
   const prevAnimationsRef = useRef<Map<string, PartAnimation> | null>(null);
   // Track which keyframe we're editing to detect when it changes
-  const editingKeyframeRef = useRef<{ pathIds: string[]; time: number } | null>(null);
+  // Use the first path's time as a representative for comparison
+  const firstKeyframeTime = pathTimeMap.get(pathIds[0]) ?? 0;
+  const editingKeyframeRef = useRef<{ pathIds: string[]; time: number } | null>(
+    null,
+  );
+
+  // Calculate absolute value
+  // For single path: base + relative = absolute
+  // For multi path in abs mode: use first path's base to display, but apply target angle to all
+  const baseValue = getBasePropertyValue(pathIds[0], property);
+
+  // For rotation, convert radians to degrees for display
+  const isRotation = property === "rot";
+  const displayValue = absoluteMode
+    ? (isRotation ? (baseValue + value) * (180 / Math.PI) : baseValue + value)
+    : (isRotation ? value * (180 / Math.PI) : value);
 
   // Update local value when external value changes (but not while focused on SAME keyframe)
   useEffect(() => {
     // If keyframe changed (different paths or time), always update even if focused
     const keyframeChanged = editingKeyframeRef.current &&
-      (JSON.stringify(editingKeyframeRef.current.pathIds) !== JSON.stringify(pathIds) ||
-       Math.abs(editingKeyframeRef.current.time - keyframeTime) > 0.0001);
+      (JSON.stringify(editingKeyframeRef.current.pathIds) !==
+          JSON.stringify(pathIds) ||
+        Math.abs(editingKeyframeRef.current.time - firstKeyframeTime) > 0.0001);
 
     if (!isFocused || keyframeChanged) {
-      setLocalValue(formatNumber(value, decimals));
+      setLocalValue(formatNumber(displayValue, decimals));
       // If keyframe changed while focused, commit any pending changes
       if (keyframeChanged && isFocused) {
         setIsFocused(false);
@@ -1402,12 +1740,19 @@ function KeyframePropertyInput({
         editingKeyframeRef.current = null;
       }
     }
-  }, [value, decimals, isFocused, pathIds, keyframeTime, clipId]);
+  }, [displayValue, decimals, isFocused, pathIds, firstKeyframeTime, clipId]);
+
+  // Update local value when switching modes
+  useEffect(() => {
+    if (!isFocused) {
+      setLocalValue(formatNumber(displayValue, decimals));
+    }
+  }, [absoluteMode]);
 
   const handleFocus = () => {
     setIsFocused(true);
     // Track which keyframe we're editing
-    editingKeyframeRef.current = { pathIds, time: keyframeTime };
+    editingKeyframeRef.current = { pathIds, time: firstKeyframeTime };
     // Capture the animation state before editing starts for all paths
     const clip = store.getState().animationClips.find((c) => c.id === clipId);
     const prevAnimations = new Map<string, PartAnimation>();
@@ -1423,7 +1768,27 @@ function KeyframePropertyInput({
     // Live update for immediate visual feedback
     const num = parseFloat(newValue);
     if (!isNaN(num)) {
-      store.setKeyframePropertyLiveMulti(clipId, pathIds, property, keyframeTime, num);
+      if (absoluteMode) {
+        // In absolute mode, set each path to the target absolute value
+        // This means each path gets a different relative value based on its own base
+        const targetAbsolute = isRotation ? num * (Math.PI / 180) : num;
+        for (const pathId of pathIds) {
+          const pathBase = getBasePropertyValue(pathId, property);
+          const relativeValue = targetAbsolute - pathBase;
+          const pathTime = pathTimeMap.get(pathId) ?? firstKeyframeTime;
+          store.setKeyframePropertyLive(clipId, pathId, property, pathTime, relativeValue);
+        }
+      } else {
+        // In relative mode, apply the same relative value to all paths
+        // Each path uses its own selected keyframe time
+        const relativeValue = isRotation ? num * (Math.PI / 180) : num;
+        store.setKeyframePropertyLiveMulti(
+          clipId,
+          pathTimeMap,
+          property,
+          relativeValue,
+        );
+      }
     }
   };
 
@@ -1451,10 +1816,28 @@ function KeyframePropertyInput({
         const cursorPos = input.selectionStart;
         const negated = -num;
         // Convert to string without reformatting
-        const newValue = String(negated);
-        setLocalValue(newValue);
+        const newValueStr = String(negated);
+        setLocalValue(newValueStr);
         // Live update
-        store.setKeyframePropertyLiveMulti(clipId, pathIds, property, keyframeTime, negated);
+        if (absoluteMode) {
+          // In absolute mode, set each path to the target absolute value
+          const targetAbsolute = isRotation ? negated * (Math.PI / 180) : negated;
+          for (const pathId of pathIds) {
+            const pathBase = getBasePropertyValue(pathId, property);
+            const relativeValue = targetAbsolute - pathBase;
+            const pathTime = pathTimeMap.get(pathId) ?? firstKeyframeTime;
+            store.setKeyframePropertyLive(clipId, pathId, property, pathTime, relativeValue);
+          }
+        } else {
+          // In relative mode, apply the same relative value to all paths
+          const relativeValue = isRotation ? negated * (Math.PI / 180) : negated;
+          store.setKeyframePropertyLiveMulti(
+            clipId,
+            pathTimeMap,
+            property,
+            relativeValue,
+          );
+        }
         // Restore cursor position after React updates the input
         requestAnimationFrame(() => {
           // Adjust cursor position: if we added/removed a minus sign, shift accordingly
@@ -1476,16 +1859,36 @@ function KeyframePropertyInput({
     }
   };
 
+  // Show absolute toggle for rotation (works for both single and multi-path)
+  const showAbsoluteToggle = isRotation;
+
   return (
-    <input
-      type="number"
-      step={step}
-      value={localValue}
-      onChange={handleChange}
-      onFocus={handleFocus}
-      onBlur={handleBlur}
-      onKeyDown={handleKeyDown}
-    />
+    <>
+      <input
+        type="number"
+        step={step}
+        value={localValue}
+        onChange={handleChange}
+        onFocus={handleFocus}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
+      />
+      {showAbsoluteToggle && (
+        <button
+          className={styles.resetButton}
+          onClick={() => setAbsoluteMode(!absoluteMode)}
+          style={{
+            background: absoluteMode ? "#4488ff" : undefined,
+            color: absoluteMode ? "#fff" : undefined,
+          }}
+          title={absoluteMode
+            ? "Showing absolute angle (click for relative)"
+            : "Showing relative offset (click for absolute)"}
+        >
+          Abs
+        </button>
+      )}
+    </>
   );
 }
 
@@ -1497,6 +1900,7 @@ function UnifiedKeyframeProperties({
   pathNames,
   clipName,
   keyframe,
+  pathTimeMap,
   clipDuration,
 }: {
   clipId: string;
@@ -1504,6 +1908,7 @@ function UnifiedKeyframeProperties({
   pathNames: string[];
   clipName: string;
   keyframe: UnifiedKeyframe;
+  pathTimeMap: Map<string, number>;
   clipDuration: number;
 }) {
   const [editingTime, setEditingTime] = useState(false);
@@ -1516,19 +1921,30 @@ function UnifiedKeyframeProperties({
     }
   }, [keyframe.t, editingTime]);
 
-  const handlePropertyToggle = (property: AnimatableProperty, isSet: boolean) => {
+  const handlePropertyToggle = (
+    property: AnimatableProperty,
+    isSet: boolean,
+  ) => {
     if (isSet) {
-      // Unset the property on all selected paths
-      store.unsetKeyframePropertyMulti(clipId, pathIds, property, keyframe.t);
+      // Unset the property on all selected paths at their respective times
+      store.unsetKeyframePropertyMulti(clipId, pathTimeMap, property);
     } else {
-      // Set the property to its default value on all selected paths
-      store.setKeyframePropertyMulti(clipId, pathIds, property, keyframe.t, defaultPropertyValues[property]);
+      // Set the property to its default value on all selected paths at their respective times
+      store.setKeyframePropertyMulti(
+        clipId,
+        pathTimeMap,
+        property,
+        defaultPropertyValues[property],
+      );
     }
   };
 
   const handleTimeChange = () => {
     const newTime = parseFloat(timeValue);
-    if (!isNaN(newTime) && newTime >= 0 && newTime <= clipDuration && Math.abs(newTime - keyframe.t) > 0.0001) {
+    if (
+      !isNaN(newTime) && newTime >= 0 && newTime <= clipDuration &&
+      Math.abs(newTime - keyframe.t) > 0.0001
+    ) {
       store.changeKeyframeTimeMulti(clipId, pathIds, keyframe.t, newTime);
     }
     setEditingTime(false);
@@ -1539,8 +1955,85 @@ function UnifiedKeyframeProperties({
     store.clearKeyframeSelection();
   };
 
+  // Snap rotation to a specific angle (used when property is not yet set)
+  const handleSnapToAngle = (targetDegrees: number) => {
+    // For each path, calculate the relative rotation needed to achieve the target absolute angle
+    for (const pathId of pathIds) {
+      const pathBase = getBasePropertyValue(pathId, "rot");
+      const targetAbsolute = targetDegrees * (Math.PI / 180);
+      const relativeValue = targetAbsolute - pathBase;
+      const pathTime = pathTimeMap.get(pathId) ?? keyframe.t;
+      store.setKeyframeProperty(clipId, pathId, "rot", pathTime, relativeValue);
+    }
+  };
+
+  // Copy property value from adjacent keyframe (left or right)
+  const handleCopyFromAdjacent = (property: AnimatableProperty, direction: "left" | "right") => {
+    const clip = store.getState().animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    for (const pathId of pathIds) {
+      const pathTime = pathTimeMap.get(pathId) ?? keyframe.t;
+      const partAnim = clip.parts[pathId] ?? [];
+
+      // Find adjacent keyframe with this property set
+      let adjacentKf: { t: number; value: number } | null = null;
+
+      if (direction === "left") {
+        // Find the closest keyframe to the left that has this property
+        for (const kf of partAnim) {
+          if (kf.t < pathTime - 0.0001 && kf[property] !== undefined) {
+            if (!adjacentKf || kf.t > adjacentKf.t) {
+              adjacentKf = { t: kf.t, value: kf[property]! };
+            }
+          }
+        }
+      } else {
+        // Find the closest keyframe to the right that has this property
+        for (const kf of partAnim) {
+          if (kf.t > pathTime + 0.0001 && kf[property] !== undefined) {
+            if (!adjacentKf || kf.t < adjacentKf.t) {
+              adjacentKf = { t: kf.t, value: kf[property]! };
+            }
+          }
+        }
+      }
+
+      if (adjacentKf) {
+        store.setKeyframeProperty(clipId, pathId, property, pathTime, adjacentKf.value);
+      }
+    }
+  };
+
+  // Check if there's a keyframe with the property to the left/right
+  const hasAdjacentKeyframe = (property: AnimatableProperty, direction: "left" | "right"): boolean => {
+    const clip = store.getState().animationClips.find((c) => c.id === clipId);
+    if (!clip) return false;
+
+    // Check if any selected path has an adjacent keyframe with this property
+    for (const pathId of pathIds) {
+      const pathTime = pathTimeMap.get(pathId) ?? keyframe.t;
+      const partAnim = clip.parts[pathId] ?? [];
+
+      for (const kf of partAnim) {
+        if (direction === "left") {
+          if (kf.t < pathTime - 0.0001 && kf[property] !== undefined) {
+            return true;
+          }
+        } else {
+          if (kf.t > pathTime + 0.0001 && kf[property] !== undefined) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
   // Get which properties are currently set
-  const setProperties = ANIMATABLE_PROPERTIES.filter((p) => keyframe[p] !== undefined);
+  const setProperties = ANIMATABLE_PROPERTIES.filter((p) =>
+    keyframe[p] !== undefined
+  );
 
   // Determine step and decimals based on property
   const getInputConfig = (property: AnimatableProperty) => {
@@ -1572,38 +2065,42 @@ function UnifiedKeyframeProperties({
         </div>
         <div className={styles.row}>
           <label>{isMultiSelection ? "Paths" : "Path"}</label>
-          <span className={styles.value} title={pathNames.join(", ")}>{displayName}</span>
+          <span className={styles.value} title={pathNames.join(", ")}>
+            {displayName}
+          </span>
         </div>
         <div className={styles.row}>
           <label>Time</label>
-          {editingTime ? (
-            <input
-              type="number"
-              step="0.001"
-              min={0}
-              max={clipDuration}
-              value={timeValue}
-              onChange={(e) => setTimeValue(e.target.value)}
-              onBlur={handleTimeChange}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleTimeChange();
-                if (e.key === "Escape") {
-                  setTimeValue(keyframe.t.toFixed(3));
-                  setEditingTime(false);
-                }
-              }}
-              autoFocus
-            />
-          ) : (
-            <span
-              className={styles.value}
-              style={{ cursor: "pointer" }}
-              onClick={() => setEditingTime(true)}
-              title="Click to edit time"
-            >
-              {keyframe.t.toFixed(3)}s
-            </span>
-          )}
+          {editingTime
+            ? (
+              <input
+                type="number"
+                step="0.001"
+                min={0}
+                max={clipDuration}
+                value={timeValue}
+                onChange={(e) => setTimeValue(e.target.value)}
+                onBlur={handleTimeChange}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleTimeChange();
+                  if (e.key === "Escape") {
+                    setTimeValue(keyframe.t.toFixed(3));
+                    setEditingTime(false);
+                  }
+                }}
+                autoFocus
+              />
+            )
+            : (
+              <span
+                className={styles.value}
+                style={{ cursor: "pointer" }}
+                onClick={() => setEditingTime(true)}
+                title="Click to edit time"
+              >
+                {keyframe.t.toFixed(3)}s
+              </span>
+            )}
         </div>
       </div>
 
@@ -1625,19 +2122,58 @@ function UnifiedKeyframeProperties({
               <label style={{ color: propertyColors[prop], minWidth: 50 }}>
                 {PROPERTY_LABELS[prop]}
               </label>
-              {isSet ? (
-                <KeyframePropertyInput
-                  clipId={clipId}
-                  pathIds={pathIds}
-                  property={prop}
-                  keyframeTime={keyframe.t}
-                  value={value}
-                  step={config.step}
-                  decimals={config.decimals}
-                />
-              ) : (
-                <span className={styles.value} style={{ opacity: 0.5 }}>—</span>
-              )}
+              {isSet
+                ? (
+                  <KeyframePropertyInput
+                    clipId={clipId}
+                    pathIds={pathIds}
+                    property={prop}
+                    pathTimeMap={pathTimeMap}
+                    value={value}
+                    step={config.step}
+                    decimals={config.decimals}
+                  />
+                )
+                : (
+                  <span className={styles.buttonGroup}>
+                    <button
+                      className={styles.resetButton}
+                      onClick={() => handleCopyFromAdjacent(prop, "left")}
+                      disabled={!hasAdjacentKeyframe(prop, "left")}
+                      title="Copy from keyframe to the left"
+                      style={{ opacity: hasAdjacentKeyframe(prop, "left") ? 1 : 0.3 }}
+                    >
+                      ←
+                    </button>
+                    <button
+                      className={styles.resetButton}
+                      onClick={() => handleCopyFromAdjacent(prop, "right")}
+                      disabled={!hasAdjacentKeyframe(prop, "right")}
+                      title="Copy from keyframe to the right"
+                      style={{ opacity: hasAdjacentKeyframe(prop, "right") ? 1 : 0.3 }}
+                    >
+                      →
+                    </button>
+                    {prop === "rot" && (
+                      <>
+                        <button
+                          className={styles.resetButton}
+                          onClick={() => handleSnapToAngle(0)}
+                          title="Set to horizontal (0°)"
+                        >
+                          ―
+                        </button>
+                        <button
+                          className={styles.resetButton}
+                          onClick={() => handleSnapToAngle(90)}
+                          title="Set to vertical (90°)"
+                        >
+                          |
+                        </button>
+                      </>
+                    )}
+                  </span>
+                )}
             </div>
           );
         })}

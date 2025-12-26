@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import paper from "paper";
 import { HandleType, HoveredEdge, HoveredPoint, store, useStore } from "./store/index.ts";
-import { defaultAnchorMeta, defaultTransform, lineSegment, Path, Point } from "./types.ts";
+import { defaultAnchorMeta, defaultTransform, lineSegment, Path, Point, Raster } from "./types.ts";
+import { loadImage } from "./storage.ts";
 import { createBlobPath, addBlobToPaths, subtractBlobFromPaths, getBlobPreviewOutline } from "./pathBool.ts";
 import {
   MouseButton,
@@ -51,7 +52,7 @@ import {
   updateAnimationTime,
 } from "./AnimatedMeshMaterial.ts";
 import { pathsToGeometry, createIdentityAnimationData, EffectiveTransform } from "./pathsToGeometry.ts";
-import { getEffectiveTransform, AnimationClip } from "./animation.ts";
+import { getEffectiveTransform, AnimationClip, getPropertyValue } from "./animation.ts";
 
 const VERTEX_SIZE = 0.035;
 
@@ -485,11 +486,15 @@ export const Canvas = () => {
       gridLines: THREE.LineSegments | null;
       hoveredEdgeLine: THREE.Line | null;
       hoveredPathOutline: THREE.Line | null;
+      selectionFlashOutlines: THREE.Line[];
       blobPreviewMesh: THREE.Mesh | null;
       transformPointMeshes: THREE.Mesh[];
       // AnimatedInstancedMesh for rendering paths
       animatedMeshMaterial: THREE.MeshBasicMaterial | null;
       modelPreview: AnimatedInstancedMesh | null;
+      // Raster image meshes
+      rasterMeshes: Map<string, THREE.Mesh>;
+      rasterTextures: Map<string, THREE.Texture>;
       updateGrid: () => void;
       updatePointScales: () => void;
       zoom: number;
@@ -497,6 +502,7 @@ export const Canvas = () => {
   >(null);
 
   const paths = useStore((s) => s.paths);
+  const rasters = useStore((s) => s.rasters);
   const currentPath = useStore((s) => s.currentPath);
   const hoverPoint = useStore((s) => s.hoverPoint);
   const hoveredEdge = useStore((s) => s.hoveredEdge);
@@ -550,6 +556,9 @@ export const Canvas = () => {
   const [blobPreviewPoints, setBlobPreviewPoints] = useState<Point[]>([]);
   const setBlobPreviewPointsRef = useRef(setBlobPreviewPoints);
   setBlobPreviewPointsRef.current = setBlobPreviewPoints;
+
+  // Counter to force re-render when raster textures finish loading
+  const [rasterTextureVersion, setRasterTextureVersion] = useState(0);
 
   // Helper to check if a point is selected
   const isPointSelected = (
@@ -645,6 +654,119 @@ export const Canvas = () => {
     state.modelPreview.setPlayerColorAt(0, new THREE.Color(instanceProperties.accentColor));
     state.modelPreview.setMinimapMaskAt(0, instanceProperties.minimapMask ? 1 : 0);
   }, [instanceProperties]);
+
+  // Render raster images
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+
+    // Track which rasters we've processed
+    const currentRasterIds = new Set(rasters.filter((r) => r.visible).map((r) => r.id));
+
+    // Remove meshes for rasters that no longer exist or are hidden
+    for (const [rasterId, mesh] of state.rasterMeshes) {
+      if (!currentRasterIds.has(rasterId)) {
+        state.scene.remove(mesh);
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+        state.rasterMeshes.delete(rasterId);
+      }
+    }
+
+    // Remove textures for rasters that no longer exist
+    for (const [rasterId] of state.rasterTextures) {
+      if (!rasters.find((r) => r.id === rasterId)) {
+        const texture = state.rasterTextures.get(rasterId);
+        if (texture) {
+          texture.dispose();
+          state.rasterTextures.delete(rasterId);
+        }
+      }
+    }
+
+    // Process visible rasters
+    for (let i = 0; i < rasters.length; i++) {
+      const raster = rasters[i];
+      if (!raster.visible) continue;
+
+      // Check if we already have a mesh for this raster
+      let mesh = state.rasterMeshes.get(raster.id);
+
+      if (!mesh) {
+        // Check if texture is loaded (not just placeholder)
+        const texture = state.rasterTextures.get(raster.id);
+        if (texture) {
+          // Texture exists but mesh doesn't - create mesh now
+          const geometry = new THREE.PlaneGeometry(1, 1);
+          const material = new THREE.MeshBasicMaterial({
+            map: texture,
+            transparent: true,
+            side: THREE.DoubleSide,
+          });
+          mesh = new THREE.Mesh(geometry, material);
+          state.rasterMeshes.set(raster.id, mesh);
+          state.scene.add(mesh);
+        } else if (!state.rasterTextures.has(raster.id)) {
+          // Need to load the texture - mark as loading by setting a placeholder
+          state.rasterTextures.set(raster.id, null as unknown as THREE.Texture);
+
+          // Use an async IIFE to load the image
+          (async () => {
+            const currentState = stateRef.current;
+            if (!currentState) return;
+
+            const blob = await loadImage(raster.imageId);
+            if (!blob) {
+              // Remove the placeholder on failure
+              currentState.rasterTextures.delete(raster.id);
+              return;
+            }
+
+            // Create object URL and load as texture
+            const url = URL.createObjectURL(blob);
+            const loader = new THREE.TextureLoader();
+            const texture = await loader.loadAsync(url);
+            URL.revokeObjectURL(url);
+
+            // Configure texture
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.minFilter = THREE.LinearFilter;
+            texture.magFilter = THREE.LinearFilter;
+
+            // Store the real texture (replacing placeholder)
+            currentState.rasterTextures.set(raster.id, texture);
+
+            // Trigger a re-render to create the mesh
+            setRasterTextureVersion((v) => v + 1);
+          })();
+          continue; // Skip transform update for this raster until loaded
+        } else {
+          // Placeholder exists, still loading - skip
+          continue;
+        }
+      }
+
+      // Update mesh transform (runs for existing meshes and newly created ones)
+      if (mesh) {
+        // Update existing mesh transform
+        const transform = raster.transform;
+        const tx = transform.tx + raster.x;
+        const ty = transform.ty + raster.y;
+        const sx = transform.scale * raster.width;
+        const sy = transform.scale * raster.height;
+
+        // z-position: back rasters at -0.5, front rasters at 0.5, with slight offset per raster for ordering
+        const baseZ = raster.renderOrder === "front" ? 0.5 : -0.5;
+        mesh.position.set(tx, ty, baseZ + i * 0.001);
+        mesh.scale.set(sx, sy, 1);
+        mesh.rotation.z = transform.rot;
+
+        // Update opacity
+        const material = mesh.material as THREE.MeshBasicMaterial;
+        material.opacity = raster.opacity;
+      }
+    }
+  }, [rasters, rasterTextureVersion]);
 
   // Create a selection box mesh for box selection visualization
   const createSelectionBoxMesh = (start: Point, end: Point): THREE.Line => {
@@ -1033,6 +1155,114 @@ export const Canvas = () => {
     }
   }, [hoveredPathId, hoveredPoint, hoveredEdge, paths, tool, animationClips, currentClipId, playbackTime]);
 
+  // Track previous selection for flash effect
+  const prevSelectionRef = useRef<Set<string>>(new Set());
+
+  // Selection flash effect - brief highlight when paths are selected
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+
+    // Find newly selected path IDs (not in previous selection)
+    const currentPathIds = new Set(selection.pathIds);
+    const newlySelected: string[] = [];
+    for (const id of currentPathIds) {
+      if (!prevSelectionRef.current.has(id)) {
+        newlySelected.push(id);
+      }
+    }
+    prevSelectionRef.current = currentPathIds;
+
+    if (newlySelected.length === 0) return;
+
+    // Create flash outlines for newly selected paths
+    const currentClip = animationClips.find((c) => c.id === currentClipId) ?? null;
+    const flashLines: THREE.Line[] = [];
+
+    // Expand groups to their descendant paths for flashing
+    const pathIdsToFlash: string[] = [];
+    for (const id of newlySelected) {
+      // Check if it's a group
+      const group = groups.find((g) => g.id === id);
+      if (group) {
+        // Get all descendant paths of this group
+        const descendantPathIds = store.getDescendantPathIds(id);
+        pathIdsToFlash.push(...descendantPathIds);
+      } else {
+        // It's a path
+        pathIdsToFlash.push(id);
+      }
+    }
+
+    for (const pathId of pathIdsToFlash) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path) continue;
+
+      // Get effective transform for animated paths
+      const ancestors = store.getAncestorChain(path.parentId).reverse();
+      const transform = getEffectiveTransform(path, currentClip, playbackTime, ancestors);
+
+      // Sample all bezier segments to create outline
+      const outlinePoints: THREE.Vector3[] = [];
+      const samples = 20;
+      for (const seg of path.segments) {
+        for (let i = 0; i < samples; i++) {
+          const t = i / samples;
+          const localPt = sampleBezier(seg.p0, seg.c0, seg.c1, seg.p1, t);
+          // Apply animation transform to get world position
+          const worldPt = applyTransform(localPt, transform);
+          outlinePoints.push(new THREE.Vector3(worldPt.x, worldPt.y, 0.35));
+        }
+      }
+      // Close the path
+      if (path.closed && outlinePoints.length > 0) {
+        outlinePoints.push(outlinePoints[0].clone());
+      }
+
+      const geometry = new THREE.BufferGeometry().setFromPoints(outlinePoints);
+      const material = new THREE.LineBasicMaterial({
+        color: 0xffff44,
+        transparent: true,
+        opacity: 1.0
+      });
+      const line = new THREE.Line(geometry, material);
+      state.scene.add(line);
+      flashLines.push(line);
+      state.selectionFlashOutlines.push(line);
+    }
+
+    if (flashLines.length === 0) return;
+
+    // Animate fade out
+    const startTime = performance.now();
+    const duration = 300; // ms
+
+    const animate = () => {
+      const elapsed = performance.now() - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      const opacity = 1 - progress;
+
+      for (const line of flashLines) {
+        (line.material as THREE.LineBasicMaterial).opacity = opacity;
+      }
+
+      if (progress < 1) {
+        requestAnimationFrame(animate);
+      } else {
+        // Clean up
+        for (const line of flashLines) {
+          state.scene.remove(line);
+          line.geometry.dispose();
+          (line.material as THREE.Material).dispose();
+          const idx = state.selectionFlashOutlines.indexOf(line);
+          if (idx >= 0) state.selectionFlashOutlines.splice(idx, 1);
+        }
+      }
+    };
+
+    requestAnimationFrame(animate);
+  }, [selection.pathIds, paths, groups, animationClips, currentClipId, playbackTime]);
+
   // Render blob preview while drawing (render outline from Paper.js boolean operations)
   useEffect(() => {
     const state = stateRef.current;
@@ -1115,7 +1345,13 @@ export const Canvas = () => {
 
     // Helper to create a crosshair-style mesh for transform points
     // Created at scale 1, then scaled by updatePointScales() based on zoom
-    const createTransformPointMesh = (point: Point, isCustom: boolean): THREE.Mesh => {
+    // Colors vary by: type (path/group), selected state, and custom (modified) state
+    const createTransformPointMesh = (
+      point: Point,
+      isCustom: boolean,
+      isSelected: boolean,
+      itemType: "path" | "group"
+    ): THREE.Mesh => {
       // Use a diamond shape to distinguish from circle vertices
       const shape = new THREE.Shape();
       shape.moveTo(0, size);
@@ -1125,8 +1361,26 @@ export const Canvas = () => {
       shape.closePath();
 
       const geometry = new THREE.ShapeGeometry(shape);
-      // Orange for custom, dim orange for dynamic
-      const color = isCustom ? 0xff8800 : 0x886644;
+
+      // Color scheme:
+      // Paths use orange tones, groups use purple/magenta tones
+      // Selected = brighter, Custom = saturated, Dynamic = dimmer
+      let color: number;
+      if (itemType === "path") {
+        if (isSelected) {
+          color = isCustom ? 0xffaa00 : 0xcc8844; // Selected path: bright orange / dim orange
+        } else {
+          color = isCustom ? 0xcc6600 : 0x886644; // Unselected path: medium orange / very dim
+        }
+      } else {
+        // Group
+        if (isSelected) {
+          color = isCustom ? 0xcc66ff : 0x9966cc; // Selected group: bright magenta / dim purple
+        } else {
+          color = isCustom ? 0x9944cc : 0x664488; // Unselected group: medium purple / very dim
+        }
+      }
+
       const material = new THREE.MeshBasicMaterial({ color });
       const mesh = new THREE.Mesh(geometry, material);
       mesh.position.set(point.x, point.y, 1.5); // Above vertices
@@ -1134,12 +1388,33 @@ export const Canvas = () => {
       return mesh;
     };
 
+    // Get selected path and group IDs
+    const selectedPathIds = new Set(selection.pathIds);
+    // Also consider paths with selected points as selected
+    for (const pt of selection.points) {
+      selectedPathIds.add(pt.pathId);
+    }
+    // For now, groups aren't directly selectable, but we can highlight groups
+    // that contain selected paths (including all ancestor groups)
+    const selectedGroupIds = new Set<string>();
+    for (const pathId of selectedPathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      // Walk up the ancestor chain and add all ancestor groups
+      let parentId = path?.parentId;
+      while (parentId) {
+        selectedGroupIds.add(parentId);
+        const parentGroup = groups.find((g) => g.id === parentId);
+        parentId = parentGroup?.parentId ?? null;
+      }
+    }
+
     // Render transform points for visible paths
     for (const path of paths) {
       if (!path.visible) continue;
 
       const transformPoint = getPathTransformPoint(path);
       const isCustom = path.transformPoint !== null;
+      const isSelected = selectedPathIds.has(path.id);
 
       // Apply animation transform if in animation mode
       let worldPoint = transformPoint;
@@ -1150,7 +1425,7 @@ export const Canvas = () => {
         worldPoint = applyTransform(transformPoint, transform);
       }
 
-      const mesh = createTransformPointMesh(worldPoint, isCustom);
+      const mesh = createTransformPointMesh(worldPoint, isCustom, isSelected, "path");
       state.scene.add(mesh);
       state.transformPointMeshes.push(mesh);
     }
@@ -1159,6 +1434,7 @@ export const Canvas = () => {
     for (const group of groups) {
       const transformPoint = getGroupTransformPoint(group, paths, groups);
       const isCustom = group.transformPoint !== null;
+      const isSelected = selectedGroupIds.has(group.id);
 
       // Apply animation transform if in animation mode
       let worldPoint = transformPoint;
@@ -1170,11 +1446,11 @@ export const Canvas = () => {
         // TODO: Apply group transforms when groups support animation
       }
 
-      const mesh = createTransformPointMesh(worldPoint, isCustom);
+      const mesh = createTransformPointMesh(worldPoint, isCustom, isSelected, "group");
       state.scene.add(mesh);
       state.transformPointMeshes.push(mesh);
     }
-  }, [paths, groups, showTransformPoints, currentClipId, animationClips, playbackTime]);
+  }, [paths, groups, showTransformPoints, currentClipId, animationClips, playbackTime, selection]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -1239,10 +1515,13 @@ export const Canvas = () => {
       gridLines: null,
       hoveredEdgeLine: null,
       hoveredPathOutline: null,
+      selectionFlashOutlines: [],
       blobPreviewMesh: null,
       transformPointMeshes: [],
       animatedMeshMaterial,
       modelPreview: null,
+      rasterMeshes: new Map(),
+      rasterTextures: new Map(),
       zoom: initialZoom,
       updateGrid: () => {}, // Placeholder, will be set after function is defined
       updatePointScales: () => {}, // Placeholder, will be set after function is defined
@@ -1470,6 +1749,9 @@ export const Canvas = () => {
     let dragHandleType: HandleType = "anchor";
     let dragSegmentIndex = -1;
     let dragHandleOriginalPos: Point | null = null; // Original position of the control point being dragged (for snapping)
+    let dragMirrorHandleOriginalPos: Point | null = null; // Original position of the mirrored handle (for undo tracking)
+    let dragMirrorSegmentIndex = -1;
+    let dragMirrorHandleType: HandleType = "anchor";
     let dragInitialStart: Point | null = null; // Initial mouse position when drag started (doesn't update each frame)
     let isPanning = false;
     let panStart: Point | null = null;
@@ -1498,6 +1780,13 @@ export const Canvas = () => {
     let pendingCyclePathsAtPoint: string[] = [];
     let pendingCycleClickPoint: Point | null = null;
     let pendingCycleWasAlreadySelected = false;
+    // Drag threshold state: prevent accidental drags when clicking
+    // Drag only starts after moving MIN_DRAG_DISTANCE pixels OR holding for MIN_DRAG_TIME_MS
+    const MIN_DRAG_DISTANCE = 5; // Screen pixels
+    const MIN_DRAG_TIME_MS = 100;
+    let dragThresholdMet = false;
+    let dragStartTime = 0;
+    let dragStartScreen: Point | null = null; // Screen-space start position for distance check
 
     // Helper to find nearest control handle (respects active state)
     const findNearestHandle = (
@@ -1687,9 +1976,40 @@ export const Canvas = () => {
       if (transformPointHit) {
         // Select the path/group when clicking its transform point
         if (transformPointHit.type === "path") {
-          store.selectPath(transformPointHit.id);
+          if (isShiftClick) {
+            // Toggle selection
+            store.toggleInSelection(transformPointHit.id);
+          } else {
+            // Replace selection
+            store.selectPath(transformPointHit.id);
+          }
+        } else if (transformPointHit.type === "group") {
+          // Select all paths in the group
+          const groupPaths = paths.filter((p) => p.parentId === transformPointHit.id);
+          const groupPathIds = groupPaths.map((p) => p.id);
+          if (isShiftClick) {
+            // Check if all paths in group are already selected
+            const allSelected = groupPathIds.every((id) => selection.pathIds.includes(id));
+            if (allSelected && groupPathIds.length > 0) {
+              // Remove all paths in group from selection (toggle each one)
+              for (const pathId of groupPathIds) {
+                store.toggleInSelection(pathId);
+              }
+            } else {
+              // Add all paths in group to selection
+              for (const pathId of groupPathIds) {
+                if (!selection.pathIds.includes(pathId)) {
+                  store.addToSelection(pathId);
+                }
+              }
+            }
+          } else {
+            // Replace selection with all paths in the group
+            if (groupPathIds.length > 0) {
+              store.setSelection({ pathIds: groupPathIds, points: [] });
+            }
+          }
         }
-        // Note: group selection would be added here when group selection is supported
 
         isDraggingTransformPoint = true;
         dragTransformPointItemId = transformPointHit.id;
@@ -1763,8 +2083,8 @@ export const Canvas = () => {
             pendingCyclePathsAtPoint = [];
             pendingCycleClickPoint = null;
           } else if (clickedPathId) {
-            // If clicked path is already in selection, preserve selection for multi-path drag
-            const clickedIsSelected = currentSelection.pathIds.includes(clickedPathId);
+            // If clicked path is already in selection (directly or via ancestor group), preserve selection
+            const clickedIsSelected = store.isEffectivelySelected(clickedPathId);
             if (!clickedIsSelected) {
               store.selectPath(clickedPathId);
             }
@@ -1783,8 +2103,20 @@ export const Canvas = () => {
                 isDraggingSelection = currentSelection.pathIds.length > 1;
 
                 dragCenter = getSelectionBoundingCenter(paths, currentSelection.pathIds);
+                // In animation mode, offset drag center by animated translation
+                if (activeClip && dragCenter && currentSelection.pathIds.length === 1) {
+                  const partId = currentSelection.pathIds[0];
+                  const partAnim = activeClip.parts[partId] ?? [];
+                  const animTx = getPropertyValue(partAnim, "tx", playbackTime);
+                  const animTy = getPropertyValue(partAnim, "ty", playbackTime);
+                  dragCenter = { x: dragCenter.x + animTx, y: dragCenter.y + animTy };
+                }
                 startAngle = Math.atan2(clickPoint.y - dragCenter.y, clickPoint.x - dragCenter.x);
                 startDistance = distance(clickPoint, dragCenter);
+                // Alt-drag for rotation/scale should start immediately (no threshold)
+                dragThresholdMet = true;
+                dragStartTime = Date.now();
+                dragStartScreen = { x: e.clientX, y: e.clientY };
                 e.preventDefault();
                 return;
               }
@@ -1807,7 +2139,12 @@ export const Canvas = () => {
             isDraggingHandle = false;
             dragPointIndex = -1;
             dragStart = clickPoint;
-            dragPathId = clickedPathId;
+
+            // Check if the clicked path is selected via an ancestor group
+            // If so, we drag the group (not the individual path)
+            const selectedAncestorGroupId = store.getSelectedAncestorGroupId(clickedPathId);
+            const effectiveDragId = selectedAncestorGroupId ?? clickedPathId;
+            dragPathId = effectiveDragId;
 
             // Check if we're dragging a multi-selection
             const currentSelection = store.getState().selection;
@@ -1825,7 +2162,7 @@ export const Canvas = () => {
                 }
                 dragPrevAnimation = null;
               } else {
-                dragPrevAnimation = activeClip.parts[clickedPathId] ? [...activeClip.parts[clickedPathId]] : [];
+                dragPrevAnimation = activeClip.parts[effectiveDragId] ? [...activeClip.parts[effectiveDragId]] : [];
                 dragPrevAnimations = null;
               }
             } else {
@@ -1841,6 +2178,14 @@ export const Canvas = () => {
               dragCenter = getPathTransformPoint(clickedPath);
             }
 
+            // In animation mode, offset drag center by animated translation
+            if (activeClip && dragCenter) {
+              const partAnim = activeClip.parts[effectiveDragId] ?? [];
+              const animTx = getPropertyValue(partAnim, "tx", playbackTime);
+              const animTy = getPropertyValue(partAnim, "ty", playbackTime);
+              dragCenter = { x: dragCenter.x + animTx, y: dragCenter.y + animTy };
+            }
+
             if (dragStart && dragCenter) {
               startAngle = Math.atan2(
                 dragStart.y - dragCenter.y,
@@ -1854,6 +2199,10 @@ export const Canvas = () => {
             totalScale = 1;
             isRotating = false;
             isScaling = false;
+            // Initialize drag threshold state for path dragging (not point/handle)
+            dragThresholdMet = false;
+            dragStartTime = Date.now();
+            dragStartScreen = { x: e.clientX, y: e.clientY };
             e.preventDefault();
           }
         }
@@ -1912,6 +2261,43 @@ export const Canvas = () => {
           // Capture original control point position for snapping
           const seg = selectedPath.segments[handle.segmentIndex];
           dragHandleOriginalPos = handle.handleType === "c0" ? { ...seg.c0 } : { ...seg.c1 };
+
+          // Capture mirrored handle position for undo tracking
+          dragMirrorHandleOriginalPos = null;
+          dragMirrorSegmentIndex = -1;
+          dragMirrorHandleType = "anchor";
+
+          // Calculate mirrored handle info if mirroring is enabled
+          let mirrorAnchorIndex: number;
+          if (handle.handleType === "c0") {
+            mirrorAnchorIndex = handle.segmentIndex;
+            dragMirrorSegmentIndex = handle.segmentIndex === 0
+              ? (selectedPath.closed ? selectedPath.segments.length - 1 : -1)
+              : handle.segmentIndex - 1;
+            dragMirrorHandleType = "c1";
+          } else {
+            const nextIdx = selectedPath.closed
+              ? (handle.segmentIndex + 1) % selectedPath.segments.length
+              : handle.segmentIndex + 1;
+            mirrorAnchorIndex = nextIdx;
+            dragMirrorSegmentIndex = (selectedPath.closed || handle.segmentIndex < selectedPath.segments.length - 1) ? nextIdx : -1;
+            dragMirrorHandleType = "c0";
+          }
+
+          if (dragMirrorSegmentIndex >= 0) {
+            const anchorMeta = selectedPath.anchorMeta?.[mirrorAnchorIndex];
+            const mirrorAngle = anchorMeta?.mirrorAngle || false;
+            const mirrorDistance = anchorMeta?.mirrorDistance || false;
+            const mirroredActive = dragMirrorHandleType === "c0"
+              ? selectedPath.anchorMeta?.[mirrorAnchorIndex]?.rightActive !== false
+              : selectedPath.anchorMeta?.[mirrorAnchorIndex]?.leftActive !== false;
+
+            if ((mirrorAngle || mirrorDistance) && mirroredActive) {
+              const mirrorSeg = selectedPath.segments[dragMirrorSegmentIndex];
+              dragMirrorHandleOriginalPos = dragMirrorHandleType === "c0" ? { ...mirrorSeg.c0 } : { ...mirrorSeg.c1 };
+            }
+          }
+
           dragStart = clickPoint;
           dragInitialStart = clickPoint; // Track initial position for absolute snapping
           dragPathId = pathId;
@@ -2029,6 +2415,43 @@ export const Canvas = () => {
             // Capture original control point position for snapping
             const seg = path.segments[handle.segmentIndex];
             dragHandleOriginalPos = handle.handleType === "c0" ? { ...seg.c0 } : { ...seg.c1 };
+
+            // Capture mirrored handle position for undo tracking
+            dragMirrorHandleOriginalPos = null;
+            dragMirrorSegmentIndex = -1;
+            dragMirrorHandleType = "anchor";
+
+            // Calculate mirrored handle info if mirroring is enabled
+            let mirrorAnchorIdx: number;
+            if (handle.handleType === "c0") {
+              mirrorAnchorIdx = handle.segmentIndex;
+              dragMirrorSegmentIndex = handle.segmentIndex === 0
+                ? (path.closed ? path.segments.length - 1 : -1)
+                : handle.segmentIndex - 1;
+              dragMirrorHandleType = "c1";
+            } else {
+              const nextIdx = path.closed
+                ? (handle.segmentIndex + 1) % path.segments.length
+                : handle.segmentIndex + 1;
+              mirrorAnchorIdx = nextIdx;
+              dragMirrorSegmentIndex = (path.closed || handle.segmentIndex < path.segments.length - 1) ? nextIdx : -1;
+              dragMirrorHandleType = "c0";
+            }
+
+            if (dragMirrorSegmentIndex >= 0) {
+              const anchorMeta = path.anchorMeta?.[mirrorAnchorIdx];
+              const mirrorAngle = anchorMeta?.mirrorAngle || false;
+              const mirrorDistance = anchorMeta?.mirrorDistance || false;
+              const mirroredActive = dragMirrorHandleType === "c0"
+                ? path.anchorMeta?.[mirrorAnchorIdx]?.rightActive !== false
+                : path.anchorMeta?.[mirrorAnchorIdx]?.leftActive !== false;
+
+              if ((mirrorAngle || mirrorDistance) && mirroredActive) {
+                const mirrorSeg = path.segments[dragMirrorSegmentIndex];
+                dragMirrorHandleOriginalPos = dragMirrorHandleType === "c0" ? { ...mirrorSeg.c0 } : { ...mirrorSeg.c1 };
+              }
+            }
+
             dragStart = clickPoint;
             dragInitialStart = clickPoint; // Track initial position for absolute snapping
             dragPathId = path.id;
@@ -2206,8 +2629,8 @@ export const Canvas = () => {
         pendingCyclePathsAtPoint = [];
         pendingCycleClickPoint = null;
       } else if (clickedPathId) {
-        // If clicked path is already in selection, preserve selection for multi-path drag
-        const clickedIsSelected = currentSelection.pathIds.includes(clickedPathId);
+        // If clicked path is already in selection (directly or via ancestor group), preserve selection
+        const clickedIsSelected = store.isEffectivelySelected(clickedPathId);
         if (!clickedIsSelected) {
           store.selectPath(clickedPathId);
         }
@@ -2229,8 +2652,20 @@ export const Canvas = () => {
 
             // Calculate center for rotation/scaling using bounding box center
             dragCenter = getSelectionBoundingCenter(paths, currentSelection.pathIds);
+            // In animation mode, offset drag center by animated translation
+            if (activeClip && dragCenter && currentSelection.pathIds.length === 1) {
+              const partId = currentSelection.pathIds[0];
+              const partAnim = activeClip.parts[partId] ?? [];
+              const animTx = getPropertyValue(partAnim, "tx", playbackTime);
+              const animTy = getPropertyValue(partAnim, "ty", playbackTime);
+              dragCenter = { x: dragCenter.x + animTx, y: dragCenter.y + animTy };
+            }
             startAngle = Math.atan2(clickPoint.y - dragCenter.y, clickPoint.x - dragCenter.x);
             startDistance = distance(clickPoint, dragCenter);
+            // Alt-drag for rotation/scale should start immediately (no threshold)
+            dragThresholdMet = true;
+            dragStartTime = Date.now();
+            dragStartScreen = { x: e.clientX, y: e.clientY };
             e.preventDefault();
             return;
           }
@@ -2254,7 +2689,12 @@ export const Canvas = () => {
         isDraggingHandle = false;
         dragPointIndex = -1;
         dragStart = clickPoint;
-        dragPathId = clickedPathId;
+
+        // Check if the clicked path is selected via an ancestor group
+        // If so, we drag the group (not the individual path)
+        const selectedAncestorGroupId = store.getSelectedAncestorGroupId(clickedPathId);
+        const effectiveDragId = selectedAncestorGroupId ?? clickedPathId;
+        dragPathId = effectiveDragId;
 
         // Check if we're dragging a multi-selection
         const currentSelection = store.getState().selection;
@@ -2273,7 +2713,7 @@ export const Canvas = () => {
             }
             dragPrevAnimation = null;
           } else {
-            dragPrevAnimation = activeClip.parts[clickedPathId] ? [...activeClip.parts[clickedPathId]] : [];
+            dragPrevAnimation = activeClip.parts[effectiveDragId] ? [...activeClip.parts[effectiveDragId]] : [];
             dragPrevAnimations = null;
           }
         } else {
@@ -2289,6 +2729,14 @@ export const Canvas = () => {
           dragCenter = getPathTransformPoint(clickedPath);
         }
 
+        // In animation mode, offset drag center by animated translation
+        if (activeClip && dragCenter) {
+          const partAnim = activeClip.parts[effectiveDragId] ?? [];
+          const animTx = getPropertyValue(partAnim, "tx", playbackTime);
+          const animTy = getPropertyValue(partAnim, "ty", playbackTime);
+          dragCenter = { x: dragCenter.x + animTx, y: dragCenter.y + animTy };
+        }
+
         if (dragStart && dragCenter) {
           startAngle = Math.atan2(
             dragStart.y - dragCenter.y,
@@ -2302,6 +2750,10 @@ export const Canvas = () => {
         totalScale = 1;
         isRotating = false;
         isScaling = false;
+        // Initialize drag threshold state for path dragging (not point/handle)
+        dragThresholdMet = false;
+        dragStartTime = Date.now();
+        dragStartScreen = { x: e.clientX, y: e.clientY };
         e.preventDefault();
       }
     };
@@ -2536,6 +2988,23 @@ export const Canvas = () => {
         // Switching from rotation/scale back to translation
         isRotating = false;
         isScaling = false;
+
+        // For path translation (not point/handle), check drag threshold
+        // This prevents accidental movement when clicking to select
+        if (!isDraggingPoint && !isDraggingHandle && !dragThresholdMet && dragStartScreen) {
+          const screenDx = e.clientX - dragStartScreen.x;
+          const screenDy = e.clientY - dragStartScreen.y;
+          const screenDist = Math.sqrt(screenDx * screenDx + screenDy * screenDy);
+          const timeSinceStart = Date.now() - dragStartTime;
+
+          if (screenDist >= MIN_DRAG_DISTANCE || timeSinceStart >= MIN_DRAG_TIME_MS) {
+            dragThresholdMet = true;
+          } else {
+            // Threshold not met yet - don't translate, just update dragStart
+            dragStart = point;
+            return;
+          }
+        }
 
         // Translate
         const dx = point.x - dragStart.x;
@@ -2788,7 +3257,28 @@ export const Canvas = () => {
                 { pathId: snappedToTarget.pathId, segmentIndex: snappedToTarget.segmentIndex, handleType: snappedToTarget.handleType },
               ]
             } : undefined;
-            store.commitMoveHandle(dragPathId, dragSegmentIndex, dragHandleType, totalDx, totalDy, snapConn);
+
+            // Calculate mirror movement for proper undo
+            let mirrorMove: { segmentIndex: number; handleType: HandleType; dx: number; dy: number } | undefined;
+            if (dragMirrorHandleOriginalPos && dragMirrorSegmentIndex >= 0) {
+              const currentPath = store.getState().paths.find((p) => p.id === dragPathId);
+              if (currentPath && dragMirrorSegmentIndex < currentPath.segments.length) {
+                const mirrorSeg = currentPath.segments[dragMirrorSegmentIndex];
+                const mirrorCurrentPos = dragMirrorHandleType === "c0" ? mirrorSeg.c0 : mirrorSeg.c1;
+                const mirrorDx = mirrorCurrentPos.x - dragMirrorHandleOriginalPos.x;
+                const mirrorDy = mirrorCurrentPos.y - dragMirrorHandleOriginalPos.y;
+                if (mirrorDx !== 0 || mirrorDy !== 0) {
+                  mirrorMove = {
+                    segmentIndex: dragMirrorSegmentIndex,
+                    handleType: dragMirrorHandleType,
+                    dx: mirrorDx,
+                    dy: mirrorDy,
+                  };
+                }
+              }
+            }
+
+            store.commitMoveHandle(dragPathId, dragSegmentIndex, dragHandleType, totalDx, totalDy, snapConn, mirrorMove);
           }
         } else if (isDraggingPoint && (totalDx !== 0 || totalDy !== 0)) {
           // Point dragging is blocked in animation mode, but just in case...
@@ -2887,6 +3377,10 @@ export const Canvas = () => {
       isRotating = false;
       isScaling = false;
       snappedToTarget = null;
+      // Reset drag threshold state
+      dragThresholdMet = false;
+      dragStartTime = 0;
+      dragStartScreen = null;
       // Reset cycle state
       pendingCyclePathsAtPoint = [];
       pendingCycleClickPoint = null;
@@ -3300,13 +3794,15 @@ export const Canvas = () => {
       }
       // Delete to delete selection (or keyframe when editing a clip)
       if (isDelete(e)) {
-        const { currentPath, selection, currentClipId, selectedKeyframe } = store.getState();
+        const { currentPath, selection, currentClipId, selectedKeyframes } = store.getState();
 
-        // When editing a clip, delete the selected keyframe instead of paths
+        // When editing a clip, delete all selected keyframes instead of paths
         if (currentClipId) {
-          if (selectedKeyframe) {
+          if (selectedKeyframes.length > 0) {
             e.preventDefault();
-            store.deleteKeyframe(currentClipId, selectedKeyframe.pathId, selectedKeyframe.time);
+            for (const kf of selectedKeyframes) {
+              store.deleteKeyframe(currentClipId, kf.pathId, kf.time);
+            }
             store.clearKeyframeSelection();
           }
           return; // Don't delete paths when editing a clip

@@ -350,12 +350,11 @@ export function exportBinary(
     w.writeF32(clip.duration);
     w.writeU8(clip.fps);
 
-    // Count non-empty parts
-    const nonEmptyParts = Object.entries(clip.parts).filter(([_, kfs]) => kfs.length > 0);
-    w.writeU16(nonEmptyParts.length);
+    // Count non-empty parts that have valid indices
+    const validParts: { idx: number; keyframes: typeof clip.parts[string] }[] = [];
+    for (const [partId, keyframes] of Object.entries(clip.parts)) {
+      if (keyframes.length === 0) continue;
 
-    for (const [partId, keyframes] of nonEmptyParts) {
-      // Get index
       let idx = pathIdToIdx.get(partId);
       if (idx === undefined) {
         const groupIdx = usedGroupIdToIdx.get(partId);
@@ -365,6 +364,12 @@ export function exportBinary(
       }
       if (idx === undefined) continue;
 
+      validParts.push({ idx, keyframes });
+    }
+
+    w.writeU16(validParts.length);
+
+    for (const { idx, keyframes } of validParts) {
       w.writeI16(idx);
       w.writeU16(keyframes.length);
 
@@ -372,11 +377,11 @@ export function exportBinary(
         w.writeF16(kf.t);
 
         let flags = 0;
-        if (kf.tx !== undefined && kf.tx !== 0) flags |= 1;
-        if (kf.ty !== undefined && kf.ty !== 0) flags |= 2;
-        if (kf.rot !== undefined && kf.rot !== 0) flags |= 4;
-        if (kf.scale !== undefined && kf.scale !== 1) flags |= 8;
-        if (kf.opacity !== undefined && kf.opacity !== 1) flags |= 16;
+        if (kf.tx !== undefined) flags |= 1;
+        if (kf.ty !== undefined) flags |= 2;
+        if (kf.rot !== undefined) flags |= 4;
+        if (kf.scale !== undefined) flags |= 8;
+        if (kf.opacity !== undefined) flags |= 16;
 
         w.writeU8(flags);
 

@@ -53,6 +53,24 @@ export type Group = {
   transformPoint: Point | null;
 };
 
+// Raster image (not exported in binary, stored in IndexedDB)
+export type Raster = {
+  id: string;
+  name: string;
+  parentId: string | null; // For group hierarchy
+  imageId: string; // Reference to blob in IndexedDB
+  x: number; // Position (center)
+  y: number;
+  width: number; // Natural image width
+  height: number; // Natural image height
+  opacity: number; // 0-1
+  visible: boolean;
+  locked: boolean;
+  transform: PathTransform; // translate, rotate, scale
+  transformPoint: Point | null; // Custom rotation/scale center
+  renderOrder: "front" | "back"; // Render in front of or behind paths
+};
+
 export type Tool = "select" | "line" | "blob";
 
 export type HandleType = "anchor" | "c0" | "c1";
