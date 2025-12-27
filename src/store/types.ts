@@ -34,6 +34,7 @@ export type Command =
   | { type: "translatePath"; id: string; dx: number; dy: number; skipSnap?: boolean }
   | { type: "rotatePath"; id: string; angle: number; center: Point }
   | { type: "scalePath"; id: string; scale: number; center: Point }
+  | { type: "scalePathNonUniform"; id: string; scaleX: number; scaleY: number; center: Point }
   | { type: "movePoint"; id: string; pointIndex: number; dx: number; dy: number }
   | { type: "moveHandle"; id: string; segmentIndex: number; handleType: HandleType; dx: number; dy: number; mirrorMove?: { segmentIndex: number; handleType: HandleType; dx: number; dy: number } }
   | { type: "setAnchorMeta"; id: string; anchorIndex: number; prevMeta: AnchorMeta; newMeta: AnchorMeta }
@@ -92,6 +93,7 @@ export type Command =
 export type ClipboardContent = {
   type: "paths";
   paths: Path[];
+  groups: Group[]; // Groups to preserve hierarchy
   sourceIds: string[]; // Original path IDs (for inserting after source)
   sourceNames: string[]; // Original path names (for naming copies)
 } | {
@@ -164,6 +166,7 @@ export type EditorState = {
   showAllPoints: boolean;
   showAllControlPoints: boolean;
   showTransformPoints: boolean;
+  showGrid: boolean;
   undoStack: Command[];
   redoStack: Command[];
   // Status bar info

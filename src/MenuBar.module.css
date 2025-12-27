@@ -231,3 +231,29 @@
 .deleteDocButton:hover {
   color: #ff6666;
 }
+
+/* Drop overlay for drag-and-drop */
+.dropOverlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(68, 136, 255, 0.2);
+  border: 3px dashed #4488ff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+  pointer-events: none;
+}
+
+.dropMessage {
+  background: #2a2a2a;
+  color: #fff;
+  padding: 24px 48px;
+  border-radius: 8px;
+  font-size: 18px;
+  font-weight: 500;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}

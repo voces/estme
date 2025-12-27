@@ -294,6 +294,26 @@ function InstancePropertiesSection() {
   );
 }
 
+// Scene properties section (editor settings like grid visibility)
+function ScenePropertiesSection() {
+  const showGrid = useStore((s) => s.showGrid);
+
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionTitle}>Scene Properties</div>
+      <div className={styles.checkboxRow}>
+        <input
+          type="checkbox"
+          id="showGrid"
+          checked={showGrid}
+          onChange={(e) => store.setShowGrid(e.target.checked)}
+        />
+        <label htmlFor="showGrid">Show Grid</label>
+      </div>
+    </div>
+  );
+}
+
 export const Properties = () => {
   const selection = useStore((s) => s.selection);
   const paths = useStore((s) => s.paths);
@@ -363,6 +383,7 @@ export const Properties = () => {
   if (!hasSelection) {
     return (
       <div className={styles.properties}>
+        <ScenePropertiesSection />
         <InstancePropertiesSection />
       </div>
     );

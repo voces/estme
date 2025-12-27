@@ -242,6 +242,9 @@ export function getEffectiveTransform(
   let combinedScale = 1;
   let combinedOpacity = 1;
 
+  // Track if any ancestor has set opacity via keyframes
+  let anyAncestorHasOpacityKeyframes = false;
+
   // Apply ancestor transforms in order (root to immediate parent)
   for (const ancestor of ancestorChain) {
     const ancestorAnim = clip.parts[ancestor.id];
@@ -251,7 +254,14 @@ export function getEffectiveTransform(
       const aTy = getPropertyValue(ancestorAnim, "ty", t);
       const aRot = getPropertyValue(ancestorAnim, "rot", t);
       const aScale = getPropertyValue(ancestorAnim, "scale", t);
-      const aOpacity = getPropertyValue(ancestorAnim, "opacity", t);
+      // For opacity: use animated value if keyframes exist, otherwise 1 (inherit from further up)
+      const hasAncestorOpacityKeyframes = ancestorAnim.some((kf) => kf.opacity !== undefined);
+      if (hasAncestorOpacityKeyframes) {
+        anyAncestorHasOpacityKeyframes = true;
+      }
+      const aOpacity = hasAncestorOpacityKeyframes
+        ? getPropertyValue(ancestorAnim, "opacity", t)
+        : 1;
 
       // Get the ancestor's transform point for rotation pivot
       // Note: For groups, we'd need all paths/groups to compute dynamic center
@@ -283,7 +293,14 @@ export function getEffectiveTransform(
   const pathTy = getPropertyValue(partAnim, "ty", t);
   const pathRot = getPropertyValue(partAnim, "rot", t);
   const pathScale = getPropertyValue(partAnim, "scale", t);
-  const pathOpacity = getPropertyValue(partAnim, "opacity", t);
+  // For opacity:
+  // - If path has opacity keyframes, use animated value (first keyframe as initial)
+  // - If no keyframes but ancestor has opacity keyframes, use 1 (fully controlled by ancestor)
+  // - If no one in the chain has opacity keyframes, use base path opacity
+  const hasOpacityKeyframes = partAnim?.some((kf) => kf.opacity !== undefined) ?? false;
+  const pathOpacity = hasOpacityKeyframes
+    ? getPropertyValue(partAnim, "opacity", t)
+    : (anyAncestorHasOpacityKeyframes ? 1 : path.opacity);
 
   // Get the path's transform point for rotation pivot
   const pathPivot = getPathTransformPoint(path);

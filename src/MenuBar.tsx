@@ -3,7 +3,66 @@ import { store, useStore } from "./store/index.ts";
 import { saveDocument, loadDocument, loadDocumentById, listDocuments, deleteDocument, generateId, getCurrentDocumentId, setCurrentDocumentId, StoredDocument, saveAutosave, loadAutosave, clearAutosave } from "./storage.ts";
 import { importSvg } from "./svgImport.ts";
 import { exportBinary } from "./exportBinary.ts";
+import { importBinary } from "./importBinary.ts";
 import styles from "./MenuBar.module.css";
+
+// Helper to load a file (used by both file input and drag-drop)
+async function loadFile(file: File): Promise<void> {
+  const fileName = file.name.toLowerCase();
+
+  // Handle binary .estb files
+  if (fileName.endsWith(".estb")) {
+    const buffer = await file.arrayBuffer();
+    const state = store.getState();
+    const { paths, groups, animationClips, pathCounter, groupCounter } = importBinary(
+      buffer,
+      state.pathCounter,
+      state.groupCounter
+    );
+    const docName = file.name.replace(/\.estb$/i, "");
+    store.loadDocument({
+      name: docName,
+      paths,
+      groups,
+      snapConnections: [],
+      animationClips,
+      pathCounter,
+      groupCounter,
+    }, null);
+    return;
+  }
+
+  // For text-based formats
+  const text = await file.text();
+
+  // Handle SVG files
+  if (fileName.endsWith(".svg") || text.trimStart().startsWith("<")) {
+    const state = store.getState();
+    const { paths, groups, snapConnections, newPathCounter, newGroupCounter } = importSvg(
+      text,
+      state.pathCounter,
+      state.groupCounter
+    );
+    if (paths.length === 0) {
+      throw new Error("No paths found in SVG file");
+    }
+    const docName = file.name.replace(/\.svg$/i, "");
+    store.loadDocument({
+      name: docName,
+      paths,
+      groups,
+      snapConnections,
+      animationClips: [],
+      pathCounter: newPathCounter,
+      groupCounter: newGroupCounter,
+    }, null);
+    return;
+  }
+
+  // Handle JSON/.estme files
+  const data = JSON.parse(text);
+  store.loadDocument(data, null);
+}
 
 export const MenuBar = () => {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
@@ -108,6 +167,106 @@ export const MenuBar = () => {
     document.title = `${prefix}${documentName} - estme`;
   }, [documentName, isDirty]);
 
+  // Global drag-and-drop for files
+  const [isDragging, setIsDragging] = useState(false);
+  useEffect(() => {
+    let dragCounter = 0;
+
+    const handleDragEnter = (e: DragEvent) => {
+      e.preventDefault();
+      dragCounter++;
+      if (e.dataTransfer?.types.includes("Files")) {
+        setIsDragging(true);
+      }
+    };
+
+    const handleDragLeave = (e: DragEvent) => {
+      e.preventDefault();
+      dragCounter--;
+      if (dragCounter === 0) {
+        setIsDragging(false);
+      }
+    };
+
+    const handleDragOver = (e: DragEvent) => {
+      e.preventDefault();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = "copy";
+      }
+    };
+
+    const handleDrop = async (e: DragEvent) => {
+      e.preventDefault();
+      dragCounter = 0;
+      setIsDragging(false);
+
+      const file = e.dataTransfer?.files[0];
+      if (!file) return;
+
+      // Check file extension
+      const fileName = file.name.toLowerCase();
+      const validExtensions = [".estme", ".estb", ".json", ".svg"];
+      if (!validExtensions.some((ext) => fileName.endsWith(ext))) {
+        alert("Unsupported file type. Please drop .estme, .estb, .json, or .svg files.");
+        return;
+      }
+
+      try {
+        // For SVG files, add paths to the existing document instead of replacing
+        if (fileName.endsWith(".svg")) {
+          const text = await file.text();
+          const state = store.getState();
+          const { paths, groups } = importSvg(
+            text,
+            state.pathCounter,
+            state.groupCounter
+          );
+          if (paths.length === 0) {
+            throw new Error("No paths found in SVG file");
+          }
+          // Convert paths to the format expected by _pasteEstmePaths
+          const pathsData = paths.map((p) => ({
+            name: p.name,
+            parentId: p.parentId,
+            segments: p.segments,
+            anchorMeta: p.anchorMeta,
+            closed: p.closed,
+            fill: p.fill,
+            opacity: p.opacity,
+            playerMask: p.playerMask,
+            transform: p.transform,
+            transformPoint: p.transformPoint,
+          }));
+          const groupsData = groups.map((g) => ({
+            id: g.id,
+            name: g.name,
+            parentId: g.parentId,
+            collapsed: g.collapsed,
+            transformPoint: g.transformPoint,
+          }));
+          store._pasteEstmePaths(pathsData, groupsData);
+        } else {
+          // For other file types, replace the document
+          await loadFile(file);
+        }
+      } catch (err) {
+        alert("Failed to open file: " + (err instanceof Error ? err.message : "Unknown error"));
+      }
+    };
+
+    window.addEventListener("dragenter", handleDragEnter);
+    window.addEventListener("dragleave", handleDragLeave);
+    window.addEventListener("dragover", handleDragOver);
+    window.addEventListener("drop", handleDrop);
+
+    return () => {
+      window.removeEventListener("dragenter", handleDragEnter);
+      window.removeEventListener("dragleave", handleDragLeave);
+      window.removeEventListener("dragover", handleDragOver);
+      window.removeEventListener("drop", handleDrop);
+    };
+  }, []);
+
   // Autosave when dirty (debounced, triggered on any store change)
   useEffect(() => {
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -191,39 +350,13 @@ export const MenuBar = () => {
   const handleLoadFromFile = () => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = ".estme,.json,.svg";
+    input.accept = ".estme,.estb,.json,.svg";
     input.onchange = async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0];
       if (!file) return;
 
       try {
-        const text = await file.text();
-
-        // Check if it's an SVG file
-        if (file.name.toLowerCase().endsWith(".svg") || text.trimStart().startsWith("<")) {
-          // Import SVG
-          const state = store.getState();
-          const { paths, groups, snapConnections, newPathCounter, newGroupCounter } = importSvg(text, state.pathCounter, state.groupCounter);
-          if (paths.length === 0) {
-            alert("No paths found in SVG file");
-            return;
-          }
-          // Create a new document with the imported paths
-          const docName = file.name.replace(/\.svg$/i, "");
-          store.loadDocument({
-            name: docName,
-            paths,
-            groups,
-            snapConnections,
-            animationClips: [],
-            pathCounter: newPathCounter,
-            groupCounter: newGroupCounter,
-          }, null);
-        } else {
-          // Load as estme/JSON format
-          const data = JSON.parse(text);
-          store.loadDocument(data, null);
-        }
+        await loadFile(file);
       } catch (err) {
         alert("Failed to open file: " + (err instanceof Error ? err.message : "Unknown error"));
       }
@@ -437,6 +570,29 @@ export const MenuBar = () => {
           )}
         </div>
 
+        <div
+          className={`${styles.menuItem} ${openMenu === "edit" ? styles.open : ""}`}
+          onClick={() => toggleMenu("edit")}
+        >
+          Edit
+          {openMenu === "edit" && (
+            <div className={styles.dropdown}>
+              <div
+                className={styles.dropdownItem}
+                onClick={() => { store.flipSelectionHorizontal(); setOpenMenu(null); }}
+              >
+                <span>Flip Horizontal</span>
+              </div>
+              <div
+                className={styles.dropdownItem}
+                onClick={() => { store.flipSelectionVertical(); setOpenMenu(null); }}
+              >
+                <span>Flip Vertical</span>
+              </div>
+            </div>
+          )}
+        </div>
+
         <div className={styles.documentName}>
           {isEditingName ? (
             <input
@@ -491,6 +647,12 @@ export const MenuBar = () => {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {isDragging && (
+        <div className={styles.dropOverlay}>
+          <div className={styles.dropMessage}>Drop file to import</div>
         </div>
       )}
     </>

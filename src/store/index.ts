@@ -1,7 +1,7 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
 import { booleanOperation, canBooleanOp, uniteMultiplePaths } from "../pathBool.ts";
-import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, getPathTransformPoint, getSelectionTransformPoint, getPathBounds, getAnimatedPathBounds } from "../geometry.ts";
+import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, scalePointAroundNonUniform, getPathTransformPoint, getSelectionTransformPoint, getPathBounds, getAnimatedPathBounds } from "../geometry.ts";
 import { applyCommand } from "./commands.ts";
 import { generateId, saveImage, setCurrentDocumentId } from "../storage.ts";
 import {
@@ -45,6 +45,16 @@ const loadShowTransformPoints = (): boolean => {
     return saved === "true";
   } catch {
     return false;
+  }
+};
+
+const loadShowGrid = (): boolean => {
+  try {
+    const saved = localStorage.getItem("estme:showGrid");
+    // Default to true if not set
+    return saved !== "false";
+  } catch {
+    return true;
   }
 };
 
@@ -184,6 +194,7 @@ const initialState: EditorState = {
   showAllPoints: loadShowAllPoints(),
   showAllControlPoints: loadShowAllControlPoints(),
   showTransformPoints: loadShowTransformPoints(),
+  showGrid: loadShowGrid(),
   undoStack: [],
   redoStack: [],
   mousePosition: null,
@@ -327,6 +338,15 @@ export const store = {
     state = { ...state, showTransformPoints: newValue };
     try {
       localStorage.setItem("estme:showTransformPoints", String(newValue));
+    } catch {
+      // Ignore localStorage errors
+    }
+    notify();
+  },
+  setShowGrid: (showGrid: boolean) => {
+    state = { ...state, showGrid };
+    try {
+      localStorage.setItem("estme:showGrid", String(showGrid));
     } catch {
       // Ignore localStorage errors
     }
@@ -546,14 +566,20 @@ export const store = {
       return cmds;
     };
 
-    // Delete all fully selected paths (skip locked paths)
-    for (const pathId of state.selection.pathIds) {
-      const path = state.paths.find((p) => p.id === pathId);
+    // Delete all fully selected paths and rasters (skip locked items)
+    for (const itemId of state.selection.pathIds) {
+      const path = state.paths.find((p) => p.id === itemId);
       if (path && !path.locked) {
         // Add snap connection cleanup commands
-        commands.push(...getConnectionCleanupCommands(pathId));
+        commands.push(...getConnectionCleanupCommands(itemId));
         // Add delete path command
         commands.push({ type: "deletePath", path });
+        continue;
+      }
+
+      const raster = state.rasters.find((r) => r.id === itemId);
+      if (raster && !raster.locked) {
+        commands.push({ type: "deleteRaster", raster });
       }
     }
 
@@ -1163,6 +1189,61 @@ export const store = {
 
     throttledNotify();
   },
+  // Scale entire selection non-uniformly around a center point (live, no undo)
+  scaleSelectionNonUniformLive: (scaleX: number, scaleY: number, center: Point) => {
+    const { selection } = state;
+
+    // Track all points being scaled
+    const scaledPoints: { pathId: string; segmentIndex: number }[] = [];
+
+    state = {
+      ...state,
+      paths: state.paths.map((p) => {
+        // If path is fully selected and not locked, scale all points
+        if (selection.pathIds.includes(p.id) && !p.locked) {
+          // Track all anchors as scaled
+          for (let i = 0; i < p.segments.length; i++) {
+            scaledPoints.push({ pathId: p.id, segmentIndex: i });
+          }
+          return {
+            ...p,
+            segments: p.segments.map((seg) => ({
+              p0: scalePointAroundNonUniform(seg.p0, center, scaleX, scaleY),
+              c0: scalePointAroundNonUniform(seg.c0, center, scaleX, scaleY),
+              c1: scalePointAroundNonUniform(seg.c1, center, scaleX, scaleY),
+              p1: scalePointAroundNonUniform(seg.p1, center, scaleX, scaleY),
+            })),
+          };
+        }
+        return p;
+      }),
+    };
+
+    // Move connected points that weren't already scaled
+    const scaledSet = new Set(scaledPoints.map((p) => `${p.pathId}:${p.segmentIndex}`));
+    for (const pt of scaledPoints) {
+      const connectedPoints = store.getConnectedPoints({ pathId: pt.pathId, segmentIndex: pt.segmentIndex, handleType: "anchor" });
+      for (const connPoint of connectedPoints) {
+        const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+        if (!scaledSet.has(key)) {
+          scaledSet.add(key);
+          // Get the current position of the connected point and scale it
+          const connPath = state.paths.find((p) => p.id === connPoint.pathId);
+          if (!connPath) continue;
+          const connOldPos = connPath.segments[connPoint.segmentIndex]?.p0;
+          if (!connOldPos) continue;
+
+          const newPos = scalePointAroundNonUniform(connOldPos, center, scaleX, scaleY);
+          const dx = newPos.x - connOldPos.x;
+          const dy = newPos.y - connOldPos.y;
+
+          store._movePointInternal(connPoint.pathId, connPoint.segmentIndex, dx, dy);
+        }
+      }
+    }
+
+    throttledNotify();
+  },
   // Commit scale to undo stack
   commitScale: (id: string, scale: number, center: Point) => {
     const cmd: Command = { type: "scalePath", id, scale, center };
@@ -1192,6 +1273,71 @@ export const store = {
       isDirty: true,
     };
     notify();
+  },
+  // Commit non-uniform scale for entire selection as a batch
+  commitScaleSelectionNonUniform: (scaleX: number, scaleY: number, center: Point) => {
+    const { selection, paths } = state;
+    const commands: Command[] = [];
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (path?.locked) continue; // Skip locked paths
+      commands.push({ type: "scalePathNonUniform", id: pathId, scaleX, scaleY, center });
+    }
+    if (commands.length === 0) return;
+    const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
+    state = {
+      ...state,
+      undoStack: [...state.undoStack, cmd],
+      redoStack: [],
+      isDirty: true,
+    };
+    notify();
+  },
+  // Flip selection horizontally (mirror around center X)
+  flipSelectionHorizontal: () => {
+    const { selection, paths } = state;
+    if (selection.pathIds.length === 0) return;
+
+    // Calculate selection bounds to find center
+    let minX = Infinity, maxX = -Infinity;
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue;
+      const bounds = getPathBounds(path);
+      minX = Math.min(minX, bounds.minX);
+      maxX = Math.max(maxX, bounds.maxX);
+    }
+    if (minX === Infinity) return;
+
+    const center: Point = { x: (minX + maxX) / 2, y: 0 };
+
+    // Apply the flip (scale -1 in X)
+    store.scaleSelectionNonUniformLive(-1, 1, center);
+    // Commit to undo stack
+    store.commitScaleSelectionNonUniform(-1, 1, center);
+  },
+  // Flip selection vertically (mirror around center Y)
+  flipSelectionVertical: () => {
+    const { selection, paths } = state;
+    if (selection.pathIds.length === 0) return;
+
+    // Calculate selection bounds to find center
+    let minY = Infinity, maxY = -Infinity;
+    for (const pathId of selection.pathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || path.locked) continue;
+      const bounds = getPathBounds(path);
+      minY = Math.min(minY, bounds.minY);
+      maxY = Math.max(maxY, bounds.maxY);
+    }
+    if (minY === Infinity) return;
+
+    const center: Point = { x: 0, y: (minY + maxY) / 2 };
+
+    // Apply the flip (scale -1 in Y)
+    store.scaleSelectionNonUniformLive(1, -1, center);
+    // Commit to undo stack
+    store.commitScaleSelectionNonUniform(1, -1, center);
   },
   // Align selected paths horizontally (move all transform points to same X as selection center)
   alignHorizontally: () => {
@@ -3430,27 +3576,47 @@ export const store = {
 
   // Clipboard operations
   copy: () => {
-    const { selection, paths } = state;
+    const { selection, paths, groups } = state;
 
-    // If full paths are selected, copy them
+    // If full paths are selected, copy them (including any selected groups)
     if (selection.pathIds.length > 0) {
-      // Sort by paths array order (not selection order) to preserve relative z-order
       const selectedSet = new Set(selection.pathIds);
-      const sourcePaths = paths.filter((p) => selectedSet.has(p.id));
 
+      // Separate selected paths from selected groups
+      const sourcePaths = paths.filter((p) => selectedSet.has(p.id));
+      const sourceGroups = groups.filter((g) => selectedSet.has(g.id));
+
+      // Create ID mapping for groups (old ID -> new ID)
+      const groupIdMap = new Map<string, string>();
+      for (const g of sourceGroups) {
+        groupIdMap.set(g.id, crypto.randomUUID());
+      }
+
+      // Copy groups with new IDs and remapped parent IDs
+      // Only keep parentId if the parent is also being copied
+      const copiedGroups = sourceGroups.map((g) => ({
+        ...g,
+        id: groupIdMap.get(g.id)!,
+        parentId: g.parentId && groupIdMap.has(g.parentId) ? groupIdMap.get(g.parentId)! : null,
+      }));
+
+      // Copy paths with new IDs and remapped parent IDs
+      // Only keep parentId if the parent group is also being copied
       const copiedPaths = sourcePaths.map((p) => ({
         ...p,
-        id: crypto.randomUUID(), // New ID for paste
+        id: crypto.randomUUID(),
+        parentId: p.parentId && groupIdMap.has(p.parentId) ? groupIdMap.get(p.parentId)! : null,
         segments: p.segments.map((seg) => ({ ...seg, p0: { ...seg.p0 }, c0: { ...seg.c0 }, c1: { ...seg.c1 }, p1: { ...seg.p1 } })),
         anchorMeta: p.anchorMeta.map((m) => ({ ...m })),
       }));
 
-      if (copiedPaths.length > 0) {
+      if (copiedPaths.length > 0 || copiedGroups.length > 0) {
         state = {
           ...state,
           clipboard: {
             type: "paths",
             paths: copiedPaths,
+            groups: copiedGroups,
             sourceIds: sourcePaths.map((p) => p.id),
             sourceNames: sourcePaths.map((p) => p.name),
           },
@@ -3494,23 +3660,23 @@ export const store = {
     store.deleteSelection();
   },
   paste: () => {
-    const { clipboard, paths } = state;
+    const { clipboard, paths, groups } = state;
     if (!clipboard) return;
 
     if (clipboard.type === "paths") {
-      // Generate names with " 2", " 3" suffixes based on existing paths with same base name
-      const getNextCopyName = (baseName: string): string => {
+      // Generate names with " 2", " 3" suffixes based on existing paths/groups with same base name
+      const getNextCopyName = (baseName: string, existingNames: string[]): string => {
         // Strip existing " N" suffix to get the true base name
         const baseMatch = baseName.match(/^(.+?) (\d+)$/);
         const trueName = baseMatch ? baseMatch[1] : baseName;
 
-        // Find all existing paths with this base name or base name + number
+        // Find all existing items with this base name or base name + number
         const existingNumbers: number[] = [1]; // The original counts as "1"
-        for (const p of paths) {
-          if (p.name === trueName) {
+        for (const name of existingNames) {
+          if (name === trueName) {
             existingNumbers.push(1);
           } else {
-            const match = p.name.match(/^(.+?) (\d+)$/);
+            const match = name.match(/^(.+?) (\d+)$/);
             if (match && match[1] === trueName) {
               existingNumbers.push(parseInt(match[2], 10));
             }
@@ -3522,23 +3688,40 @@ export const store = {
         return `${trueName} ${maxNum + 1}`;
       };
 
-      // Determine parent for pasted paths: use source path's parent if it still exists
-      const getSourceParent = (index: number): string | null => {
-        const sourceId = clipboard.sourceIds[index];
-        const sourcePath = paths.find((p) => p.id === sourceId);
-        if (sourcePath) {
-          return sourcePath.parentId;
+      const allPathNames = paths.map((p) => p.name);
+      const allGroupNames = groups.map((g) => g.name);
+
+      // First, create new IDs for groups and build mapping from old ID to new ID
+      const groupIdMap = new Map<string, string>();
+      for (const g of clipboard.groups) {
+        groupIdMap.set(g.id, crypto.randomUUID());
+      }
+
+      // Create pasted groups with new IDs and remapped parentIds
+      const pastedGroups = clipboard.groups.map((g) => ({
+        ...g,
+        id: groupIdMap.get(g.id)!,
+        name: getNextCopyName(g.name, allGroupNames),
+        // Remap parentId to new group ID, or null if parent isn't in clipboard
+        parentId: g.parentId && groupIdMap.has(g.parentId) ? groupIdMap.get(g.parentId)! : null,
+      }));
+
+      // Helper to get parent for a pasted path
+      const getParentForPath = (clipboardPath: Path): string | null => {
+        // If the path had a parent in the clipboard, use the remapped group ID
+        if (clipboardPath.parentId && groupIdMap.has(clipboardPath.parentId)) {
+          return groupIdMap.get(clipboardPath.parentId)!;
         }
-        // Fallback: use the parentId from the copied path data
-        return clipboard.paths[index].parentId;
+        // Otherwise, no parent (pasted at root level)
+        return null;
       };
 
-      // Create pasted paths with proper names and parent
+      // Create pasted paths with new IDs and remapped parentIds
       const pastedPaths = clipboard.paths.map((p, i) => ({
         ...p,
         id: crypto.randomUUID(),
-        name: getNextCopyName(clipboard.sourceNames[i] || p.name),
-        parentId: getSourceParent(i),
+        name: getNextCopyName(clipboard.sourceNames[i] || p.name, allPathNames),
+        parentId: getParentForPath(p),
         segments: p.segments.map((seg) => ({
           p0: { ...seg.p0 },
           c0: { ...seg.c0 },
@@ -3569,8 +3752,19 @@ export const store = {
         ...paths.slice(insertPos).map((p) => p.id),
       ];
 
-      // Create a single batch command: add paths + reorder (if needed)
-      const addCommands: Command[] = pastedPaths.map((path) => ({ type: "addPath" as const, path }));
+      // Create a single batch command: add groups first, then add paths + reorder (if needed)
+      const addCommands: Command[] = [];
+
+      // Add groups first (so paths can reference them)
+      for (const group of pastedGroups) {
+        addCommands.push({ type: "addGroup" as const, group });
+      }
+
+      // Then add paths
+      for (const path of pastedPaths) {
+        addCommands.push({ type: "addPath" as const, path });
+      }
+
       // Need to reorder if inserting anywhere other than the end
       const needsReorder = insertPos < paths.length;
 
@@ -3587,8 +3781,9 @@ export const store = {
       const cmd: Command = addCommands.length === 1 ? addCommands[0] : { type: "batch", commands: addCommands };
       executeCommand(cmd);
 
-      // Select the pasted paths
-      state = { ...state, selection: { pathIds: pastedPaths.map((p) => p.id), points: [] } };
+      // Select the pasted paths and groups
+      const pastedIds = [...pastedGroups.map((g) => g.id), ...pastedPaths.map((p) => p.id)];
+      state = { ...state, selection: { pathIds: pastedIds, points: [] } };
       notify();
     }
     // Note: Pasting individual anchors into paths is complex (would need to insert new segments)
@@ -3670,18 +3865,26 @@ export const store = {
       }
     }
 
-    // If full paths are selected, copy them
+    // If full paths are selected, copy them (including selected groups)
     if (selection.pathIds.length > 0) {
       const selectedSet = new Set(selection.pathIds);
       const sourcePaths = paths.filter((p) => selectedSet.has(p.id));
+      const sourceGroups = state.groups.filter((g) => selectedSet.has(g.id));
 
-      if (sourcePaths.length > 0) {
+      if (sourcePaths.length > 0 || sourceGroups.length > 0) {
+        // Create ID mapping for groups to preserve hierarchy in clipboard
+        const groupIdMap = new Map<string, string>();
+        for (const g of sourceGroups) {
+          groupIdMap.set(g.id, g.id); // Keep same IDs in clipboard, remap on paste
+        }
+
         // Create a serializable format
         const clipboardData = {
           type: "estme-paths" as const,
           version: 1,
           paths: sourcePaths.map((p) => ({
             name: p.name,
+            parentId: p.parentId && groupIdMap.has(p.parentId) ? p.parentId : null,
             segments: p.segments,
             anchorMeta: p.anchorMeta,
             closed: p.closed,
@@ -3690,6 +3893,13 @@ export const store = {
             playerMask: p.playerMask,
             transform: p.transform,
             transformPoint: p.transformPoint,
+          })),
+          groups: sourceGroups.map((g) => ({
+            id: g.id,
+            name: g.name,
+            parentId: g.parentId && groupIdMap.has(g.parentId) ? g.parentId : null,
+            collapsed: g.collapsed,
+            transformPoint: g.transformPoint,
           })),
         };
 
@@ -3738,7 +3948,7 @@ export const store = {
       try {
         const data = JSON.parse(text);
         if (data.type === "estme-paths" && Array.isArray(data.paths)) {
-          store._pasteEstmePaths(data.paths);
+          store._pasteEstmePaths(data.paths, data.groups);
           return;
         }
         if (data.type === "estme-keyframes" && Array.isArray(data.keyframes)) {
@@ -3863,31 +4073,41 @@ export const store = {
     notify();
   },
 
-  // Internal helper to paste estme-format paths
-  _pasteEstmePaths: (pathsData: Array<{
-    name: string;
-    segments: CubicSegment[];
-    anchorMeta: AnchorMeta[];
-    closed: boolean;
-    fill: string;
-    opacity: number;
-    playerMask?: boolean;
-    transform?: PathTransform;
-    transformPoint?: Point | null;
-  }>) => {
-    const { paths, pathCounter } = state;
+  // Internal helper to paste estme-format paths and groups
+  _pasteEstmePaths: (
+    pathsData: Array<{
+      name: string;
+      parentId?: string | null;
+      segments: CubicSegment[];
+      anchorMeta: AnchorMeta[];
+      closed: boolean;
+      fill: string;
+      opacity: number;
+      playerMask?: boolean;
+      transform?: PathTransform;
+      transformPoint?: Point | null;
+    }>,
+    groupsData?: Array<{
+      id: string;
+      name: string;
+      parentId?: string | null;
+      collapsed?: boolean;
+      transformPoint?: Point | null;
+    }>,
+  ) => {
+    const { paths, groups, pathCounter, groupCounter } = state;
 
     // Generate names with " 2", " 3" suffixes
-    const getNextCopyName = (baseName: string): string => {
+    const getNextCopyName = (baseName: string, existingNames: string[]): string => {
       const baseMatch = baseName.match(/^(.+?) (\d+)$/);
       const trueName = baseMatch ? baseMatch[1] : baseName;
 
       const existingNumbers: number[] = [1];
-      for (const p of paths) {
-        if (p.name === trueName) {
+      for (const name of existingNames) {
+        if (name === trueName) {
           existingNumbers.push(1);
         } else {
-          const match = p.name.match(/^(.+?) (\d+)$/);
+          const match = name.match(/^(.+?) (\d+)$/);
           if (match && match[1] === trueName) {
             existingNumbers.push(parseInt(match[2], 10));
           }
@@ -3898,11 +4118,37 @@ export const store = {
       return `${trueName} ${maxNum + 1}`;
     };
 
+    const allPathNames = paths.map((p) => p.name);
+    const allGroupNames = groups.map((g) => g.name);
+
+    // Build ID mapping for groups (old clipboard ID -> new ID)
+    const groupIdMap = new Map<string, string>();
+    const pastedGroups: Group[] = [];
+
+    if (groupsData && groupsData.length > 0) {
+      for (const g of groupsData) {
+        const newId = crypto.randomUUID();
+        groupIdMap.set(g.id, newId);
+      }
+
+      // Create groups with new IDs
+      for (const g of groupsData) {
+        pastedGroups.push({
+          id: groupIdMap.get(g.id)!,
+          name: getNextCopyName(g.name, allGroupNames),
+          parentId: g.parentId && groupIdMap.has(g.parentId) ? groupIdMap.get(g.parentId)! : null,
+          collapsed: g.collapsed ?? false,
+          transformPoint: g.transformPoint ?? null,
+        });
+      }
+    }
+
     let pCounter = pathCounter;
     const pastedPaths: Path[] = pathsData.map((p) => ({
       id: crypto.randomUUID(),
-      name: getNextCopyName(p.name || `Path ${++pCounter}`),
-      parentId: null, // Paste at root level
+      name: getNextCopyName(p.name || `Path ${++pCounter}`, allPathNames),
+      // Use remapped parentId if it exists in clipboard groups, otherwise null
+      parentId: p.parentId && groupIdMap.has(p.parentId) ? groupIdMap.get(p.parentId)! : null,
       segments: p.segments.map((seg) => ({
         p0: { ...seg.p0 },
         c0: { ...seg.c0 },
@@ -3920,21 +4166,30 @@ export const store = {
       transformPoint: p.transformPoint ?? null,
     }));
 
-    if (pastedPaths.length === 0) return;
+    if (pastedPaths.length === 0 && pastedGroups.length === 0) return;
 
-    const addCommands: Command[] = pastedPaths.map((path) => ({
-      type: "addPath" as const,
-      path,
-    }));
+    const addCommands: Command[] = [];
+
+    // Add groups first
+    for (const group of pastedGroups) {
+      addCommands.push({ type: "addGroup" as const, group });
+    }
+
+    // Then add paths
+    for (const path of pastedPaths) {
+      addCommands.push({ type: "addPath" as const, path });
+    }
 
     const cmd: Command = addCommands.length === 1 ? addCommands[0] : { type: "batch", commands: addCommands };
     executeCommand(cmd);
 
-    // Update counter and select pasted paths
+    // Update counters and select pasted items
+    const pastedIds = [...pastedGroups.map((g) => g.id), ...pastedPaths.map((p) => p.id)];
     state = {
       ...state,
       pathCounter: pCounter,
-      selection: { pathIds: pastedPaths.map((p) => p.id), points: [] },
+      groupCounter: groupCounter + pastedGroups.length,
+      selection: { pathIds: pastedIds, points: [] },
     };
     notify();
   },
@@ -6334,6 +6589,308 @@ export const store = {
     }
   },
 
+  // Bake a keyframe's properties down to direct children (groups and paths)
+  // This copies the parent's keyframe properties to all direct children at the same time,
+  // then clears the properties from the parent keyframe
+  bakeKeyframeDown: (
+    clipId: string,
+    partId: string,
+    t: number,
+  ) => {
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    // Get the parent's keyframe at this time
+    const parentAnim = clip.parts[partId] ?? [];
+    const parentKf = parentAnim.find((kf) => Math.abs(kf.t - t) < 0.0001);
+    if (!parentKf) return;
+
+    // Check what properties are set on this keyframe
+    const propsToTransfer: AnimatableProperty[] = [];
+    if (parentKf.tx !== undefined) propsToTransfer.push("tx");
+    if (parentKf.ty !== undefined) propsToTransfer.push("ty");
+    if (parentKf.rot !== undefined) propsToTransfer.push("rot");
+    if (parentKf.scale !== undefined) propsToTransfer.push("scale");
+    if (parentKf.opacity !== undefined) propsToTransfer.push("opacity");
+
+    if (propsToTransfer.length === 0) return;
+
+    // Get direct children (both paths and groups)
+    const childPathIds = store.getDirectChildPathIds(partId);
+    const childGroupIds = store.getDirectChildGroupIds(partId);
+    const childIds = [...childPathIds, ...childGroupIds];
+
+    if (childIds.length === 0) return;
+
+    // Get parent group's transform point (pivot for rotation/scale)
+    // Use stored transformPoint, or origin if not set (matching getEffectiveTransform behavior)
+    const parentGroup = state.groups.find((g) => g.id === partId);
+    if (!parentGroup) return;
+    const parentPivot = parentGroup.transformPoint ?? { x: 0, y: 0 };
+
+    // Get parent's transform values
+    const parentTx = parentKf.tx ?? 0;
+    const parentTy = parentKf.ty ?? 0;
+    const parentRot = parentKf.rot ?? 0;
+    const parentScale = parentKf.scale ?? 1;
+    const parentOpacity = parentKf.opacity ?? 1;
+
+    // Helper to calculate pivot offset (same as getPivotOffset in animation.ts)
+    const getPivotOffset = (pivot: Point, rot: number, scale: number): Point => {
+      if (Math.abs(rot) < 0.0001 && Math.abs(scale - 1) < 0.0001) {
+        return { x: 0, y: 0 };
+      }
+      const c = Math.cos(rot);
+      const s = Math.sin(rot);
+      const rotatedX = pivot.x * scale * c - pivot.y * scale * s;
+      const rotatedY = pivot.x * scale * s + pivot.y * scale * c;
+      return { x: pivot.x - rotatedX, y: pivot.y - rotatedY };
+    };
+
+    // Parent's pivot offset
+    const parentPivotOffset = getPivotOffset(parentPivot, parentRot, parentScale);
+
+    // Parent's combined contribution to translation
+    const parentCombinedTx = parentTx + parentPivotOffset.x;
+    const parentCombinedTy = parentTy + parentPivotOffset.y;
+
+    const pCos = Math.cos(parentRot);
+    const pSin = Math.sin(parentRot);
+
+    // Build batch command
+    const commands: Command[] = [];
+
+    // Add properties to each child
+    for (const childId of childIds) {
+      const childAnim = clip.parts[childId] ?? [];
+      let newChildAnim = [...childAnim];
+
+      // Get child's pivot point
+      let childPivot: Point;
+      const childPath = state.paths.find((p) => p.id === childId);
+      const childGroup = state.groups.find((g) => g.id === childId);
+      if (childPath) {
+        childPivot = getPathTransformPoint(childPath);
+      } else if (childGroup) {
+        childPivot = childGroup.transformPoint ?? { x: 0, y: 0 };
+      } else {
+        continue;
+      }
+
+      // Find or create keyframe at this time
+      let childKfIndex = newChildAnim.findIndex((kf) => Math.abs(kf.t - t) < 0.0001);
+      if (childKfIndex < 0) {
+        // Insert new keyframe
+        newChildAnim.push({ t });
+        newChildAnim.sort((a, b) => a.t - b.t);
+        childKfIndex = newChildAnim.findIndex((kf) => Math.abs(kf.t - t) < 0.0001);
+      }
+
+      // Get existing child keyframe values
+      const existingChildKf = newChildAnim[childKfIndex];
+      const cTx = existingChildKf.tx ?? 0;
+      const cTy = existingChildKf.ty ?? 0;
+      const cRot = existingChildKf.rot ?? 0;
+      const cScale = existingChildKf.scale ?? 1;
+      const cOpacity = existingChildKf.opacity ?? 1;
+
+      // Calculate new child rot/scale (these are straightforward)
+      let newCRot = cRot + parentRot;
+      const newCScale = cScale * parentScale;
+      const newCOpacity = cOpacity * parentOpacity;
+
+      // Normalize rotation to be within +/- π of the previous keyframe's rotation
+      // to avoid large jumps in animation
+      if (childKfIndex > 0) {
+        const prevKf = newChildAnim[childKfIndex - 1];
+        const prevRot = prevKf.rot ?? 0;
+        while (newCRot - prevRot > Math.PI) newCRot -= 2 * Math.PI;
+        while (newCRot - prevRot < -Math.PI) newCRot += 2 * Math.PI;
+      }
+
+      // Calculate what newCTx, newCTy should be so the child ends up in the same position
+      //
+      // The math differs for paths vs groups because of how getEffectiveTransform works:
+      // - For paths (leaf nodes), the path's tx/ty + pivotOffset gets rotated by the parent's rotation
+      // - For groups (in ancestor chain), the PARENT's accumulated tx/ty gets rotated by the GROUP's rotation
+      //
+      // For a PATH with parent:
+      //   rotatedPathTx = (pathTx + pathPivotOffset.x) * cos(parentRot) - (pathTy + pathPivotOffset.y) * sin(parentRot)
+      //   finalTx = parentCombinedTx + rotatedPathTx * parentScale
+      //
+      // For a GROUP in ancestor chain with parent above it:
+      //   The parent's contribution gets rotated by the child group's rotation:
+      //   rotatedParentTx = parentCombinedTx * cos(childRot) - parentCombinedTy * sin(childRot)
+      //   finalAccumulatedTx = rotatedParentTx * childScale + childTx + childPivotOffset.x
+
+      let newCTx: number;
+      let newCTy: number;
+
+      if (childPath) {
+        // PATH: parent's rotation rotates the child's (tx + pivotOffset)
+        const childPivotOffset = getPivotOffset(childPivot, cRot, cScale);
+        const txWithOffset = cTx + childPivotOffset.x;
+        const tyWithOffset = cTy + childPivotOffset.y;
+        const rotatedChildTx = txWithOffset * pCos - tyWithOffset * pSin;
+        const rotatedChildTy = txWithOffset * pSin + tyWithOffset * pCos;
+
+        const newChildPivotOffset = getPivotOffset(childPivot, newCRot, newCScale);
+
+        newCTx = parentCombinedTx + rotatedChildTx * parentScale - newChildPivotOffset.x;
+        newCTy = parentCombinedTy + rotatedChildTy * parentScale - newChildPivotOffset.y;
+      } else {
+        // GROUP: child's rotation rotates the parent's contribution
+        // Before baking: rotatedParentTx = parentCombinedTx * cos(cRot) - parentCombinedTy * sin(cRot)
+        //                accumulated = rotatedParentTx * cScale + cTx + childPivotOffset.x
+        // After baking:  accumulated = newCTx + childPivotOffset.x  (since no parent, nothing to rotate)
+        // Setting equal: newCTx = parentCombinedTx * cos(cRot) * cScale - parentCombinedTy * sin(cRot) * cScale + cTx
+
+        const cCos = Math.cos(cRot);
+        const cSin = Math.sin(cRot);
+        const rotatedParentTx = parentCombinedTx * cCos - parentCombinedTy * cSin;
+        const rotatedParentTy = parentCombinedTx * cSin + parentCombinedTy * cCos;
+
+        newCTx = rotatedParentTx * cScale + cTx;
+        newCTy = rotatedParentTy * cScale + cTy;
+      }
+
+      const updatedChildKf = { ...existingChildKf };
+
+      // Set the baked values on the child keyframe
+      const needsTxTy = propsToTransfer.includes("tx") || propsToTransfer.includes("ty") ||
+                        propsToTransfer.includes("rot") || propsToTransfer.includes("scale");
+
+      if (needsTxTy) {
+        updatedChildKf.tx = newCTx;
+        updatedChildKf.ty = newCTy;
+      }
+
+      if (propsToTransfer.includes("rot")) {
+        updatedChildKf.rot = newCRot;
+      }
+
+      if (propsToTransfer.includes("scale")) {
+        updatedChildKf.scale = newCScale;
+      }
+
+      if (propsToTransfer.includes("opacity")) {
+        updatedChildKf.opacity = newCOpacity;
+      }
+
+      newChildAnim[childKfIndex] = updatedChildKf;
+
+      // Only add command if animation changed
+      if (JSON.stringify(childAnim) !== JSON.stringify(newChildAnim)) {
+        commands.push({
+          type: "setPartAnimation",
+          clipId,
+          partId: childId,
+          prevAnimation: childAnim,
+          newAnimation: newChildAnim,
+        });
+      }
+    }
+
+    // Delete the parent keyframe
+    let newParentAnim = [...parentAnim];
+    const parentKfIndex = newParentAnim.findIndex((kf) => Math.abs(kf.t - t) < 0.0001);
+    if (parentKfIndex >= 0) {
+      newParentAnim = newParentAnim.filter((_, i) => i !== parentKfIndex);
+
+      commands.push({
+        type: "setPartAnimation",
+        clipId,
+        partId,
+        prevAnimation: parentAnim,
+        newAnimation: newParentAnim,
+      });
+    }
+
+    // Execute as batch
+    if (commands.length > 0) {
+      executeCommand({ type: "batch", commands });
+    }
+  },
+
+  // Create keyframes at current time for all selected paths/groups
+  // Only sets properties that have keyframes elsewhere on the track (before or after)
+  // Interpolates the value at the current time
+  createKeyframesForSelection: () => {
+    const clipId = state.currentClipId;
+    if (!clipId) return;
+
+    const clip = state.animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    const t = state.playbackTime;
+    const commands: Command[] = [];
+    const newSelectedKeyframes: { pathId: string; time: number }[] = [];
+
+    // Collect IDs to create keyframes for
+    // Use groups if selected, otherwise use paths directly
+    const idsToProcess: string[] = [];
+    for (const id of state.selection.pathIds) {
+      const isGroup = state.groups.some((g) => g.id === id);
+      const isPath = state.paths.some((p) => p.id === id);
+      if (isGroup || isPath) {
+        idsToProcess.push(id);
+      }
+    }
+
+    if (idsToProcess.length === 0) return;
+
+    for (const partId of idsToProcess) {
+      const partAnim = clip.parts[partId] ?? [];
+
+      // Check if there's already a keyframe at this time
+      const existingKfIndex = partAnim.findIndex((kf) => Math.abs(kf.t - t) < 0.0001);
+      if (existingKfIndex >= 0) {
+        // Already has a keyframe, just select it
+        newSelectedKeyframes.push({ pathId: partId, time: t });
+        continue;
+      }
+
+      // For each property, check if it has any keyframes before or after
+      // If so, interpolate the value at current time
+      const newKf: { t: number; tx?: number; ty?: number; rot?: number; scale?: number; opacity?: number } = { t };
+      let hasAnyProperty = false;
+
+      for (const prop of ANIMATABLE_PROPERTIES) {
+        // Check if any keyframe on this track has this property set
+        const hasProperty = partAnim.some((kf) => kf[prop] !== undefined);
+        if (hasProperty) {
+          // Interpolate the value at current time
+          const value = getPropertyValue(partAnim, prop, t);
+          newKf[prop] = value;
+          hasAnyProperty = true;
+        }
+      }
+
+      if (hasAnyProperty) {
+        // Add the new keyframe
+        const newPartAnim = [...partAnim, newKf];
+        newPartAnim.sort((a, b) => a.t - b.t);
+
+        commands.push({
+          type: "setPartAnimation",
+          clipId,
+          partId,
+          prevAnimation: partAnim,
+          newAnimation: newPartAnim,
+        });
+
+        newSelectedKeyframes.push({ pathId: partId, time: t });
+      }
+    }
+
+    if (commands.length > 0) {
+      executeCommand({ type: "batch", commands });
+      // Select the newly created keyframes
+      state = { ...state, selectedKeyframes: newSelectedKeyframes };
+      notify();
+    }
+  },
+
   setPlaybackTime: (time: number) => {
     state = { ...state, playbackTime: time };
     savePlaybackTime(time);
@@ -6995,7 +7552,7 @@ export const store = {
 };
 
 // Import AnimationClip, AnimatableProperty, and keyframe utilities for use in store
-import { AnimationClip, AnimatableProperty, PartAnimation, setKeyframeProperty, unsetKeyframeProperty, removeKeyframe, changeKeyframeTime, getOrCreateKeyframe, getPropertyValue } from "../animation.ts";
+import { AnimationClip, AnimatableProperty, PartAnimation, setKeyframeProperty, unsetKeyframeProperty, removeKeyframe, changeKeyframeTime, getOrCreateKeyframe, getPropertyValue, ANIMATABLE_PROPERTIES, defaultPropertyValues } from "../animation.ts";
 
 export function useStore<T>(selector: (state: EditorState) => T): T {
   return useSyncExternalStore(

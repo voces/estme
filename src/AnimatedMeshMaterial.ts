@@ -33,7 +33,6 @@ const PART_Z_OFFSET = 0.0001;
 const VERTEX_ATTRIBUTES = `
   attribute float partID;
   attribute float playerMask;
-  attribute float alpha;
   attribute float instanceAlpha;
   attribute float instanceMinimapMask;
   attribute vec3 instancePlayerColor;
@@ -111,7 +110,6 @@ export const createAnimatedMeshMaterial = (): MeshBasicMaterial => {
       ${VERTEX_ATTRIBUTES}
       varying float vInstanceAlpha;
       varying float vInstanceMinimapMask;
-      varying float vVertexAlpha;
       varying float vPlayerMask;
       varying vec3 vPlayerColor;
       varying vec3 vTint;
@@ -125,7 +123,6 @@ export const createAnimatedMeshMaterial = (): MeshBasicMaterial => {
       void main() {
         vInstanceAlpha = instanceAlpha;
         vInstanceMinimapMask = instanceMinimapMask;
-        vVertexAlpha = alpha;
         vPlayerMask = playerMask;
         vPlayerColor = instancePlayerColor;
         vTint = instanceTint;
@@ -196,7 +193,6 @@ export const createAnimatedMeshMaterial = (): MeshBasicMaterial => {
     shader.fragmentShader = `
       varying float vInstanceAlpha;
       varying float vInstanceMinimapMask;
-      varying float vVertexAlpha;
       varying float vPlayerMask;
       varying vec3 vPlayerColor;
       varying vec3 vTint;
@@ -206,7 +202,7 @@ export const createAnimatedMeshMaterial = (): MeshBasicMaterial => {
     shader.fragmentShader = shader.fragmentShader.replace(
       /vec4 diffuseColor = vec4\( diffuse, opacity \);/,
       `
-      float finalOpacity = vVertexAlpha * vInstanceAlpha * vAnimOpacity;
+      float finalOpacity = vInstanceAlpha * vAnimOpacity;
       vec4 diffuseColor = vec4( diffuse, finalOpacity );
       `,
     );
@@ -267,7 +263,7 @@ export const createDepthMaterial = (): MeshBasicMaterial => {
         float speed = instanceAnim.z;
         vec4 animTransform = sampleAnimation(partID, clip, phase, speed);
         float animOpacity = sampleOpacity(partID, clip, phase, speed);
-        vFinalOpacity = alpha * instanceAlpha * animOpacity;
+        vFinalOpacity = instanceAlpha * animOpacity;
         vInstanceAlpha = instanceAlpha;
 
         float tx = animTransform.r;

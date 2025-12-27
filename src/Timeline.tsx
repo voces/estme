@@ -176,6 +176,44 @@ export const Timeline = () => {
     }, 1500);
   }, [narrowLastDepth]);
 
+  // Bake down: can only do this when selected keyframes belong to groups with children
+  const canBakeDown = useMemo(() => {
+    if (!currentClipId || selectedKeyframes.length === 0) return false;
+    // At least one selected keyframe must be on a group that has direct children
+    for (const kf of selectedKeyframes) {
+      const isGroup = groups.some((g) => g.id === kf.pathId);
+      if (isGroup) {
+        const childPaths = paths.filter((p) => p.parentId === kf.pathId);
+        const childGroups = groups.filter((g) => g.parentId === kf.pathId);
+        if (childPaths.length > 0 || childGroups.length > 0) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }, [currentClipId, selectedKeyframes, groups, paths]);
+
+  const handleBakeDown = useCallback(() => {
+    if (!currentClipId) return;
+    // Bake down all selected keyframes that belong to groups
+    for (const kf of selectedKeyframes) {
+      const isGroup = groups.some((g) => g.id === kf.pathId);
+      if (isGroup) {
+        store.bakeKeyframeDown(currentClipId, kf.pathId, kf.time);
+      }
+    }
+  }, [currentClipId, selectedKeyframes, groups]);
+
+  // Check if we can create keyframes (have selection and active clip)
+  const canCreateKeyframes = useMemo(() => {
+    if (!currentClipId) return false;
+    return selection.pathIds.length > 0;
+  }, [currentClipId, selection.pathIds]);
+
+  const handleCreateKeyframes = useCallback(() => {
+    store.createKeyframesForSelection();
+  }, []);
+
   // Playback loop
   useEffect(() => {
     if (!isPlaying || !currentClip) return;
@@ -1212,6 +1250,34 @@ export const Timeline = () => {
             title="Select last keyframe per track (repeat for 2nd-last, 3rd-last...)"
           >
             ⊢
+          </button>
+        </div>
+
+        <div className={styles.separator} />
+
+        {/* Bake down button */}
+        <div className={styles.buttonGroup}>
+          <button
+            className={styles.headerBtn}
+            onClick={handleBakeDown}
+            disabled={!canBakeDown}
+            title="Bake keyframe properties down to direct children"
+          >
+            ↧
+          </button>
+        </div>
+
+        <div className={styles.separator} />
+
+        {/* Create keyframes button */}
+        <div className={styles.buttonGroup}>
+          <button
+            className={styles.headerBtn}
+            onClick={handleCreateKeyframes}
+            disabled={!canCreateKeyframes}
+            title="Create keyframes at current time for selected items (interpolating existing properties)"
+          >
+            ◆+
           </button>
         </div>
 

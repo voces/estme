@@ -35,6 +35,13 @@ export function scalePointAround(p: Point, center: Point, scale: number): Point 
   };
 }
 
+export function scalePointAroundNonUniform(p: Point, center: Point, scaleX: number, scaleY: number): Point {
+  return {
+    x: center.x + (p.x - center.x) * scaleX,
+    y: center.y + (p.y - center.y) * scaleY,
+  };
+}
+
 export function rotatePoint(p: Point, center: Point, angle: number): Point {
   const cos = Math.cos(angle);
   const sin = Math.sin(angle);

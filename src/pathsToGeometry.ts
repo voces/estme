@@ -59,7 +59,6 @@ export function pathsToGeometry(
 
   const allPositions: number[] = [];
   const allColors: number[] = [];
-  const allAlphas: number[] = [];
   const allPartIDs: number[] = [];
   const allPlayerMasks: number[] = [];
 
@@ -126,20 +125,15 @@ export function pathsToGeometry(
     const positions = geometry.attributes.position;
     const vertexCount = positions.count;
 
-    // Clamp opacity to 0-1 range
-    const opacity = Math.max(0, Math.min(1, transform.opacity));
-
     for (let i = 0; i < vertexCount; i++) {
       // Apply transform to position
       const transformed = applyTransform(positions.getX(i), positions.getY(i), transform);
       allPositions.push(transformed.x, transformed.y, positions.getZ(i));
-      // Store colors without opacity multiplication - alpha is separate
       allColors.push(
         colors[i * 3],
         colors[i * 3 + 1],
         colors[i * 3 + 2],
       );
-      allAlphas.push(opacity);
       allPartIDs.push(partIdx);
       allPlayerMasks.push(path.playerMask ? 1 : 0);
     }
@@ -151,7 +145,6 @@ export function pathsToGeometry(
       // For now, let's convert to non-indexed
       const nonIndexedPositions: number[] = [];
       const nonIndexedColors: number[] = [];
-      const nonIndexedAlphas: number[] = [];
       const nonIndexedPartIDs: number[] = [];
       const nonIndexedPlayerMasks: number[] = [];
 
@@ -160,13 +153,11 @@ export function pathsToGeometry(
         // Apply transform to position
         const transformed = applyTransform(positions.getX(idx), positions.getY(idx), transform);
         nonIndexedPositions.push(transformed.x, transformed.y, positions.getZ(idx));
-        // Store colors without opacity multiplication - alpha is separate
         nonIndexedColors.push(
           colors[idx * 3],
           colors[idx * 3 + 1],
           colors[idx * 3 + 2],
         );
-        nonIndexedAlphas.push(opacity);
         nonIndexedPartIDs.push(partIdx);
         nonIndexedPlayerMasks.push(path.playerMask ? 1 : 0);
       }
@@ -174,13 +165,11 @@ export function pathsToGeometry(
       // Replace the last added vertices with the expanded ones
       allPositions.splice(allPositions.length - vertexCount * 3);
       allColors.splice(allColors.length - vertexCount * 3);
-      allAlphas.splice(allAlphas.length - vertexCount);
       allPartIDs.splice(allPartIDs.length - vertexCount);
       allPlayerMasks.splice(allPlayerMasks.length - vertexCount);
 
       allPositions.push(...nonIndexedPositions);
       allColors.push(...nonIndexedColors);
-      allAlphas.push(...nonIndexedAlphas);
       allPartIDs.push(...nonIndexedPartIDs);
       allPlayerMasks.push(...nonIndexedPlayerMasks);
     }
@@ -200,10 +189,6 @@ export function pathsToGeometry(
     new BufferAttribute(new Float32Array(allColors), 3),
   );
   mergedGeometry.setAttribute(
-    "alpha",
-    new BufferAttribute(new Float32Array(allAlphas), 1),
-  );
-  mergedGeometry.setAttribute(
     "partID",
     new BufferAttribute(new Float32Array(allPartIDs), 1),
   );
@@ -221,8 +206,11 @@ export function pathsToGeometry(
 /**
  * Create identity animation data (no animation, all parts at default pose).
  * This is useful for previewing models without any animation.
+ *
+ * @param partCount - Number of parts in the geometry
+ * @param opacities - Optional array of opacity values for each part (defaults to 1 for all)
  */
-export function createIdentityAnimationData(partCount: number): AnimationData {
+export function createIdentityAnimationData(partCount: number, opacities?: number[]): AnimationData {
   const sampleCount = 1; // Only one sample needed for static pose
 
   // Transform texture: R=tx, G=ty, B=rot, A=scale
@@ -246,9 +234,15 @@ export function createIdentityAnimationData(partCount: number): AnimationData {
   transformTexture.needsUpdate = true;
 
   // Opacity texture: R=opacity
-  // Identity: opacity=1
+  // Use provided opacities or default to 1
   const opacityData = new Float32Array(sampleCount * partCount);
-  opacityData.fill(1);
+  if (opacities) {
+    for (let i = 0; i < partCount; i++) {
+      opacityData[i] = opacities[i] ?? 1;
+    }
+  } else {
+    opacityData.fill(1);
+  }
 
   const opacityTexture = new DataTexture(
     opacityData,
@@ -262,7 +256,8 @@ export function createIdentityAnimationData(partCount: number): AnimationData {
   return {
     partCount,
     sampleCount,
-    clips: new Map([["default", 0]]),
+    clipCount: 1,
+    clips: new Map([["default", { index: 0, duration: 0 }]]),
     transformTexture,
     opacityTexture,
   };

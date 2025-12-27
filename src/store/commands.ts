@@ -5,6 +5,7 @@ import {
   makeStraightControlPoints,
   rotatePoint,
   scalePointAround,
+  scalePointAroundNonUniform,
   splitBezierAt,
 } from "../geometry.ts";
 import { Command, EditorState, emptySelection, HandleType } from "./types.ts";
@@ -268,6 +269,53 @@ export function applyCommand(
               if (connPath && connPath.segments[connPoint.segmentIndex]) {
                 const oldPos = connPath.segments[connPoint.segmentIndex].p0;
                 const newPos = scalePointAround(oldPos, cmd.center, scale);
+                const dx = newPos.x - oldPos.x;
+                const dy = newPos.y - oldPos.y;
+                newPaths = movePointInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, dx, dy);
+              }
+            }
+          }
+        }
+      }
+
+      return { ...state, paths: newPaths };
+    }
+    case "scalePathNonUniform": {
+      // For undo, we need to scale by 1/scale
+      const scaleX = isUndo ? 1 / cmd.scaleX : cmd.scaleX;
+      const scaleY = isUndo ? 1 / cmd.scaleY : cmd.scaleY;
+
+      const path = state.paths.find((p) => p.id === cmd.id);
+      if (!path) return state;
+
+      // First, scale the main path
+      let newPaths = state.paths.map((p) => {
+        if (p.id !== cmd.id) return p;
+        return {
+          ...p,
+          segments: p.segments.map((seg) => ({
+            p0: scalePointAroundNonUniform(seg.p0, cmd.center, scaleX, scaleY),
+            c0: scalePointAroundNonUniform(seg.c0, cmd.center, scaleX, scaleY),
+            c1: scalePointAroundNonUniform(seg.c1, cmd.center, scaleX, scaleY),
+            p1: scalePointAroundNonUniform(seg.p1, cmd.center, scaleX, scaleY),
+          })),
+        };
+      });
+
+      // Then, scale all connected points on OTHER paths around the same center
+      const movedPoints = new Set<string>();
+      for (let i = 0; i < path.segments.length; i++) {
+        const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
+        for (const connPoint of connectedPoints) {
+          if (connPoint.pathId !== cmd.id) {
+            const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
+            if (!movedPoints.has(key)) {
+              movedPoints.add(key);
+              // Get the current position and scale it
+              const connPath = newPaths.find((p) => p.id === connPoint.pathId);
+              if (connPath && connPath.segments[connPoint.segmentIndex]) {
+                const oldPos = connPath.segments[connPoint.segmentIndex].p0;
+                const newPos = scalePointAroundNonUniform(oldPos, cmd.center, scaleX, scaleY);
                 const dx = newPos.x - oldPos.x;
                 const dy = newPos.y - oldPos.y;
                 newPaths = movePointInternal(newPaths, connPoint.pathId, connPoint.segmentIndex, dx, dy);

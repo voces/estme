@@ -42,9 +42,11 @@ import {
   getPathPoints,
   getPathTransformPoint,
   getGroupTransformPoint,
+  getPathBounds,
   getSelectionCenter,
   getSelectionBoundingCenter,
   sampleBezier,
+  BoundingBox,
 } from "./geometry.ts";
 import { AnimatedInstancedMesh } from "./AnimatedInstancedMesh.ts";
 import {
@@ -495,6 +497,13 @@ export const Canvas = () => {
       // Raster image meshes
       rasterMeshes: Map<string, THREE.Mesh>;
       rasterTextures: Map<string, THREE.Texture>;
+      // Transform handles for selection bounding box
+      transformHandles: {
+        boundingBox: THREE.Line | null;
+        corners: THREE.Mesh[]; // 4 corner handles for scaling
+        rotationHandle: THREE.Mesh | null;
+        rotationLine: THREE.Line | null;
+      };
       updateGrid: () => void;
       updatePointScales: () => void;
       zoom: number;
@@ -515,6 +524,7 @@ export const Canvas = () => {
   const showAllPoints = useStore((s) => s.showAllPoints);
   const showAllControlPoints = useStore((s) => s.showAllControlPoints);
   const showTransformPoints = useStore((s) => s.showTransformPoints);
+  const showGrid = useStore((s) => s.showGrid);
   const groups = useStore((s) => s.groups);
   const blobRadius = useStore((s) => s.blobRadius);
   const animationClips = useStore((s) => s.animationClips);
@@ -615,8 +625,11 @@ export const Canvas = () => {
     const geometry = pathsToGeometry(visiblePaths, transforms);
     if (!geometry) return;
 
-    // Create identity animation data (transforms are already baked in)
-    const animationData = createIdentityAnimationData(visiblePaths.length);
+    // Extract opacities from transforms for animation data
+    const opacities = visiblePaths.map((path) => transforms.get(path.id)?.opacity ?? 1);
+
+    // Create identity animation data with effective opacities
+    const animationData = createIdentityAnimationData(visiblePaths.length, opacities);
 
     // Create the AnimatedInstancedMesh with 1 instance
     const mesh = new AnimatedInstancedMesh(
@@ -1452,6 +1465,152 @@ export const Canvas = () => {
     }
   }, [paths, groups, showTransformPoints, currentClipId, animationClips, playbackTime, selection]);
 
+  // Render transform handles around selection bounding box (only in edit mode, not animation mode)
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+
+    // Helper to clean up transform handles
+    const clearTransformHandles = () => {
+      const { transformHandles } = state;
+      if (transformHandles.boundingBox) {
+        state.scene.remove(transformHandles.boundingBox);
+        transformHandles.boundingBox.geometry.dispose();
+        (transformHandles.boundingBox.material as THREE.Material).dispose();
+        transformHandles.boundingBox = null;
+      }
+      for (const corner of transformHandles.corners) {
+        state.scene.remove(corner);
+        corner.geometry.dispose();
+        (corner.material as THREE.Material).dispose();
+      }
+      transformHandles.corners = [];
+      if (transformHandles.rotationHandle) {
+        state.scene.remove(transformHandles.rotationHandle);
+        transformHandles.rotationHandle.geometry.dispose();
+        (transformHandles.rotationHandle.material as THREE.Material).dispose();
+        transformHandles.rotationHandle = null;
+      }
+      if (transformHandles.rotationLine) {
+        state.scene.remove(transformHandles.rotationLine);
+        transformHandles.rotationLine.geometry.dispose();
+        (transformHandles.rotationLine.material as THREE.Material).dispose();
+        transformHandles.rotationLine = null;
+      }
+    };
+
+    clearTransformHandles();
+
+    // Only show in edit mode (no animation clip selected) and when there's a selection
+    if (currentClipId) return;
+    if (selection.pathIds.length === 0 && selection.points.length === 0) return;
+    if (tool !== "select") return;
+
+    // Calculate the bounding box of the selection
+    const selectedPathIds = new Set<string>();
+    for (const id of selection.pathIds) {
+      // Check if it's a group - expand to child paths
+      const group = groups.find((g) => g.id === id);
+      if (group) {
+        const descendantIds = store.getDescendantPathIds(id);
+        for (const pid of descendantIds) {
+          selectedPathIds.add(pid);
+        }
+      } else {
+        selectedPathIds.add(id);
+      }
+    }
+    // Also include paths that have selected points
+    for (const pt of selection.points) {
+      selectedPathIds.add(pt.pathId);
+    }
+
+    if (selectedPathIds.size === 0) return;
+
+    // Calculate combined bounding box
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const pathId of selectedPathIds) {
+      const path = paths.find((p) => p.id === pathId);
+      if (!path || !path.visible) continue;
+      const bounds = getPathBounds(path);
+      minX = Math.min(minX, bounds.minX);
+      minY = Math.min(minY, bounds.minY);
+      maxX = Math.max(maxX, bounds.maxX);
+      maxY = Math.max(maxY, bounds.maxY);
+    }
+
+    if (!isFinite(minX)) return;
+
+    const zoom = state.zoom;
+    const handleSize = VERTEX_SIZE * 1.5 * zoom;
+    const rotationHandleDistance = 0.15 * zoom; // Distance above top edge
+
+    // Create bounding box outline
+    const boxGeometry = new THREE.BufferGeometry();
+    const boxVertices = new Float32Array([
+      minX, minY, 0.4,
+      maxX, minY, 0.4,
+      maxX, maxY, 0.4,
+      minX, maxY, 0.4,
+      minX, minY, 0.4,
+    ]);
+    boxGeometry.setAttribute("position", new THREE.BufferAttribute(boxVertices, 3));
+    const boxMaterial = new THREE.LineBasicMaterial({ color: 0x4488ff });
+    const boxLine = new THREE.Line(boxGeometry, boxMaterial);
+    state.scene.add(boxLine);
+    state.transformHandles.boundingBox = boxLine;
+
+    // Create corner handles (squares for scaling)
+    const corners: Point[] = [
+      { x: minX, y: minY }, // bottom-left
+      { x: maxX, y: minY }, // bottom-right
+      { x: maxX, y: maxY }, // top-right
+      { x: minX, y: maxY }, // top-left
+    ];
+
+    for (const corner of corners) {
+      const shape = new THREE.Shape();
+      shape.moveTo(-handleSize / 2, -handleSize / 2);
+      shape.lineTo(handleSize / 2, -handleSize / 2);
+      shape.lineTo(handleSize / 2, handleSize / 2);
+      shape.lineTo(-handleSize / 2, handleSize / 2);
+      shape.closePath();
+
+      const geometry = new THREE.ShapeGeometry(shape);
+      const material = new THREE.MeshBasicMaterial({ color: 0x4488ff });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(corner.x, corner.y, 0.5);
+      state.scene.add(mesh);
+      state.transformHandles.corners.push(mesh);
+    }
+
+    // Create rotation handle (circle above top center)
+    const topCenterX = (minX + maxX) / 2;
+    const topCenterY = maxY;
+    const rotationY = topCenterY + rotationHandleDistance;
+
+    // Line from top center to rotation handle
+    const lineGeometry = new THREE.BufferGeometry();
+    const lineVertices = new Float32Array([
+      topCenterX, topCenterY, 0.4,
+      topCenterX, rotationY, 0.4,
+    ]);
+    lineGeometry.setAttribute("position", new THREE.BufferAttribute(lineVertices, 3));
+    const lineMaterial = new THREE.LineBasicMaterial({ color: 0x4488ff });
+    const rotLine = new THREE.Line(lineGeometry, lineMaterial);
+    state.scene.add(rotLine);
+    state.transformHandles.rotationLine = rotLine;
+
+    // Circle for rotation handle
+    const circleGeometry = new THREE.CircleGeometry(handleSize * 0.6, 16);
+    const circleMaterial = new THREE.MeshBasicMaterial({ color: 0x4488ff });
+    const circleMesh = new THREE.Mesh(circleGeometry, circleMaterial);
+    circleMesh.position.set(topCenterX, rotationY, 0.5);
+    state.scene.add(circleMesh);
+    state.transformHandles.rotationHandle = circleMesh;
+
+  }, [paths, groups, selection, currentClipId, tool]);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -1522,6 +1681,12 @@ export const Canvas = () => {
       modelPreview: null,
       rasterMeshes: new Map(),
       rasterTextures: new Map(),
+      transformHandles: {
+        boundingBox: null,
+        corners: [],
+        rotationHandle: null,
+        rotationLine: null,
+      },
       zoom: initialZoom,
       updateGrid: () => {}, // Placeholder, will be set after function is defined
       updatePointScales: () => {}, // Placeholder, will be set after function is defined
@@ -1538,6 +1703,11 @@ export const Canvas = () => {
         state.gridLines.geometry.dispose();
         (state.gridLines.material as THREE.Material).dispose();
         state.gridLines = null;
+      }
+
+      // Check if grid should be shown
+      if (!store.getState().showGrid) {
+        return;
       }
 
       const { camera } = state;
@@ -1724,6 +1894,14 @@ export const Canvas = () => {
     };
   }, []);
 
+  // Update grid visibility when showGrid changes
+  useEffect(() => {
+    const state = stateRef.current;
+    if (state) {
+      state.updateGrid();
+    }
+  }, [showGrid]);
+
   // Mouse handlers
   useEffect(() => {
     const container = containerRef.current;
@@ -1775,6 +1953,20 @@ export const Canvas = () => {
     let dragTransformPointItemId: string | null = null;
     let dragTransformPointItemType: "path" | "group" | null = null;
     let dragTransformPointOriginal: Point | null = null;
+    // Transform handle dragging state (for selection bounding box handles)
+    let isDraggingTransformHandle = false;
+    let transformHandleType: "corner" | "rotation" | null = null;
+    let transformHandleCornerIndex = -1; // 0=BL, 1=BR, 2=TR, 3=TL
+    let transformHandleStartBounds: BoundingBox | null = null;
+    let transformHandleCenter: Point | null = null;
+    let transformHandleStartAngle: number | null = null;
+    let transformHandlePreserveAspect = false;
+    // Cumulative tracking for undo/redo
+    let transformHandleTotalAngle = 0; // Cumulative rotation angle
+    let transformHandleTotalScaleX = 1; // Cumulative X scale
+    let transformHandleTotalScaleY = 1; // Cumulative Y scale
+    let transformHandlePrevScaleX = 1; // Previous frame's scale (for delta calculation)
+    let transformHandlePrevScaleY = 1;
     // Click-to-cycle state: only cycle through overlapping paths on mouseup (not mousedown)
     // This allows dragging an already-selected path without it cycling away
     let pendingCyclePathsAtPoint: string[] = [];
@@ -1969,6 +2161,113 @@ export const Canvas = () => {
       const clickPoint = screenToWorld(e, container, state.camera);
       const isShiftClick = e.shiftKey;
       const isAnimationMode = activeClipId !== null;
+
+      // Check for transform handle click first (only in edit mode with a selection)
+      if (!isAnimationMode && (selection.pathIds.length > 0 || selection.points.length > 0)) {
+        const handleHitThreshold = VERTEX_SIZE * 2 * state.zoom;
+        const { transformHandles } = state;
+
+        // Check rotation handle
+        if (transformHandles.rotationHandle) {
+          const handlePos = transformHandles.rotationHandle.position;
+          const dist = distance(clickPoint, { x: handlePos.x, y: handlePos.y });
+          if (dist <= handleHitThreshold) {
+            // Start rotation drag
+            isDraggingTransformHandle = true;
+            transformHandleType = "rotation";
+            transformHandlePreserveAspect = false;
+
+            // Calculate selection bounds and center for rotation
+            const selectedPathIds = new Set<string>();
+            for (const id of selection.pathIds) {
+              const group = groups.find((g) => g.id === id);
+              if (group) {
+                const descendantIds = store.getDescendantPathIds(id);
+                for (const pid of descendantIds) selectedPathIds.add(pid);
+              } else {
+                selectedPathIds.add(id);
+              }
+            }
+            for (const pt of selection.points) selectedPathIds.add(pt.pathId);
+
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const pathId of selectedPathIds) {
+              const path = paths.find((p) => p.id === pathId);
+              if (!path || !path.visible) continue;
+              const bounds = getPathBounds(path);
+              minX = Math.min(minX, bounds.minX);
+              minY = Math.min(minY, bounds.minY);
+              maxX = Math.max(maxX, bounds.maxX);
+              maxY = Math.max(maxY, bounds.maxY);
+            }
+            transformHandleStartBounds = { minX, minY, maxX, maxY };
+            transformHandleCenter = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+            transformHandleStartAngle = Math.atan2(
+              clickPoint.y - transformHandleCenter.y,
+              clickPoint.x - transformHandleCenter.x
+            );
+            transformHandleTotalAngle = 0; // Reset cumulative angle
+            dragStart = clickPoint;
+            e.preventDefault();
+            return;
+          }
+        }
+
+        // Check corner handles
+        for (let i = 0; i < transformHandles.corners.length; i++) {
+          const corner = transformHandles.corners[i];
+          const cornerPos = corner.position;
+          const dist = distance(clickPoint, { x: cornerPos.x, y: cornerPos.y });
+          if (dist <= handleHitThreshold) {
+            // Start scale drag
+            isDraggingTransformHandle = true;
+            transformHandleType = "corner";
+            transformHandleCornerIndex = i;
+            transformHandlePreserveAspect = e.shiftKey;
+
+            // Calculate selection bounds and center for scaling
+            const selectedPathIds = new Set<string>();
+            for (const id of selection.pathIds) {
+              const group = groups.find((g) => g.id === id);
+              if (group) {
+                const descendantIds = store.getDescendantPathIds(id);
+                for (const pid of descendantIds) selectedPathIds.add(pid);
+              } else {
+                selectedPathIds.add(id);
+              }
+            }
+            for (const pt of selection.points) selectedPathIds.add(pt.pathId);
+
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const pathId of selectedPathIds) {
+              const path = paths.find((p) => p.id === pathId);
+              if (!path || !path.visible) continue;
+              const bounds = getPathBounds(path);
+              minX = Math.min(minX, bounds.minX);
+              minY = Math.min(minY, bounds.minY);
+              maxX = Math.max(maxX, bounds.maxX);
+              maxY = Math.max(maxY, bounds.maxY);
+            }
+            transformHandleStartBounds = { minX, minY, maxX, maxY };
+            // The pivot is the opposite corner from the one being dragged
+            const pivotCorners: Point[] = [
+              { x: maxX, y: maxY }, // Dragging BL, pivot at TR
+              { x: minX, y: maxY }, // Dragging BR, pivot at TL
+              { x: minX, y: minY }, // Dragging TR, pivot at BL
+              { x: maxX, y: minY }, // Dragging TL, pivot at BR
+            ];
+            transformHandleCenter = pivotCorners[i];
+            // Reset cumulative scale tracking
+            transformHandleTotalScaleX = 1;
+            transformHandleTotalScaleY = 1;
+            transformHandlePrevScaleX = 1;
+            transformHandlePrevScaleY = 1;
+            dragStart = clickPoint;
+            e.preventDefault();
+            return;
+          }
+        }
+      }
 
       // Check for transform point click first (highest priority when visible)
       const hitThreshold = VERTEX_SIZE * 2 * state.zoom;
@@ -2833,6 +3132,82 @@ export const Canvas = () => {
         return;
       }
 
+      // Handle transform handle dragging (scale/rotate from bounding box handles)
+      if (isDraggingTransformHandle && transformHandleCenter && transformHandleStartBounds) {
+        const currentPoint = screenToWorld(e, container, state.camera);
+
+        // Check if shift is currently held for aspect ratio preservation
+        transformHandlePreserveAspect = e.shiftKey;
+
+        if (transformHandleType === "rotation") {
+          // Rotation drag
+          const currentAngle = Math.atan2(
+            currentPoint.y - transformHandleCenter.y,
+            currentPoint.x - transformHandleCenter.x
+          );
+          const deltaAngle = currentAngle - (transformHandleStartAngle ?? 0);
+
+          // Track cumulative angle for undo
+          transformHandleTotalAngle += deltaAngle;
+
+          // Rotate selection around center (delta-based)
+          store.rotateSelectionLive(deltaAngle, transformHandleCenter);
+          transformHandleStartAngle = currentAngle;
+        } else if (transformHandleType === "corner") {
+          // Scale drag
+          const bounds = transformHandleStartBounds;
+          const pivot = transformHandleCenter;
+
+          // Calculate cumulative scale based on how far the corner has moved from its ORIGINAL position
+          // Corner indices: 0=BL, 1=BR, 2=TR, 3=TL
+          const originalCorners: Point[] = [
+            { x: bounds.minX, y: bounds.minY },
+            { x: bounds.maxX, y: bounds.minY },
+            { x: bounds.maxX, y: bounds.maxY },
+            { x: bounds.minX, y: bounds.maxY },
+          ];
+          const originalCorner = originalCorners[transformHandleCornerIndex];
+
+          // Distance from pivot to original corner vs current mouse position
+          const originalDist = distance(pivot, originalCorner);
+          const currentDist = distance(pivot, currentPoint);
+
+          if (originalDist > 0.001) {
+            let newTotalScaleX = 1;
+            let newTotalScaleY = 1;
+
+            if (transformHandlePreserveAspect) {
+              // Uniform scale
+              const uniformScale = currentDist / originalDist;
+              newTotalScaleX = uniformScale;
+              newTotalScaleY = uniformScale;
+            } else {
+              // Non-uniform scale: compute X and Y scale separately
+              const originalVec = { x: originalCorner.x - pivot.x, y: originalCorner.y - pivot.y };
+              const currentVec = { x: currentPoint.x - pivot.x, y: currentPoint.y - pivot.y };
+
+              newTotalScaleX = Math.abs(originalVec.x) > 0.001 ? currentVec.x / originalVec.x : 1;
+              newTotalScaleY = Math.abs(originalVec.y) > 0.001 ? currentVec.y / originalVec.y : 1;
+            }
+
+            // Calculate delta scale (how much to scale from previous frame)
+            // If prev was 2x and now is 3x, we need to apply 1.5x delta
+            const deltaScaleX = transformHandlePrevScaleX !== 0 ? newTotalScaleX / transformHandlePrevScaleX : 1;
+            const deltaScaleY = transformHandlePrevScaleY !== 0 ? newTotalScaleY / transformHandlePrevScaleY : 1;
+
+            // Update tracking
+            transformHandleTotalScaleX = newTotalScaleX;
+            transformHandleTotalScaleY = newTotalScaleY;
+            transformHandlePrevScaleX = newTotalScaleX;
+            transformHandlePrevScaleY = newTotalScaleY;
+
+            // Apply delta scale
+            store.scaleSelectionNonUniformLive(deltaScaleX, deltaScaleY, pivot);
+          }
+        }
+        return;
+      }
+
       if (!isDragging || !dragStart || !dragPathId) return;
 
       const point = screenToWorld(e, container, state.camera);
@@ -3142,6 +3517,31 @@ export const Canvas = () => {
         dragTransformPointItemId = null;
         dragTransformPointItemType = null;
         dragTransformPointOriginal = null;
+        dragStart = null;
+        return;
+      }
+
+      // End transform handle drag (scale/rotate)
+      if (isDraggingTransformHandle && transformHandleCenter) {
+        // Commit scale/rotate to undo stack
+        if (transformHandleType === "rotation" && transformHandleTotalAngle !== 0) {
+          store.commitRotateSelection(transformHandleTotalAngle, transformHandleCenter);
+        } else if (transformHandleType === "corner" && (transformHandleTotalScaleX !== 1 || transformHandleTotalScaleY !== 1)) {
+          store.commitScaleSelectionNonUniform(transformHandleTotalScaleX, transformHandleTotalScaleY, transformHandleCenter);
+        }
+        // Reset state
+        isDraggingTransformHandle = false;
+        transformHandleType = null;
+        transformHandleCornerIndex = -1;
+        transformHandleStartBounds = null;
+        transformHandleCenter = null;
+        transformHandleStartAngle = null;
+        transformHandlePreserveAspect = false;
+        transformHandleTotalAngle = 0;
+        transformHandleTotalScaleX = 1;
+        transformHandleTotalScaleY = 1;
+        transformHandlePrevScaleX = 1;
+        transformHandlePrevScaleY = 1;
         dragStart = null;
         return;
       }
