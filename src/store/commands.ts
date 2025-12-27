@@ -152,6 +152,7 @@ export function applyCommand(
     case "translatePath": {
       const dx = isUndo ? -cmd.dx : cmd.dx;
       const dy = isUndo ? -cmd.dy : cmd.dy;
+      const excludePathIds = new Set(cmd.excludePathIds ?? []);
 
       const path = state.paths.find((p) => p.id === cmd.id);
       if (!path) return state;
@@ -171,12 +172,13 @@ export function applyCommand(
       });
 
       // Then, move all connected points on OTHER paths (unless skipSnap is set)
+      // Skip paths that are in excludePathIds (they're being translated by their own command)
       if (!cmd.skipSnap) {
         const movedPoints = new Set<string>();
         for (let i = 0; i < path.segments.length; i++) {
           const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
           for (const connPoint of connectedPoints) {
-            if (connPoint.pathId !== cmd.id) {
+            if (connPoint.pathId !== cmd.id && !excludePathIds.has(connPoint.pathId)) {
               const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
               if (!movedPoints.has(key)) {
                 movedPoints.add(key);
@@ -191,6 +193,7 @@ export function applyCommand(
     }
     case "rotatePath": {
       const angle = isUndo ? -cmd.angle : cmd.angle;
+      const excludePathIds = new Set(cmd.excludePathIds ?? []);
 
       const path = state.paths.find((p) => p.id === cmd.id);
       if (!path) return state;
@@ -210,11 +213,12 @@ export function applyCommand(
       });
 
       // Then, rotate all connected points on OTHER paths around the same center
+      // Skip paths that are in excludePathIds (they're being rotated by their own command)
       const movedPoints = new Set<string>();
       for (let i = 0; i < path.segments.length; i++) {
         const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
         for (const connPoint of connectedPoints) {
-          if (connPoint.pathId !== cmd.id) {
+          if (connPoint.pathId !== cmd.id && !excludePathIds.has(connPoint.pathId)) {
             const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
             if (!movedPoints.has(key)) {
               movedPoints.add(key);
@@ -237,6 +241,7 @@ export function applyCommand(
     case "scalePath": {
       // For undo, we need to scale by 1/scale
       const scale = isUndo ? 1 / cmd.scale : cmd.scale;
+      const excludePathIds = new Set(cmd.excludePathIds ?? []);
 
       const path = state.paths.find((p) => p.id === cmd.id);
       if (!path) return state;
@@ -256,11 +261,12 @@ export function applyCommand(
       });
 
       // Then, scale all connected points on OTHER paths around the same center
+      // Skip paths that are in excludePathIds (they're being scaled by their own command)
       const movedPoints = new Set<string>();
       for (let i = 0; i < path.segments.length; i++) {
         const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
         for (const connPoint of connectedPoints) {
-          if (connPoint.pathId !== cmd.id) {
+          if (connPoint.pathId !== cmd.id && !excludePathIds.has(connPoint.pathId)) {
             const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
             if (!movedPoints.has(key)) {
               movedPoints.add(key);
@@ -284,6 +290,7 @@ export function applyCommand(
       // For undo, we need to scale by 1/scale
       const scaleX = isUndo ? 1 / cmd.scaleX : cmd.scaleX;
       const scaleY = isUndo ? 1 / cmd.scaleY : cmd.scaleY;
+      const excludePathIds = new Set(cmd.excludePathIds ?? []);
 
       const path = state.paths.find((p) => p.id === cmd.id);
       if (!path) return state;
@@ -303,11 +310,12 @@ export function applyCommand(
       });
 
       // Then, scale all connected points on OTHER paths around the same center
+      // Skip paths that are in excludePathIds (they're being scaled by their own command)
       const movedPoints = new Set<string>();
       for (let i = 0; i < path.segments.length; i++) {
         const connectedPoints = getConnectedPoints(state, { pathId: cmd.id, segmentIndex: i, handleType: "anchor" });
         for (const connPoint of connectedPoints) {
-          if (connPoint.pathId !== cmd.id) {
+          if (connPoint.pathId !== cmd.id && !excludePathIds.has(connPoint.pathId)) {
             const key = `${connPoint.pathId}:${connPoint.segmentIndex}`;
             if (!movedPoints.has(key)) {
               movedPoints.add(key);
@@ -515,74 +523,122 @@ export function applyCommand(
     }
     case "deleteAnchor": {
       if (isUndo) {
-        // Restore the previous path state
+        // Restore the previous path state and snap connections
         return {
           ...state,
           paths: state.paths.map((p) =>
             p.id === cmd.id ? cmd.prevPath : p
           ),
+          snapConnections: cmd.prevSnapConnections,
           selection: { pathIds: state.selection.pathIds, points: [] },
         };
       } else {
-        // Delete the anchor by merging segments
+        const path = state.paths.find((p) => p.id === cmd.id);
+        if (!path || path.segments.length <= 3) {
+          return state;
+        }
+
+        const idx = cmd.anchorIndex;
+        const prevIdx = idx === 0 ? path.segments.length - 1 : idx - 1;
+
+        // Get the segments before and after the anchor
+        const prevSeg = path.segments[prevIdx];
+        const currSeg = path.segments[idx];
+
+        // Check if both adjacent segments are straight
+        const bothStraight = isSegmentStraight(prevSeg) && isSegmentStraight(currSeg);
+
+        // Create merged segment: from prev's p0 to curr's p1
+        let mergedSeg: CubicSegment;
+        if (bothStraight) {
+          // If both were straight, make the merged segment straight too
+          const straight = makeStraightControlPoints(prevSeg.p0, currSeg.p1);
+          mergedSeg = {
+            p0: prevSeg.p0,
+            c0: straight.c0,
+            c1: straight.c1,
+            p1: currSeg.p1,
+          };
+        } else {
+          // Keep prev's c0 and curr's c1 for the curve shape
+          mergedSeg = {
+            p0: prevSeg.p0,
+            c0: prevSeg.c0,
+            c1: currSeg.c1,
+            p1: currSeg.p1,
+          };
+        }
+
+        // Build new segments array
+        const newSegments: CubicSegment[] = [];
+        for (let i = 0; i < path.segments.length; i++) {
+          if (i === prevIdx) {
+            newSegments.push(mergedSeg);
+          } else if (i !== idx) {
+            newSegments.push(path.segments[i]);
+          }
+        }
+
+        // Build new anchorMeta array (remove the deleted anchor's metadata)
+        const newAnchorMeta = path.anchorMeta.filter((_, i) => i !== idx);
+
+        // Update snap connections when deleting anchor at idx:
+        // Merged segment position:
+        //   - Normal case (idx > 0): prevIdx = idx-1, merged is at prevIdx
+        //   - Wrap case (idx = 0): prevIdx = len-1, merged is at prevIdx-1 = len-2
+        // Merged segment has:
+        //   c0 = old c0 from prevIdx (preserved)
+        //   c1 = old c1 from idx (moved)
+        // What to remove:
+        //   - c0 at idx: deleted (anchor's outgoing handle)
+        //   - c1 at prevIdx: replaced by c1 from idx (old reference invalid)
+        //   - anchor at idx: deleted
+        // What to update:
+        //   - c1 at idx → c1 at merged segment position
+        //   - Segments > idx shift down by 1
+        //   - For wrap case: c0 at prevIdx also shifts down by 1
+
+        // Calculate where the merged segment ends up
+        const mergedNewIdx = prevIdx > idx ? prevIdx - 1 : prevIdx;
+
+        const newSnapConnections = state.snapConnections
+          .map((conn) => {
+            const newPoints = conn.points
+              .filter((pt) => {
+                if (pt.pathId !== cmd.id) return true;
+                // Remove references to deleted handles
+                if (pt.segmentIndex === idx && pt.handleType === "c0") return false;
+                if (pt.segmentIndex === idx && pt.handleType === "anchor") return false;
+                // Remove old c1 at prevIdx (will be replaced by c1 from idx)
+                if (pt.segmentIndex === prevIdx && pt.handleType === "c1") return false;
+                return true;
+              })
+              .map((pt) => {
+                if (pt.pathId !== cmd.id) return pt;
+                // Update segment indices
+                let newSegIndex = pt.segmentIndex;
+                if (pt.segmentIndex === idx && pt.handleType === "c1") {
+                  // c1 at idx moves to c1 at merged segment position
+                  newSegIndex = mergedNewIdx;
+                } else if (pt.segmentIndex > idx) {
+                  // Shift down by 1
+                  newSegIndex = pt.segmentIndex - 1;
+                }
+                return { ...pt, segmentIndex: newSegIndex };
+              });
+            return { ...conn, points: newPoints };
+          })
+          // Remove connections that now have fewer than 2 points
+          .filter((conn) => conn.points.length >= 2);
+
         return {
           ...state,
-          paths: state.paths.map((p) => {
-            if (p.id !== cmd.id) return p;
-
-            // Can't delete if only 3 or fewer segments (need at least 3 for a valid closed path)
-            if (p.segments.length <= 3) return p;
-
-            const idx = cmd.anchorIndex;
-            const prevIdx = idx === 0 ? p.segments.length - 1 : idx - 1;
-
-            // Get the segments before and after the anchor
-            const prevSeg = p.segments[prevIdx];
-            const currSeg = p.segments[idx];
-
-            // Check if both adjacent segments are straight
-            const bothStraight = isSegmentStraight(prevSeg) && isSegmentStraight(currSeg);
-
-            // Create merged segment: from prev's p0 to curr's p1
-            let mergedSeg: CubicSegment;
-            if (bothStraight) {
-              // If both were straight, make the merged segment straight too
-              const straight = makeStraightControlPoints(prevSeg.p0, currSeg.p1);
-              mergedSeg = {
-                p0: prevSeg.p0,
-                c0: straight.c0,
-                c1: straight.c1,
-                p1: currSeg.p1,
-              };
-            } else {
-              // Keep prev's c0 and curr's c1 for the curve shape
-              mergedSeg = {
-                p0: prevSeg.p0,
-                c0: prevSeg.c0,
-                c1: currSeg.c1,
-                p1: currSeg.p1,
-              };
-            }
-
-            // Build new segments array
-            const newSegments = [];
-            for (let i = 0; i < p.segments.length; i++) {
-              if (i === prevIdx) {
-                newSegments.push(mergedSeg);
-              } else if (i !== idx) {
-                newSegments.push(p.segments[i]);
-              }
-            }
-
-            // Build new anchorMeta array (remove the deleted anchor's metadata)
-            const newAnchorMeta = p.anchorMeta.filter((_, i) => i !== idx);
-
-            return {
-              ...p,
-              segments: newSegments,
-              anchorMeta: newAnchorMeta,
-            };
-          }),
+          paths: state.paths.map((p) =>
+            p.id === cmd.id
+              ? { ...p, segments: newSegments, anchorMeta: newAnchorMeta }
+              : p
+          ),
+          snapConnections: newSnapConnections,
           selection: { pathIds: state.selection.pathIds, points: [] },
         };
       }

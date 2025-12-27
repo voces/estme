@@ -31,16 +31,16 @@ export type Command =
   | { type: "addPath"; path: Path }
   | { type: "deletePath"; path: Path }
   | { type: "selectPath"; prevId: string | null; newId: string | null }
-  | { type: "translatePath"; id: string; dx: number; dy: number; skipSnap?: boolean }
-  | { type: "rotatePath"; id: string; angle: number; center: Point }
-  | { type: "scalePath"; id: string; scale: number; center: Point }
-  | { type: "scalePathNonUniform"; id: string; scaleX: number; scaleY: number; center: Point }
+  | { type: "translatePath"; id: string; dx: number; dy: number; skipSnap?: boolean; excludePathIds?: string[] }
+  | { type: "rotatePath"; id: string; angle: number; center: Point; excludePathIds?: string[] }
+  | { type: "scalePath"; id: string; scale: number; center: Point; excludePathIds?: string[] }
+  | { type: "scalePathNonUniform"; id: string; scaleX: number; scaleY: number; center: Point; excludePathIds?: string[] }
   | { type: "movePoint"; id: string; pointIndex: number; dx: number; dy: number }
   | { type: "moveHandle"; id: string; segmentIndex: number; handleType: HandleType; dx: number; dy: number; mirrorMove?: { segmentIndex: number; handleType: HandleType; dx: number; dy: number } }
   | { type: "setAnchorMeta"; id: string; anchorIndex: number; prevMeta: AnchorMeta; newMeta: AnchorMeta }
   | { type: "toggleControl"; id: string; anchorIndex: number; handleType: "left" | "right"; prevMeta: AnchorMeta; newMeta: AnchorMeta; prevControlPos: Point; newControlPos: Point }
   | { type: "setMirror"; id: string; anchorIndex: number; prevMeta: AnchorMeta; newMeta: AnchorMeta; prevC0: Point; newC0: Point; prevC1: Point; newC1: Point }
-  | { type: "deleteAnchor"; id: string; anchorIndex: number; prevPath: Path }
+  | { type: "deleteAnchor"; id: string; anchorIndex: number; prevPath: Path; prevSnapConnections: SnapConnection[] }
   | { type: "setPathFill"; id: string; prevFill: string; newFill: string }
   | { type: "setPathOpacity"; id: string; prevOpacity: number; newOpacity: number }
   | { type: "insertAnchor"; id: string; segmentIndex: number; t: number; prevPath: Path }

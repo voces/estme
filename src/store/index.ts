@@ -1,7 +1,7 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
 import { booleanOperation, canBooleanOp, uniteMultiplePaths } from "../pathBool.ts";
-import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, scalePointAroundNonUniform, getPathTransformPoint, getSelectionTransformPoint, getPathBounds, getAnimatedPathBounds } from "../geometry.ts";
+import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, scalePointAroundNonUniform, getPathTransformPoint, getGroupTransformPoint, getSelectionTransformPoint, getPathBounds, getAnimatedPathBounds } from "../geometry.ts";
 import { applyCommand } from "./commands.ts";
 import { generateId, saveImage, setCurrentDocumentId } from "../storage.ts";
 import {
@@ -606,13 +606,13 @@ export const store = {
         ).length;
         if (path.segments.length - pendingDeletions <= 3) continue;
 
-        // Update snap connection indices for anchors on this path
-        store.updateConnectionIndices(pathId, segmentIndex);
+        // The command will update snap connections itself, save current state for undo
         commands.push({
           type: "deleteAnchor",
           id: pathId,
           anchorIndex: segmentIndex,
           prevPath: path,
+          prevSnapConnections: [...state.snapConnections],
         });
       } else if (handleType === "c0") {
         // Delete c0 control point - collapse to anchor (same as toggle off)
@@ -1030,11 +1030,16 @@ export const store = {
   // Commit translation for entire selection as a batch
   commitTranslateSelection: (dx: number, dy: number) => {
     const { selection, paths } = state;
+    const translatedPathIds = selection.pathIds.filter((id) => {
+      const path = paths.find((p) => p.id === id);
+      return path && !path.locked;
+    });
+
     const commands: Command[] = [];
-    for (const pathId of selection.pathIds) {
-      const path = paths.find((p) => p.id === pathId);
-      if (path?.locked) continue; // Skip locked paths
-      commands.push({ type: "translatePath", id: pathId, dx, dy });
+    for (const pathId of translatedPathIds) {
+      // Exclude other paths in the selection from connected point translation
+      const excludePathIds = translatedPathIds.filter((id) => id !== pathId);
+      commands.push({ type: "translatePath", id: pathId, dx, dy, excludePathIds });
     }
     // For individual points, we'd need movePoint commands
     for (const pt of selection.points) {
@@ -1057,15 +1062,20 @@ export const store = {
   // Commit rotation for entire selection as a batch
   commitRotateSelection: (angle: number, center: Point) => {
     const { selection, paths } = state;
-    const commands: Command[] = [];
-    for (const pathId of selection.pathIds) {
-      const path = paths.find((p) => p.id === pathId);
-      if (path?.locked) continue; // Skip locked paths
-      commands.push({ type: "rotatePath", id: pathId, angle, center });
-    }
+    const rotatedPathIds = selection.pathIds.filter((id) => {
+      const path = paths.find((p) => p.id === id);
+      return path && !path.locked;
+    });
     // Note: rotating individual points is just translation in a circle, complex to implement
     // For now, only full paths support rotation
-    if (commands.length === 0) return;
+    if (rotatedPathIds.length === 0) return;
+
+    const commands: Command[] = [];
+    for (const pathId of rotatedPathIds) {
+      // Exclude other paths in the selection from connected point rotation
+      const excludePathIds = rotatedPathIds.filter((id) => id !== pathId);
+      commands.push({ type: "rotatePath", id: pathId, angle, center, excludePathIds });
+    }
     const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
     state = {
       ...state,
@@ -1258,13 +1268,18 @@ export const store = {
   // Commit scale for entire selection as a batch
   commitScaleSelection: (scale: number, center: Point) => {
     const { selection, paths } = state;
+    const scaledPathIds = selection.pathIds.filter((id) => {
+      const path = paths.find((p) => p.id === id);
+      return path && !path.locked;
+    });
+    if (scaledPathIds.length === 0) return;
+
     const commands: Command[] = [];
-    for (const pathId of selection.pathIds) {
-      const path = paths.find((p) => p.id === pathId);
-      if (path?.locked) continue; // Skip locked paths
-      commands.push({ type: "scalePath", id: pathId, scale, center });
+    for (const pathId of scaledPathIds) {
+      // Exclude other paths in the selection from connected point scaling
+      const excludePathIds = scaledPathIds.filter((id) => id !== pathId);
+      commands.push({ type: "scalePath", id: pathId, scale, center, excludePathIds });
     }
-    if (commands.length === 0) return;
     const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
     state = {
       ...state,
@@ -1277,13 +1292,18 @@ export const store = {
   // Commit non-uniform scale for entire selection as a batch
   commitScaleSelectionNonUniform: (scaleX: number, scaleY: number, center: Point) => {
     const { selection, paths } = state;
+    const scaledPathIds = selection.pathIds.filter((id) => {
+      const path = paths.find((p) => p.id === id);
+      return path && !path.locked;
+    });
+    if (scaledPathIds.length === 0) return;
+
     const commands: Command[] = [];
-    for (const pathId of selection.pathIds) {
-      const path = paths.find((p) => p.id === pathId);
-      if (path?.locked) continue; // Skip locked paths
-      commands.push({ type: "scalePathNonUniform", id: pathId, scaleX, scaleY, center });
+    for (const pathId of scaledPathIds) {
+      // Exclude other paths in the selection from connected point scaling
+      const excludePathIds = scaledPathIds.filter((id) => id !== pathId);
+      commands.push({ type: "scalePathNonUniform", id: pathId, scaleX, scaleY, center, excludePathIds });
     }
-    if (commands.length === 0) return;
     const cmd: Command = commands.length === 1 ? commands[0] : { type: "batch", commands };
     state = {
       ...state,
@@ -2627,6 +2647,46 @@ export const store = {
             const mirroredConnected = store.getConnectedPoints({ pathId: id, segmentIndex: mirroredSegmentIndex, handleType: mirroredHandleType });
             for (const connPoint of mirroredConnected) {
               if (connPoint.handleType === "c0" || connPoint.handleType === "c1") {
+                // Check if this connected point will already be mirrored by another point
+                // that was moved via snap propagation from the primary handle.
+                // This prevents double-movement when both handles are snapped to handles
+                // on another anchor that also has mirroring enabled.
+                const connPath = state.paths.find((p) => p.id === connPoint.pathId);
+                if (connPath) {
+                  // Find the anchor for this connected handle
+                  let connAnchorIndex: number;
+                  let connMirroredSegIdx: number;
+                  let connMirroredHandleType: HandleType;
+                  if (connPoint.handleType === "c0") {
+                    connAnchorIndex = connPoint.segmentIndex;
+                    connMirroredSegIdx = connPoint.segmentIndex === 0
+                      ? (connPath.closed ? connPath.segments.length - 1 : -1)
+                      : connPoint.segmentIndex - 1;
+                    connMirroredHandleType = "c1";
+                  } else {
+                    const nextIdx = connPath.closed
+                      ? (connPoint.segmentIndex + 1) % connPath.segments.length
+                      : connPoint.segmentIndex + 1;
+                    connAnchorIndex = nextIdx;
+                    connMirroredSegIdx = (connPath.closed || connPoint.segmentIndex < connPath.segments.length - 1) ? nextIdx : -1;
+                    connMirroredHandleType = "c0";
+                  }
+
+                  // Check if the connected anchor has mirroring enabled
+                  const connAnchorMeta = connPath.anchorMeta?.[connAnchorIndex];
+                  const connHasMirroring = connAnchorMeta?.mirrorAngle || connAnchorMeta?.mirrorDistance;
+
+                  if (connHasMirroring && connMirroredSegIdx >= 0) {
+                    // The connected handle's mirror would be at connMirroredSegIdx:connMirroredHandleType
+                    // Check if that mirror handle was already moved (meaning the connected handle
+                    // will have been mirrored already)
+                    const connMirrorKey = `${connPoint.pathId}:${connMirroredSegIdx}:${connMirroredHandleType}`;
+                    if (moved.has(connMirrorKey)) {
+                      // Skip - this handle was already set via mirroring from its opposite handle
+                      continue;
+                    }
+                  }
+                }
                 store.moveHandleLive(connPoint.pathId, connPoint.segmentIndex, connPoint.handleType, mirroredDx, mirroredDy, moved);
               }
             }
@@ -5650,22 +5710,12 @@ export const store = {
 
   // Animation actions
   addAnimationClip: (clip: AnimationClip) => {
-    // Add empty keyframe at time 0 for all existing paths (user will tick properties they want)
-    const clipWithDefaults: AnimationClip = {
-      ...clip,
-      parts: { ...clip.parts },
-    };
-    for (const path of state.paths) {
-      // Create an empty unified keyframe at t=0 (no properties set)
-      clipWithDefaults.parts[path.id] = [{ t: 0 }];
-    }
-    executeCommand({ type: "addAnimationClip", clip: clipWithDefaults });
-    // Auto-select the new clip and select the first keyframe if there's a path
-    const firstPath = state.paths[0];
+    executeCommand({ type: "addAnimationClip", clip });
+    // Auto-select the new clip
     state = {
       ...state,
-      currentClipId: clipWithDefaults.id,
-      selectedKeyframes: firstPath ? [{ pathId: firstPath.id, time: 0 }] : [],
+      currentClipId: clip.id,
+      selectedKeyframes: [],
     };
     notify();
   },
@@ -5692,7 +5742,8 @@ export const store = {
   },
 
   selectAnimationClip: (clipId: string | null) => {
-    state = { ...state, currentClipId: clipId };
+    // Clear keyframe selection when switching clips since keyframes are clip-specific
+    state = { ...state, currentClipId: clipId, selectedKeyframes: [] };
     try {
       if (clipId) {
         localStorage.setItem("estme:currentClipId", clipId);
@@ -7140,7 +7191,8 @@ export const store = {
   },
 
   // Rotate all selected paths/groups/rasters in animation mode
-  rotateSelectionTransform: (angle: number) => {
+  // If center is provided and multiple items are selected, rotate around that common center
+  rotateSelectionTransform: (angle: number, center?: Point) => {
     if (!state.currentClipId) return;
 
     const clip = state.animationClips.find((c) => c.id === state.currentClipId);
@@ -7150,35 +7202,63 @@ export const store = {
     const selectedIds = state.selection.pathIds;
     if (selectedIds.length === 0) return;
 
-    // Collect all animatable part IDs: paths, groups, and rasters
-    const partIds: string[] = [];
+    // Collect all animatable part IDs with their transform points
+    const parts: { id: string; transformPoint: Point }[] = [];
     for (const id of selectedIds) {
       const group = state.groups.find((g) => g.id === id);
       if (group) {
-        partIds.push(id);
+        const tp = getGroupTransformPoint(group, state.paths, state.groups);
+        parts.push({ id, transformPoint: tp });
         continue;
       }
       const raster = state.rasters.find((r) => r.id === id);
       if (raster) {
-        partIds.push(id);
+        // For rasters, use their center position
+        const tp = { x: raster.x, y: raster.y };
+        parts.push({ id, transformPoint: tp });
         continue;
       }
       const path = state.paths.find((p) => p.id === id);
       if (path) {
-        partIds.push(id);
+        const tp = getPathTransformPoint(path);
+        parts.push({ id, transformPoint: tp });
       }
     }
 
-    if (partIds.length === 0) return;
+    if (parts.length === 0) return;
 
     // Update keyframes for all selected parts
     const newParts = { ...clip.parts };
-    for (const partId of partIds) {
-      const prevAnimation = newParts[partId] ?? [];
-      const currentRot = getPropertyValue(prevAnimation, "rot", t);
+    const useCommonCenter = center && parts.length > 1;
 
-      const newAnimation = setKeyframeProperty(prevAnimation, t, "rot", currentRot + angle);
-      newParts[partId] = newAnimation;
+    for (const part of parts) {
+      const prevAnimation = newParts[part.id] ?? [];
+      const currentRot = getPropertyValue(prevAnimation, "rot", t);
+      const currentTx = getPropertyValue(prevAnimation, "tx", t);
+      const currentTy = getPropertyValue(prevAnimation, "ty", t);
+
+      let newAnimation = setKeyframeProperty(prevAnimation, t, "rot", currentRot + angle);
+
+      // If rotating around a common center, also apply translation offset
+      if (useCommonCenter) {
+        // Get the animated position of this part's transform point
+        const animatedTp = {
+          x: part.transformPoint.x + currentTx,
+          y: part.transformPoint.y + currentTy,
+        };
+
+        // Rotate the animated transform point around the common center
+        const rotated = rotatePoint(animatedTp, center, angle);
+
+        // The new translation is the difference from the base transform point
+        const newTx = rotated.x - part.transformPoint.x;
+        const newTy = rotated.y - part.transformPoint.y;
+
+        newAnimation = setKeyframeProperty(newAnimation, t, "tx", newTx);
+        newAnimation = setKeyframeProperty(newAnimation, t, "ty", newTy);
+      }
+
+      newParts[part.id] = newAnimation;
     }
 
     state = {
@@ -7187,7 +7267,7 @@ export const store = {
         c.id === state.currentClipId ? { ...c, parts: newParts } : c
       ),
       // Select keyframes for all parts in selection
-      selectedKeyframes: partIds.map((partId) => ({ pathId: partId, time: t })),
+      selectedKeyframes: parts.map((part) => ({ pathId: part.id, time: t })),
     };
     throttledNotify();
   },

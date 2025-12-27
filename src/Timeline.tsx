@@ -1282,14 +1282,15 @@ export const Timeline = () => {
         </div>
 
         <span className={styles.timeDisplay}>
-          {playbackTime.toFixed(2)}s /
+          {playbackTime.toFixed(2)}s /{" "}
           <input
             type="number"
             className={styles.durationInput}
-            value={currentClip?.duration ?? 1}
+            value={Math.round((currentClip?.duration ?? 1) * 1000) / 1000}
             onChange={handleDurationChange}
             step={0.1}
             min={0.1}
+            max={60}
           />
           s
         </span>

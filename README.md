@@ -4,7 +4,7 @@
 
 ## Live Demo
 
-https://verit.github.io/estme/
+https://voces.github.io/estme/
 
 ## Features
 

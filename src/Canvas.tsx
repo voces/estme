@@ -3347,7 +3347,8 @@ export const Canvas = () => {
         if (activeClipId) {
           // Animation mode: use transform-based rotation
           if (isDraggingSelection) {
-            store.rotateSelectionTransform(deltaAngle);
+            // Pass dragCenter for multi-selection to rotate around common center
+            store.rotateSelectionTransform(deltaAngle, dragCenter ?? undefined);
           } else {
             store.rotatePathTransform(dragPathId!, deltaAngle);
           }

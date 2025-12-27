@@ -70,8 +70,10 @@ export const MenuBar = () => {
   const [editName, setEditName] = useState("");
   const [showOpenDialog, setShowOpenDialog] = useState(false);
   const [savedDocuments, setSavedDocuments] = useState<StoredDocument[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
   const menuBarRef = useRef<HTMLDivElement>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const documentName = useStore((s) => s.documentName);
   const documentId = useStore((s) => s.documentId);
   const isDirty = useStore((s) => s.isDirty);
@@ -453,11 +455,17 @@ export const MenuBar = () => {
     try {
       const docs = await listDocuments();
       setSavedDocuments(docs);
+      setSearchQuery("");
       setShowOpenDialog(true);
     } catch (err) {
       alert("Failed to list documents: " + (err instanceof Error ? err.message : "Unknown error"));
     }
   };
+
+  // Filter documents by search query
+  const filteredDocuments = savedDocuments.filter((doc) =>
+    doc.name.toLowerCase().includes(searchQuery.toLowerCase())
+  );
 
   // Keep refs updated for keyboard shortcuts
   handleSaveRef.current = handleSaveToStorage;
@@ -620,11 +628,22 @@ export const MenuBar = () => {
               <button className={styles.closeButton} onClick={() => setShowOpenDialog(false)}>×</button>
             </div>
             <div className={styles.dialogContent}>
+              <input
+                ref={searchInputRef}
+                type="text"
+                className={styles.searchInput}
+                placeholder="Search documents..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                autoFocus
+              />
               {savedDocuments.length === 0 ? (
                 <div className={styles.emptyMessage}>No saved documents</div>
+              ) : filteredDocuments.length === 0 ? (
+                <div className={styles.emptyMessage}>No matching documents</div>
               ) : (
                 <div className={styles.documentList}>
-                  {savedDocuments.map((doc) => (
+                  {filteredDocuments.map((doc) => (
                     <div
                       key={doc.id}
                       className={`${styles.documentItem} ${doc.id === documentId ? styles.current : ""}`}
