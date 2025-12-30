@@ -648,7 +648,7 @@ export const Canvas = () => {
     const instanceProps = store.getState().instanceProperties;
     mesh.setAlphaAt(0, instanceProps.opacity);
     // Use tint for vertex color multiplier
-    mesh.setTintAt(0, new THREE.Color(instanceProps.vertexColor), 1);
+    mesh.setTintAt(0, new THREE.Color(instanceProps.vertexColor));
     mesh.setPlayerColorAt(0, new THREE.Color(instanceProps.accentColor));
     mesh.setMinimapMaskAt(0, instanceProps.minimapMask ? 1 : 0);
 
@@ -663,7 +663,7 @@ export const Canvas = () => {
 
     state.modelPreview.setAlphaAt(0, instanceProperties.opacity);
     // Use tint for vertex color multiplier
-    state.modelPreview.setTintAt(0, new THREE.Color(instanceProperties.vertexColor), 1);
+    state.modelPreview.setTintAt(0, new THREE.Color(instanceProperties.vertexColor));
     state.modelPreview.setPlayerColorAt(0, new THREE.Color(instanceProperties.accentColor));
     state.modelPreview.setMinimapMaskAt(0, instanceProperties.minimapMask ? 1 : 0);
   }, [instanceProperties]);
@@ -1856,7 +1856,7 @@ export const Canvas = () => {
       frameId = requestAnimationFrame(render);
       // Update animation time for AnimatedInstancedMesh
       const timeSeconds = (performance.now() - startTime) / 1000;
-      updateAnimationTime(animatedMeshMaterial, timeSeconds);
+      updateAnimationTime(timeSeconds);
       renderer.render(scene, camera);
     };
     render();
@@ -1916,7 +1916,8 @@ export const Canvas = () => {
     let startDistance: number | null = null;
     let totalDx = 0;
     let totalDy = 0;
-    let totalAngle = 0;
+    let totalAngle = 0; // Raw cumulative angle (unsnapped)
+    let appliedAngle = 0; // Currently applied angle (may be snapped)
     let totalScale = 1;
     let isRotating = false;
     let isScaling = false;
@@ -1962,7 +1963,8 @@ export const Canvas = () => {
     let transformHandleStartAngle: number | null = null;
     let transformHandlePreserveAspect = false;
     // Cumulative tracking for undo/redo
-    let transformHandleTotalAngle = 0; // Cumulative rotation angle
+    let transformHandleTotalAngle = 0; // Cumulative rotation angle (unsnapped, for tracking raw input)
+    let transformHandleAppliedAngle = 0; // Currently applied angle (may be snapped)
     let transformHandleTotalScaleX = 1; // Cumulative X scale
     let transformHandleTotalScaleY = 1; // Cumulative Y scale
     let transformHandlePrevScaleX = 1; // Previous frame's scale (for delta calculation)
@@ -2207,6 +2209,7 @@ export const Canvas = () => {
               clickPoint.x - transformHandleCenter.x
             );
             transformHandleTotalAngle = 0; // Reset cumulative angle
+            transformHandleAppliedAngle = 0; // Reset applied angle
             dragStart = clickPoint;
             e.preventDefault();
             return;
@@ -2495,6 +2498,7 @@ export const Canvas = () => {
             totalDx = 0;
             totalDy = 0;
             totalAngle = 0;
+            appliedAngle = 0;
             totalScale = 1;
             isRotating = false;
             isScaling = false;
@@ -3046,6 +3050,7 @@ export const Canvas = () => {
         totalDx = 0;
         totalDy = 0;
         totalAngle = 0;
+        appliedAngle = 0;
         totalScale = 1;
         isRotating = false;
         isScaling = false;
@@ -3145,14 +3150,27 @@ export const Canvas = () => {
             currentPoint.y - transformHandleCenter.y,
             currentPoint.x - transformHandleCenter.x
           );
-          const deltaAngle = currentAngle - (transformHandleStartAngle ?? 0);
+          const rawDelta = currentAngle - (transformHandleStartAngle ?? 0);
 
-          // Track cumulative angle for undo
-          transformHandleTotalAngle += deltaAngle;
+          // Track cumulative angle (unsnapped) for computing snapped position
+          transformHandleTotalAngle += rawDelta;
+          transformHandleStartAngle = currentAngle;
+
+          // If shift is held, snap to 15-degree intervals
+          let targetAngle = transformHandleTotalAngle;
+          if (e.shiftKey) {
+            const snap = Math.PI / 12; // 15 degrees
+            targetAngle = Math.round(transformHandleTotalAngle / snap) * snap;
+          }
+
+          // Calculate delta from current applied angle to target
+          const deltaAngle = targetAngle - transformHandleAppliedAngle;
+          transformHandleAppliedAngle = targetAngle;
 
           // Rotate selection around center (delta-based)
-          store.rotateSelectionLive(deltaAngle, transformHandleCenter);
-          transformHandleStartAngle = currentAngle;
+          if (Math.abs(deltaAngle) > 0.0001) {
+            store.rotateSelectionLive(deltaAngle, transformHandleCenter);
+          }
         } else if (transformHandleType === "corner") {
           // Scale drag
           const bounds = transformHandleStartBounds;
@@ -3337,27 +3355,40 @@ export const Canvas = () => {
           point.y - dragCenter.y,
           point.x - dragCenter.x,
         );
-        const deltaAngle = currentAngle - startAngle;
-        totalAngle += deltaAngle;
+        const rawDelta = currentAngle - startAngle;
+        totalAngle += rawDelta;
         startAngle = currentAngle;
+
+        // If shift is held, snap to 15-degree intervals
+        let targetAngle = totalAngle;
+        if (e.shiftKey) {
+          const snap = Math.PI / 12; // 15 degrees
+          targetAngle = Math.round(totalAngle / snap) * snap;
+        }
+
+        // Calculate delta from current applied angle to target
+        const deltaAngle = targetAngle - appliedAngle;
+        appliedAngle = targetAngle;
 
         // Always update store (throttles React renders internally)
         // In animation mode, use transform-based rotation
-        const { currentClipId: activeClipId } = store.getState();
-        if (activeClipId) {
-          // Animation mode: use transform-based rotation
-          if (isDraggingSelection) {
-            // Pass dragCenter for multi-selection to rotate around common center
-            store.rotateSelectionTransform(deltaAngle, dragCenter ?? undefined);
+        if (Math.abs(deltaAngle) > 0.0001) {
+          const { currentClipId: activeClipId } = store.getState();
+          if (activeClipId) {
+            // Animation mode: use transform-based rotation
+            if (isDraggingSelection) {
+              // Pass dragCenter for multi-selection to rotate around common center
+              store.rotateSelectionTransform(deltaAngle, dragCenter ?? undefined);
+            } else {
+              store.rotatePathTransform(dragPathId!, deltaAngle);
+            }
           } else {
-            store.rotatePathTransform(dragPathId!, deltaAngle);
-          }
-        } else {
-          // Normal mode: geometry-based rotation
-          if (isDraggingSelection) {
-            store.rotateSelectionLive(deltaAngle, dragCenter!);
-          } else {
-            store.rotatePathLive(dragPathId!, deltaAngle, dragCenter!);
+            // Normal mode: geometry-based rotation
+            if (isDraggingSelection) {
+              store.rotateSelectionLive(deltaAngle, dragCenter!);
+            } else {
+              store.rotatePathLive(dragPathId!, deltaAngle, dragCenter!);
+            }
           }
         }
       } else {
@@ -3525,8 +3556,8 @@ export const Canvas = () => {
       // End transform handle drag (scale/rotate)
       if (isDraggingTransformHandle && transformHandleCenter) {
         // Commit scale/rotate to undo stack
-        if (transformHandleType === "rotation" && transformHandleTotalAngle !== 0) {
-          store.commitRotateSelection(transformHandleTotalAngle, transformHandleCenter);
+        if (transformHandleType === "rotation" && transformHandleAppliedAngle !== 0) {
+          store.commitRotateSelection(transformHandleAppliedAngle, transformHandleCenter);
         } else if (transformHandleType === "corner" && (transformHandleTotalScaleX !== 1 || transformHandleTotalScaleY !== 1)) {
           store.commitScaleSelectionNonUniform(transformHandleTotalScaleX, transformHandleTotalScaleY, transformHandleCenter);
         }
@@ -3539,6 +3570,7 @@ export const Canvas = () => {
         transformHandleStartAngle = null;
         transformHandlePreserveAspect = false;
         transformHandleTotalAngle = 0;
+        transformHandleAppliedAngle = 0;
         transformHandleTotalScaleX = 1;
         transformHandleTotalScaleY = 1;
         transformHandlePrevScaleX = 1;
@@ -3702,7 +3734,7 @@ export const Canvas = () => {
               store.commitScale(dragPathId, totalScale, dragCenter);
             }
           }
-        } else if (isRotating && totalAngle !== 0 && dragCenter) {
+        } else if (isRotating && appliedAngle !== 0 && dragCenter) {
           if (activeClipId) {
             // Animation mode: commit transform-based rotation (with keyframes)
             if (isDraggingSelection && dragPrevAnimations) {
@@ -3713,9 +3745,9 @@ export const Canvas = () => {
           } else {
             // Normal mode: geometry-based rotation
             if (isDraggingSelection) {
-              store.commitRotateSelection(totalAngle, dragCenter);
+              store.commitRotateSelection(appliedAngle, dragCenter);
             } else {
-              store.commitRotate(dragPathId, totalAngle, dragCenter);
+              store.commitRotate(dragPathId, appliedAngle, dragCenter);
             }
           }
         } else if (totalDx !== 0 || totalDy !== 0) {
@@ -3774,6 +3806,7 @@ export const Canvas = () => {
       totalDx = 0;
       totalDy = 0;
       totalAngle = 0;
+      appliedAngle = 0;
       totalScale = 1;
       isRotating = false;
       isScaling = false;
