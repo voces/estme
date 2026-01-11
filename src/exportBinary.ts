@@ -45,6 +45,7 @@
 
 import { Path, Group, CubicSegment } from "./types.ts";
 import { AnimationClip } from "./animation.ts";
+import { averageColors, getAnchorColor } from "./geometry.ts";
 
 // Float16 encoding/decoding
 function floatToFloat16(value: number): number {
@@ -294,7 +295,11 @@ export function exportBinary(
     if (hasVC) flags |= 8;
 
     w.writeU8(flags);
-    w.writeU24(hexToInt(path.fill));
+    // If path has vertex colors, compute average for the base fill color
+    const fillColor = hasVC
+      ? averageColors(path.anchorMeta.map((_, i) => getAnchorColor(path, i)))
+      : path.fill;
+    w.writeU24(hexToInt(fillColor));
     w.writeU8(Math.round(path.opacity * 255));
 
     if (hasParent) {

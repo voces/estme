@@ -7580,9 +7580,16 @@ export const store = {
       showTransformPoints: state.showTransformPoints,
       // Clear selection for new document
       selection: emptySelection,
+      // Clear animation clip selection (new doc has no clips)
+      currentClipId: null,
+      selectedKeyframes: [],
     };
     setCurrentDocumentId(newId);
     saveSelection(emptySelection);
+    // Clear persisted clip selection
+    try {
+      localStorage.removeItem("estme:currentClipId");
+    } catch { /* ignore */ }
     notify();
   },
 

@@ -4,6 +4,7 @@ import { saveDocument, loadDocument, loadDocumentById, listDocuments, deleteDocu
 import { importSvg } from "./svgImport.ts";
 import { exportBinary } from "./exportBinary.ts";
 import { importBinary } from "./importBinary.ts";
+import { exportSvg } from "./exportSvg.ts";
 import styles from "./MenuBar.module.css";
 
 // Helper to load a file (used by both file input and drag-drop)
@@ -407,6 +408,26 @@ export const MenuBar = () => {
     }
   };
 
+  // Export SVG format
+  const handleExportSvg = () => {
+    setOpenMenu(null);
+    try {
+      const state = store.getState();
+      const svg = exportSvg(state.paths, state.groups);
+      const blob = new Blob([svg], { type: "image/svg+xml" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${documentName}.svg`;
+      a.click();
+
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert("Export failed: " + (err instanceof Error ? err.message : "Unknown error"));
+    }
+  };
+
   // Save to IndexedDB
   const handleSaveToStorage = async () => {
     setOpenMenu(null);
@@ -563,6 +584,9 @@ export const MenuBar = () => {
               </div>
               <div className={styles.dropdownItem} onClick={handleExportBinary}>
                 <span>Export (.estb)</span>
+              </div>
+              <div className={styles.dropdownItem} onClick={handleExportSvg}>
+                <span>Export (.svg)</span>
               </div>
               <div className={styles.separator} />
               <div className={styles.dropdownItem} onClick={handleRename}>
