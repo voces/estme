@@ -15,7 +15,7 @@ async function loadFile(file: File): Promise<void> {
   if (fileName.endsWith(".estb")) {
     const buffer = await file.arrayBuffer();
     const state = store.getState();
-    const { paths, groups, animationClips, pathCounter, groupCounter } = importBinary(
+    const { paths, groups, cameras, animationClips, pathCounter, groupCounter } = importBinary(
       buffer,
       state.pathCounter,
       state.groupCounter
@@ -25,6 +25,7 @@ async function loadFile(file: File): Promise<void> {
       name: docName,
       paths,
       groups,
+      cameras,
       snapConnections: [],
       animationClips,
       pathCounter,
@@ -72,6 +73,11 @@ export const MenuBar = () => {
   const [showOpenDialog, setShowOpenDialog] = useState(false);
   const [savedDocuments, setSavedDocuments] = useState<StoredDocument[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
+  const [showGitHubDialog, setShowGitHubDialog] = useState(false);
+  const [gitHubAssets, setGitHubAssets] = useState<{ name: string; download_url: string }[]>([]);
+  const [gitHubLoading, setGitHubLoading] = useState(false);
+  const [gitHubError, setGitHubError] = useState<string | null>(null);
+  const [gitHubSearchQuery, setGitHubSearchQuery] = useState("");
   const menuBarRef = useRef<HTMLDivElement>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -208,15 +214,18 @@ export const MenuBar = () => {
 
       // Check file extension
       const fileName = file.name.toLowerCase();
-      const validExtensions = [".estme", ".estb", ".json", ".svg"];
+      const imageExtensions = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
+      const validExtensions = [".estme", ".estb", ".json", ".svg", ...imageExtensions];
       if (!validExtensions.some((ext) => fileName.endsWith(ext))) {
-        alert("Unsupported file type. Please drop .estme, .estb, .json, or .svg files.");
+        alert("Unsupported file type. Please drop .estme, .estb, .json, .svg, or image files.");
         return;
       }
 
       try {
-        // For SVG files, add paths to the existing document instead of replacing
-        if (fileName.endsWith(".svg")) {
+        // For image files, add as raster
+        if (imageExtensions.some((ext) => fileName.endsWith(ext))) {
+          await store._pasteImageBlob(file);
+        } else if (fileName.endsWith(".svg")) {
           const text = await file.text();
           const state = store.getState();
           const { paths, groups } = importSvg(
@@ -368,6 +377,95 @@ export const MenuBar = () => {
     setOpenMenu(null);
   };
 
+  // Load from GitHub
+  const handleLoadFromGitHub = async () => {
+    setOpenMenu(null);
+    setShowGitHubDialog(true);
+    setGitHubSearchQuery("");
+    setGitHubError(null);
+
+    if (gitHubAssets.length > 0) return; // Already fetched
+
+    setGitHubLoading(true);
+    try {
+      const res = await fetch(
+        "https://api.github.com/repos/voces/emoji-sheep-tag/contents/client/assets"
+      );
+      if (!res.ok) throw new Error(`GitHub API returned ${res.status}`);
+      const files: { name: string; download_url: string }[] = await res.json();
+      const filtered = files.filter(
+        (f) => f.name.endsWith(".estb") || f.name.endsWith(".estme") || f.name.endsWith(".svg")
+      );
+      setGitHubAssets(filtered);
+    } catch (err) {
+      setGitHubError(err instanceof Error ? err.message : "Failed to fetch assets");
+    } finally {
+      setGitHubLoading(false);
+    }
+  };
+
+  const handleSelectGitHubAsset = async (asset: { name: string; download_url: string }) => {
+    try {
+      if (asset.name.endsWith(".estb")) {
+        // LFS-tracked files need the media URL instead of raw
+        const mediaUrl = `https://media.githubusercontent.com/media/voces/emoji-sheep-tag/refs/heads/master/client/assets/${asset.name}`;
+        const res = await fetch(mediaUrl);
+        if (!res.ok) throw new Error(`Failed to download ${asset.name}`);
+        const buffer = await res.arrayBuffer();
+        const state = store.getState();
+        const { paths, groups, cameras, animationClips, pathCounter, groupCounter } = importBinary(
+          buffer,
+          state.pathCounter,
+          state.groupCounter
+        );
+        const docName = asset.name.replace(/\.estb$/i, "");
+        store.loadDocument({
+          name: docName,
+          paths,
+          groups,
+          cameras,
+          snapConnections: [],
+          animationClips,
+          pathCounter,
+          groupCounter,
+        }, null);
+      } else if (asset.name.endsWith(".svg")) {
+        const res = await fetch(asset.download_url);
+        if (!res.ok) throw new Error(`Failed to download ${asset.name}`);
+        const text = await res.text();
+        const state = store.getState();
+        const { paths, groups, snapConnections, newPathCounter, newGroupCounter } = importSvg(
+          text,
+          state.pathCounter,
+          state.groupCounter
+        );
+        if (paths.length === 0) throw new Error("No paths found in SVG file");
+        const docName = asset.name.replace(/\.svg$/i, "");
+        store.loadDocument({
+          name: docName,
+          paths,
+          groups,
+          snapConnections,
+          animationClips: [],
+          pathCounter: newPathCounter,
+          groupCounter: newGroupCounter,
+        }, null);
+      } else {
+        const res = await fetch(asset.download_url);
+        if (!res.ok) throw new Error(`Failed to download ${asset.name}`);
+        const data = await res.json();
+        store.loadDocument(data, null);
+      }
+      setShowGitHubDialog(false);
+    } catch (err) {
+      alert("Failed to load asset: " + (err instanceof Error ? err.message : "Unknown error"));
+    }
+  };
+
+  const filteredGitHubAssets = gitHubAssets.filter((a) =>
+    a.name.toLowerCase().includes(gitHubSearchQuery.toLowerCase())
+  );
+
   // Download to file
   const handleDownload = () => {
     const data = store.getDocumentData();
@@ -393,6 +491,7 @@ export const MenuBar = () => {
         state.paths,
         state.groups,
         state.animationClips,
+        state.cameras,
       );
       const blob = new Blob([binary], { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
@@ -413,7 +512,7 @@ export const MenuBar = () => {
     setOpenMenu(null);
     try {
       const state = store.getState();
-      const svg = exportSvg(state.paths, state.groups);
+      const svg = exportSvg(state.paths, state.groups, state.cameras);
       const blob = new Blob([svg], { type: "image/svg+xml" });
       const url = URL.createObjectURL(blob);
 
@@ -579,8 +678,11 @@ export const MenuBar = () => {
               <div className={styles.dropdownItem} onClick={handleLoadFromFile}>
                 <span>Load from file...</span>
               </div>
+              <div className={styles.dropdownItem} onClick={handleLoadFromGitHub}>
+                <span>Load from GitHub...</span>
+              </div>
               <div className={styles.dropdownItem} onClick={handleDownload}>
-                <span>Download</span>
+                <span>Download (.estme)</span>
               </div>
               <div className={styles.dropdownItem} onClick={handleExportBinary}>
                 <span>Export (.estb)</span>
@@ -687,6 +789,52 @@ export const MenuBar = () => {
                     </div>
                   ))}
                 </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showGitHubDialog && (
+        <div className={styles.dialogOverlay} onClick={() => setShowGitHubDialog(false)}>
+          <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
+            <div className={styles.dialogHeader}>
+              <span>Load from GitHub</span>
+              <button className={styles.closeButton} onClick={() => setShowGitHubDialog(false)}>×</button>
+            </div>
+            <div className={styles.dialogContent}>
+              {gitHubLoading ? (
+                <div className={styles.emptyMessage}>Loading assets...</div>
+              ) : gitHubError ? (
+                <div className={styles.emptyMessage}>{gitHubError}</div>
+              ) : (
+                <>
+                  <input
+                    type="text"
+                    className={styles.searchInput}
+                    placeholder="Search assets..."
+                    value={gitHubSearchQuery}
+                    onChange={(e) => setGitHubSearchQuery(e.target.value)}
+                    autoFocus
+                  />
+                  {filteredGitHubAssets.length === 0 ? (
+                    <div className={styles.emptyMessage}>No matching assets</div>
+                  ) : (
+                    <div className={styles.documentList}>
+                      {filteredGitHubAssets.map((asset) => (
+                        <div
+                          key={asset.name}
+                          className={styles.documentItem}
+                          onClick={() => handleSelectGitHubAsset(asset)}
+                        >
+                          <div className={styles.documentInfo}>
+                            <div className={styles.documentTitle}>{asset.name}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>

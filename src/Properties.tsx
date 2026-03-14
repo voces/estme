@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { PointSelection, Selection, store, useStore } from "./store/index.ts";
 import { InstanceProperties as InstancePropertiesType } from "./store/types.ts";
-import { HandleType, Path, Point, PointReference, Raster } from "./types.ts";
+import { Camera, HandleType, Path, Point, PointReference, Raster } from "./types.ts";
 import {
   ANIMATABLE_PROPERTIES,
   AnimatableProperty,
@@ -319,6 +319,7 @@ export const Properties = () => {
   const paths = useStore((s) => s.paths);
   const groups = useStore((s) => s.groups);
   const rasters = useStore((s) => s.rasters);
+  const cameras = useStore((s) => s.cameras);
   const selectedKeyframes = useStore((s) => s.selectedKeyframes);
   const currentClipId = useStore((s) => s.currentClipId);
   const animationClips = useStore((s) => s.animationClips);
@@ -400,6 +401,11 @@ export const Properties = () => {
     const raster = rasters.find((r) => r.id === selection.pathIds[0]);
     if (raster) {
       return <RasterProperties raster={raster} />;
+    }
+    // Check if this is a camera
+    const camera = cameras.find((c) => c.id === selection.pathIds[0]);
+    if (camera) {
+      return <CameraProperties camera={camera} />;
     }
     // Otherwise it's a path
     const path = paths.find((p) => p.id === selection.pathIds[0]);
@@ -763,6 +769,16 @@ function PathProperties({ path, pathId }: { path: Path; pathId: string }) {
           </button>
         </div>
       )}
+
+      <div className={styles.notesSection}>
+        <div className={styles.sectionTitle}>Notes</div>
+        <textarea
+          className={styles.notesTextarea}
+          value={path.notes ?? ""}
+          onChange={(e) => store.setNotes(pathId, e.target.value)}
+          placeholder="Add notes..."
+        />
+      </div>
     </div>
   );
 }
@@ -898,6 +914,97 @@ function RasterProperties({ raster }: { raster: Raster }) {
             })}
           />
         </div>
+      </div>
+
+      <div className={styles.notesSection}>
+        <div className={styles.sectionTitle}>Notes</div>
+        <textarea
+          className={styles.notesTextarea}
+          value={raster.notes ?? ""}
+          onChange={(e) => store.setNotes(raster.id, e.target.value)}
+          placeholder="Add notes..."
+        />
+      </div>
+    </div>
+  );
+}
+
+// Camera properties panel
+function CameraProperties({ camera }: { camera: Camera }) {
+  const handlePositionChange = (axis: "x" | "y", value: string) => {
+    const num = parseFloat(value);
+    if (isNaN(num)) return;
+    store.setCameraPosition(camera.id,
+      axis === "x" ? num : camera.x,
+      axis === "y" ? num : camera.y
+    );
+  };
+
+  const handleSizeChange = (value: string) => {
+    const num = parseFloat(value);
+    if (isNaN(num) || num <= 0) return;
+    store.setCameraSize(camera.id, num);
+  };
+
+  return (
+    <div className={styles.properties}>
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Camera</div>
+        <div className={styles.row}>
+          <label>Name</label>
+          <span className={styles.value}>{camera.name}</span>
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Position</div>
+        <div className={styles.row}>
+          <label>X</label>
+          <NumberInput
+            value={camera.x}
+            step="0.1"
+            onChange={(v) => handlePositionChange("x", v)}
+          />
+        </div>
+        <div className={styles.row}>
+          <label>Y</label>
+          <NumberInput
+            value={camera.y}
+            step="0.1"
+            onChange={(v) => handlePositionChange("y", v)}
+          />
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <div className={styles.sectionTitle}>Size</div>
+        <div className={styles.row}>
+          <label>Half-width</label>
+          <NumberInput
+            value={camera.size}
+            step="0.1"
+            onChange={handleSizeChange}
+          />
+        </div>
+      </div>
+
+      <div className={styles.section}>
+        <button
+          className={styles.deleteButton}
+          onClick={() => store.deleteCamera(camera.id)}
+        >
+          Delete Camera
+        </button>
+      </div>
+
+      <div className={styles.notesSection}>
+        <div className={styles.sectionTitle}>Notes</div>
+        <textarea
+          className={styles.notesTextarea}
+          value={camera.notes ?? ""}
+          onChange={(e) => store.setNotes(camera.id, e.target.value)}
+          placeholder="Add notes..."
+        />
       </div>
     </div>
   );
@@ -1193,6 +1300,16 @@ function GroupProperties(
         allPaths={paths}
         allGroups={groups}
       />
+
+      <div className={styles.notesSection}>
+        <div className={styles.sectionTitle}>Notes</div>
+        <textarea
+          className={styles.notesTextarea}
+          value={group.notes ?? ""}
+          onChange={(e) => store.setNotes(group.id, e.target.value)}
+          placeholder="Add notes..."
+        />
+      </div>
     </div>
   );
 }

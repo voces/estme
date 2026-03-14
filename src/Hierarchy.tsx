@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Group, Path, Raster } from "./types.ts";
+import { Camera, Group, Path, Raster } from "./types.ts";
 import { store, useStore } from "./store/index.ts";
 import { averageColors, getAnchorColor } from "./geometry.ts";
 import styles from "./Hierarchy.module.css";
@@ -126,9 +126,10 @@ export const Hierarchy = () => {
   const paths = useStore((s) => s.paths);
   const groups = useStore((s) => s.groups);
   const rasters = useStore((s) => s.rasters);
+  const cameras = useStore((s) => s.cameras);
   const selection = useStore((s) => s.selection);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editingType, setEditingType] = useState<"path" | "group" | "raster" | null>(null);
+  const [editingType, setEditingType] = useState<"path" | "group" | "raster" | "camera" | null>(null);
   const [editingName, setEditingName] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -138,6 +139,8 @@ export const Hierarchy = () => {
   // Drag and drop state
   const [draggedItem, setDraggedItem] = useState<{ id: string; type: "path" | "group" | "raster"; parentId: string | null } | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget>(null);
+  const [showMenu, setShowMenu] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (editingId && inputRef.current) {
@@ -145,6 +148,18 @@ export const Hierarchy = () => {
       inputRef.current.select();
     }
   }, [editingId]);
+
+  // Close overflow menu on outside click
+  useEffect(() => {
+    if (!showMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setShowMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showMenu]);
 
   // Build a flat list of selectable items in display order for range selection
   const getSelectableItems = (): { id: string; type: "path" | "group" | "raster" }[] => {
@@ -300,7 +315,7 @@ export const Hierarchy = () => {
     lastClickedRef.current = { id: rasterId, type: "raster" };
   };
 
-  const handleDoubleClick = (id: string, type: "path" | "group" | "raster", currentName: string, e: React.MouseEvent) => {
+  const handleDoubleClick = (id: string, type: "path" | "group" | "raster" | "camera", currentName: string, e: React.MouseEvent) => {
     e.stopPropagation();
     setEditingId(id);
     setEditingType(type);
@@ -315,6 +330,8 @@ export const Hierarchy = () => {
         store.setGroupName(editingId, editingName.trim());
       } else if (editingType === "raster") {
         store.setRasterName(editingId, editingName.trim());
+      } else if (editingType === "camera") {
+        store.setCameraName(editingId, editingName.trim());
       }
     }
     setEditingId(null);
@@ -758,6 +775,53 @@ export const Hierarchy = () => {
     );
   };
 
+  const renderCameraItem = (camera: Camera) => {
+    const isSelected = selection.pathIds.includes(camera.id);
+    const isEditing = editingId === camera.id && editingType === "camera";
+
+    return (
+      <div
+        key={camera.id}
+        className={`${styles.item} ${isSelected ? styles.selected : ""}`}
+        style={{ paddingLeft: "6px" }}
+        onClick={() => {
+          store.setSelection({ pathIds: [camera.id], points: [] });
+        }}
+      >
+        <span className={styles.collapseToggleSpacer} />
+        <button
+          className={`${styles.toggle} ${!camera.visible ? styles.hidden : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            store.setCameraVisible(camera.id, !camera.visible);
+          }}
+          title={camera.visible ? "Hide camera" : "Show camera"}
+        >
+          {camera.visible ? "\u25C9" : "\u25CE"}
+        </button>
+        <span className={styles.rasterIcon}>📷</span>
+        {isEditing ? (
+          <input
+            ref={inputRef}
+            className={styles.nameInput}
+            value={editingName}
+            onChange={(e) => setEditingName(e.target.value)}
+            onBlur={handleRenameSubmit}
+            onKeyDown={handleKeyDown}
+            onClick={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <span
+            className={styles.name}
+            onDoubleClick={(e) => handleDoubleClick(camera.id, "camera", camera.name, e)}
+          >
+            {camera.name}
+          </span>
+        )}
+      </div>
+    );
+  };
+
   const canGroup = selection.pathIds.length > 0;
   // Can ungroup if any selected path has a parent group
   const canUngroup = selection.pathIds.some((id) => {
@@ -769,23 +833,38 @@ export const Hierarchy = () => {
     <div className={styles.hierarchy}>
       <div className={styles.title}>
         <span>Hierarchy</span>
-        <div className={styles.titleButtons}>
+        <div className={styles.titleButtons} ref={menuRef}>
           <button
-            className={styles.groupButton}
-            onClick={() => store.groupSelection()}
-            disabled={!canGroup}
-            title="Group selected paths (G)"
+            className={styles.menuToggle}
+            onClick={() => setShowMenu(!showMenu)}
+            title="Actions"
           >
-            Group
+            ⋯
           </button>
-          <button
-            className={styles.groupButton}
-            onClick={() => store.ungroupSelection()}
-            disabled={!canUngroup}
-            title="Ungroup selected paths (Shift+G)"
-          >
-            Ungroup
-          </button>
+          {showMenu && (
+            <div className={styles.overflowMenu}>
+              <button
+                className={styles.menuItem}
+                onClick={() => { store.groupSelection(); setShowMenu(false); }}
+                disabled={!canGroup}
+              >
+                Group (G)
+              </button>
+              <button
+                className={styles.menuItem}
+                onClick={() => { store.ungroupSelection(); setShowMenu(false); }}
+                disabled={!canUngroup}
+              >
+                Ungroup (⇧G)
+              </button>
+              <button
+                className={styles.menuItem}
+                onClick={() => { store.addCamera(); setShowMenu(false); }}
+              >
+                Add Camera
+              </button>
+            </div>
+          )}
         </div>
       </div>
       <div className={styles.list}>
@@ -804,6 +883,7 @@ export const Hierarchy = () => {
             }
           })
         )}
+        {cameras.map((camera) => renderCameraItem(camera))}
       </div>
     </div>
   );

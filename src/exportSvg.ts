@@ -1,6 +1,7 @@
 // SVG export utility - converts estme paths to SVG format
 
-import { Path, Group } from "./types.ts";
+import { Camera, Path, Group } from "./types.ts";
+import { averageColors, getAnchorColor } from "./geometry.ts";
 
 // Convert a path's segments to an SVG path d attribute
 // Y coordinates are negated to flip from canvas coordinates (Y up) to SVG coordinates (Y down)
@@ -26,72 +27,92 @@ function pathToSvgD(path: Path): string {
   return parts.join(" ");
 }
 
-// Build group hierarchy for proper nesting in SVG
-function buildGroupTree(
-  groups: Group[],
-  paths: Path[]
-): Map<string | null, { groups: Group[]; paths: Path[] }> {
-  const tree = new Map<string | null, { groups: Group[]; paths: Path[] }>();
-
-  // Initialize with root
-  tree.set(null, { groups: [], paths: [] });
-
-  // Add all groups to tree
-  for (const group of groups) {
-    if (!tree.has(group.id)) {
-      tree.set(group.id, { groups: [], paths: [] });
-    }
-    const parentChildren = tree.get(group.parentId);
-    if (parentChildren) {
-      parentChildren.groups.push(group);
-    } else {
-      tree.set(group.parentId, { groups: [group], paths: [] });
-    }
-  }
-
-  // Add paths to their parents
-  for (const path of paths) {
-    const parentChildren = tree.get(path.parentId);
-    if (parentChildren) {
-      parentChildren.paths.push(path);
-    } else {
-      tree.set(path.parentId, { groups: [], paths: [path] });
-    }
-  }
-
-  return tree;
+// Get the effective fill color for a path, accounting for per-anchor vertex colors
+function getPathFillColor(path: Path): string {
+  const hasVertexColors = path.anchorMeta?.some((meta) => meta.color !== null) ?? false;
+  if (!hasVertexColors) return path.fill;
+  const vertexColors = path.segments.map((_, i) => getAnchorColor(path, i));
+  return averageColors(vertexColors);
 }
 
-// Recursively render a group and its children
-function renderGroup(
-  groupId: string | null,
-  tree: Map<string | null, { groups: Group[]; paths: Path[] }>,
+// Build a path index map for determining render order
+function buildPathIndices(paths: Path[]): Map<string, number> {
+  const indices = new Map<string, number>();
+  for (let i = 0; i < paths.length; i++) {
+    indices.set(paths[i].id, i);
+  }
+  return indices;
+}
+
+// Get the minimum path array index among all descendants of a group
+function getGroupMinIndex(
+  groupId: string,
   groups: Group[],
-  indent: string
+  paths: Path[],
+  pathIndices: Map<string, number>,
+): number {
+  let minIndex = Infinity;
+  for (const path of paths) {
+    if (path.parentId === groupId) {
+      const idx = pathIndices.get(path.id);
+      if (idx !== undefined && idx < minIndex) minIndex = idx;
+    }
+  }
+  for (const group of groups) {
+    if (group.parentId === groupId) {
+      const childMin = getGroupMinIndex(group.id, groups, paths, pathIndices);
+      if (childMin < minIndex) minIndex = childMin;
+    }
+  }
+  return minIndex;
+}
+
+// Recursively render children of a group, interleaving groups and paths by array order
+function renderChildren(
+  parentId: string | null,
+  groups: Group[],
+  paths: Path[],
+  pathIndices: Map<string, number>,
+  indent: string,
 ): string[] {
   const lines: string[] = [];
-  const children = tree.get(groupId);
-  if (!children) return lines;
 
-  // Render child groups first (they appear behind paths in the same group)
-  for (const childGroup of children.groups) {
-    const group = groups.find((g) => g.id === childGroup.id);
-    if (!group) continue;
+  // Collect items at this level with their sort keys
+  type Item =
+    | { type: "path"; path: Path; sortKey: number }
+    | { type: "group"; group: Group; sortKey: number };
+  const items: Item[] = [];
 
-    lines.push(`${indent}<g id="${escapeXml(group.name)}">`);
-    lines.push(...renderGroup(group.id, tree, groups, indent + "  "));
-    lines.push(`${indent}</g>`);
+  for (const path of paths) {
+    if (path.parentId !== parentId) continue;
+    const idx = pathIndices.get(path.id) ?? Infinity;
+    items.push({ type: "path", path, sortKey: idx });
   }
 
-  // Render paths
-  for (const path of children.paths) {
-    const d = pathToSvgD(path);
-    if (!d) continue;
+  for (const group of groups) {
+    if (group.parentId !== parentId) continue;
+    const minIdx = getGroupMinIndex(group.id, groups, paths, pathIndices);
+    items.push({ type: "group", group, sortKey: minIdx });
+  }
 
-    const opacity = path.opacity < 1 ? ` fill-opacity="${path.opacity}"` : "";
-    lines.push(
-      `${indent}<path id="${escapeXml(path.name)}" d="${d}" fill="${path.fill}"${opacity}/>`
-    );
+  // Sort by array index (lower index = rendered first = behind in SVG)
+  items.sort((a, b) => a.sortKey - b.sortKey);
+
+  for (const item of items) {
+    if (item.type === "group") {
+      lines.push(`${indent}<g id="${escapeXml(item.group.name)}">`);
+      lines.push(...renderChildren(item.group.id, groups, paths, pathIndices, indent + "  "));
+      lines.push(`${indent}</g>`);
+    } else {
+      const d = pathToSvgD(item.path);
+      if (!d) continue;
+      const fill = getPathFillColor(item.path);
+      const opacity = item.path.opacity < 1 ? ` fill-opacity="${item.path.opacity}"` : "";
+      const player = item.path.playerMask ? ` data-player="true"` : "";
+      lines.push(
+        `${indent}<path id="${escapeXml(item.path.name)}" d="${d}" fill="${fill}"${opacity}${player}/>`
+      );
+    }
   }
 
   return lines;
@@ -140,7 +161,7 @@ function calculateBounds(paths: Path[]): {
   return { minX, minY, maxX, maxY };
 }
 
-export function exportSvg(paths: Path[], groups: Group[]): string {
+export function exportSvg(paths: Path[], groups: Group[], cameras?: Camera[]): string {
   // Filter to visible paths only
   const visiblePaths = paths.filter((p) => p.visible);
 
@@ -151,8 +172,8 @@ export function exportSvg(paths: Path[], groups: Group[]): string {
   const height = bounds.maxY - bounds.minY + padding * 2;
   const viewBox = `${bounds.minX - padding} ${bounds.minY - padding} ${width} ${height}`;
 
-  // Build group tree
-  const tree = buildGroupTree(groups, visiblePaths);
+  // Build path index map for correct render ordering
+  const pathIndices = buildPathIndices(visiblePaths);
 
   // Build SVG
   const lines: string[] = [];
@@ -161,8 +182,21 @@ export function exportSvg(paths: Path[], groups: Group[]): string {
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${width}" height="${height}">`
   );
 
-  // Render from root
-  lines.push(...renderGroup(null, tree, groups, "  "));
+  // Render from root, interleaving groups and paths by array order
+  lines.push(...renderChildren(null, groups, visiblePaths, pathIndices, "  "));
+
+  // Export cameras as rect elements
+  if (cameras) {
+    for (const camera of cameras) {
+      const x = camera.x - camera.size;
+      const y = -(camera.y + camera.size); // Negate Y for SVG coords
+      const w = camera.size * 2;
+      const h = camera.size * 2;
+      lines.push(
+        `  <rect id="${escapeXml(camera.name)}" data-camera="true" x="${x}" y="${y}" width="${w}" height="${h}" fill="none" stroke="#888" stroke-dasharray="5,5"/>`
+      );
+    }
+  }
 
   lines.push(`</svg>`);
 

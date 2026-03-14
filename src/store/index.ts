@@ -1,5 +1,5 @@
 import { useCallback, useSyncExternalStore } from "react";
-import { AnchorMeta, CubicSegment, defaultTransform, Group, lineSegment, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
+import { AnchorMeta, Camera, CubicSegment, defaultTransform, Group, lineSegment, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
 import { booleanOperation, canBooleanOp, uniteMultiplePaths } from "../pathBool.ts";
 import { isSegmentStraight, makeStraightControlPoints, rotatePoint, scalePointAround, scalePointAroundNonUniform, getPathTransformPoint, getGroupTransformPoint, getSelectionTransformPoint, getPathBounds, getAnimatedPathBounds } from "../geometry.ts";
 import { applyCommand } from "./commands.ts";
@@ -203,14 +203,17 @@ const initialState: EditorState = {
   pathCounter: 1,
   groupCounter: 1,
   rasterCounter: 1,
+  cameras: [],
   snapConnections: [],
   pendingBooleanOp: null,
   animationClips: [],
   currentClipId: loadCurrentClipId(),
   playbackTime: loadPlaybackTime(),
   isPlaying: false,
+  playbackSpeed: 1,
   selectedKeyframes: [] as SelectedKeyframe[],
   instanceProperties: loadInstanceProperties(),
+  zoomToFitCounter: 0,
 };
 
 let state = initialState;
@@ -566,7 +569,7 @@ export const store = {
       return cmds;
     };
 
-    // Delete all fully selected paths and rasters (skip locked items)
+    // Delete all fully selected paths, rasters, and groups (skip locked items)
     for (const itemId of state.selection.pathIds) {
       const path = state.paths.find((p) => p.id === itemId);
       if (path && !path.locked) {
@@ -580,6 +583,14 @@ export const store = {
       const raster = state.rasters.find((r) => r.id === itemId);
       if (raster && !raster.locked) {
         commands.push({ type: "deleteRaster", raster });
+        continue;
+      }
+
+      const group = state.groups.find((g) => g.id === itemId);
+      if (group) {
+        const childPathIds = store.getDirectChildPathIds(itemId);
+        const childGroupIds = store.getDirectChildGroupIds(itemId);
+        commands.push({ type: "deleteGroup", group, childPathIds, childGroupIds });
       }
     }
 
@@ -3385,6 +3396,31 @@ export const store = {
     if (!raster || raster.name === name) return;
     executeCommand({ type: "setRasterName", id: rasterId, prevName: raster.name, newName: name });
   },
+  setNotes: (id: string, notes: string) => {
+    const path = state.paths.find((p) => p.id === id);
+    if (path) {
+      state = { ...state, isDirty: true, paths: state.paths.map((p) => p.id === id ? { ...p, notes } : p) };
+      notify();
+      return;
+    }
+    const group = state.groups.find((g) => g.id === id);
+    if (group) {
+      state = { ...state, isDirty: true, groups: state.groups.map((g) => g.id === id ? { ...g, notes } : g) };
+      notify();
+      return;
+    }
+    const raster = state.rasters.find((r) => r.id === id);
+    if (raster) {
+      state = { ...state, isDirty: true, rasters: state.rasters.map((r) => r.id === id ? { ...r, notes } : r) };
+      notify();
+      return;
+    }
+    const camera = state.cameras.find((c) => c.id === id);
+    if (camera) {
+      state = { ...state, isDirty: true, cameras: state.cameras.map((c) => c.id === id ? { ...c, notes } : c) };
+      notify();
+    }
+  },
   setRasterOpacity: (rasterId: string, opacity: number) => {
     const raster = state.rasters.find((r) => r.id === rasterId);
     if (!raster || raster.opacity === opacity) return;
@@ -3411,6 +3447,70 @@ export const store = {
     const raster = state.rasters.find((r) => r.id === rasterId);
     if (!raster || raster.renderOrder === renderOrder) return;
     executeCommand({ type: "setRasterRenderOrder", id: rasterId, renderOrder });
+  },
+  // Camera methods
+  addCamera: () => {
+    const camera: Camera = {
+      id: crypto.randomUUID(),
+      name: `Camera ${state.cameras.length + 1}`,
+      x: 0,
+      y: 0,
+      size: 100,
+      visible: true,
+    };
+    executeCommand({ type: "addCamera", camera });
+    state = { ...state, selection: { pathIds: [camera.id], points: [] } };
+    notify();
+  },
+  deleteCamera: (id: string) => {
+    const camera = state.cameras.find((c) => c.id === id);
+    if (!camera) return;
+    executeCommand({ type: "deleteCamera", camera });
+    if (state.selection.pathIds.includes(id)) {
+      state = { ...state, selection: { pathIds: state.selection.pathIds.filter((pid) => pid !== id), points: [] } };
+      notify();
+    }
+  },
+  setCameraName: (id: string, name: string) => {
+    const camera = state.cameras.find((c) => c.id === id);
+    if (!camera || camera.name === name) return;
+    executeCommand({ type: "setCameraName", id, prevName: camera.name, newName: name });
+  },
+  setCameraPosition: (id: string, x: number, y: number) => {
+    const camera = state.cameras.find((c) => c.id === id);
+    if (!camera || (camera.x === x && camera.y === y)) return;
+    executeCommand({ type: "setCameraPosition", id, prevX: camera.x, prevY: camera.y, newX: x, newY: y });
+  },
+  // Live camera position update (no undo - for dragging)
+  setCameraPositionLive: (id: string, dx: number, dy: number) => {
+    state = {
+      ...state,
+      cameras: state.cameras.map((c) =>
+        c.id === id ? { ...c, x: c.x + dx, y: c.y + dy } : c
+      ),
+    };
+    notify();
+  },
+  // Commit camera position after dragging (records undo)
+  commitCameraPosition: (id: string, prevX: number, prevY: number) => {
+    const camera = state.cameras.find((c) => c.id === id);
+    if (!camera) return;
+    if (camera.x === prevX && camera.y === prevY) return;
+    executeCommand({ type: "setCameraPosition", id, prevX, prevY, newX: camera.x, newY: camera.y });
+  },
+  setCameraSize: (id: string, size: number) => {
+    const camera = state.cameras.find((c) => c.id === id);
+    if (!camera || camera.size === size) return;
+    executeCommand({ type: "setCameraSize", id, prevSize: camera.size, newSize: size });
+  },
+  setCameraVisible: (id: string, visible: boolean) => {
+    state = {
+      ...state,
+      cameras: state.cameras.map((c) =>
+        c.id === id ? { ...c, visible } : c
+      ),
+    };
+    notify();
   },
   // Set transform point for a path or group (with undo)
   setTransformPoint: (itemId: string, itemType: "path" | "group", point: Point | null) => {
@@ -4271,44 +4371,56 @@ export const store = {
 
     if (validKeyframes.length === 0) return;
 
+    // Group keyframes by partId so we can handle multiple keyframes on the same track
+    const keyframesByPart = new Map<string, typeof validKeyframes>();
+    for (const kfData of validKeyframes) {
+      const existing = keyframesByPart.get(kfData.partId) ?? [];
+      existing.push(kfData);
+      keyframesByPart.set(kfData.partId, existing);
+    }
+
     // Paste keyframes at current playback time (adjusting for relative time offsets)
     const commands: Command[] = [];
     const newSelectedKeyframes: SelectedKeyframe[] = [];
 
-    for (const kfData of validKeyframes) {
-      const { partId, keyframe } = kfData;
-      const targetTime = Math.max(0, Math.min(clip.duration, playbackTime + keyframe.t));
-
+    for (const [partId, partKeyframes] of keyframesByPart) {
       const prevAnimation = clip.parts[partId] ?? [];
+      let workingAnimation = [...prevAnimation];
 
-      // Check if there's already a keyframe at this time
-      const existingIdx = prevAnimation.findIndex((k) => Math.abs(k.t - targetTime) < 0.0001);
+      for (const kfData of partKeyframes) {
+        const { keyframe } = kfData;
+        const targetTime = Math.max(0, Math.min(clip.duration, playbackTime + keyframe.t));
 
-      let newAnimation: PartAnimation;
-      if (existingIdx >= 0) {
-        // Merge with existing keyframe
-        newAnimation = prevAnimation.map((k, i) => {
-          if (i !== existingIdx) return k;
-          return {
-            ...k,
+        // Check if there's already a keyframe at this time in our working animation
+        const existingIdx = workingAnimation.findIndex((k) => Math.abs(k.t - targetTime) < 0.0001);
+
+        if (existingIdx >= 0) {
+          // Merge with existing keyframe
+          workingAnimation = workingAnimation.map((k, i) => {
+            if (i !== existingIdx) return k;
+            return {
+              ...k,
+              t: targetTime,
+              tx: keyframe.tx ?? k.tx,
+              ty: keyframe.ty ?? k.ty,
+              rot: keyframe.rot ?? k.rot,
+              scale: keyframe.scale ?? k.scale,
+              opacity: keyframe.opacity ?? k.opacity,
+            };
+          });
+        } else {
+          // Add new keyframe
+          workingAnimation = [...workingAnimation, {
             t: targetTime,
-            tx: keyframe.tx ?? k.tx,
-            ty: keyframe.ty ?? k.ty,
-            rot: keyframe.rot ?? k.rot,
-            scale: keyframe.scale ?? k.scale,
-            opacity: keyframe.opacity ?? k.opacity,
-          };
-        });
-      } else {
-        // Add new keyframe
-        newAnimation = [...prevAnimation, {
-          t: targetTime,
-          tx: keyframe.tx,
-          ty: keyframe.ty,
-          rot: keyframe.rot,
-          scale: keyframe.scale,
-          opacity: keyframe.opacity,
-        }].sort((a, b) => a.t - b.t);
+            tx: keyframe.tx,
+            ty: keyframe.ty,
+            rot: keyframe.rot,
+            scale: keyframe.scale,
+            opacity: keyframe.opacity,
+          }].sort((a, b) => a.t - b.t);
+        }
+
+        newSelectedKeyframes.push({ pathId: partId, time: targetTime });
       }
 
       commands.push({
@@ -4316,10 +4428,8 @@ export const store = {
         clipId: currentClipId,
         partId,
         prevAnimation,
-        newAnimation,
+        newAnimation: workingAnimation,
       });
-
-      newSelectedKeyframes.push({ pathId: partId, time: targetTime });
     }
 
     if (commands.length === 0) return;
@@ -5059,8 +5169,8 @@ export const store = {
   },
 
   selectGroup: (groupId: string) => {
-    // Select all descendant paths
-    const pathIds = store.getDescendantPathIds(groupId);
+    // Select the group itself and all descendant paths
+    const pathIds = [groupId, ...store.getDescendantPathIds(groupId)];
     const newSelection = { pathIds, points: [] };
     state = { ...state, selection: newSelection };
     saveSelection(newSelection);
@@ -5068,19 +5178,21 @@ export const store = {
   },
 
   toggleGroupInSelection: (groupId: string) => {
-    // Toggle all descendant paths in selection
-    const pathIds = store.getDescendantPathIds(groupId);
+    // Toggle the group itself and all descendant paths in selection
+    const pathIds = [groupId, ...store.getDescendantPathIds(groupId)];
     const currentSelected = state.selection.pathIds;
 
-    // Check if all descendants are currently selected
-    const allSelected = pathIds.every((id) => currentSelected.includes(id));
+    // Check if group is currently selected
+    const allSelected = currentSelected.includes(groupId) &&
+      pathIds.every((id) => currentSelected.includes(id));
 
     let newPathIds: string[];
     if (allSelected) {
-      // Remove all descendants from selection
-      newPathIds = currentSelected.filter((id) => !pathIds.includes(id));
+      // Remove group and all descendants from selection
+      const removeSet = new Set(pathIds);
+      newPathIds = currentSelected.filter((id) => !removeSet.has(id));
     } else {
-      // Add all descendants to selection
+      // Add group and all descendants to selection
       newPathIds = [...new Set([...currentSelected, ...pathIds])];
     }
 
@@ -5141,9 +5253,33 @@ export const store = {
     targetType: "path" | "group" | "raster",
     position: "before" | "after"
   ) => {
-    // Handle raster repositioning separately (rasters can only be repositioned relative to rasters)
+    // Handle raster repositioning separately
     if (itemType === "raster") {
-      if (targetType !== "raster") return; // Can't mix rasters with paths/groups for now
+      if (targetType !== "raster") {
+        // Dropping raster relative to a non-raster: find nearest raster in same parent
+        const targetParentId = targetType === "path"
+          ? state.paths.find((p) => p.id === targetId)?.parentId ?? null
+          : targetType === "group"
+            ? state.groups.find((g) => g.id === targetId)?.parentId ?? null
+            : null;
+        const siblingRasters = state.rasters.filter((r) => r.parentId === targetParentId);
+        if (siblingRasters.length === 0) return;
+        const fromIndex = state.rasters.findIndex((r) => r.id === itemId);
+        const lastSibling = siblingRasters[siblingRasters.length - 1];
+        let toIndex = state.rasters.findIndex((r) => r.id === lastSibling.id);
+        if (fromIndex === -1 || toIndex === -1) return;
+        if (position === "after") toIndex++;
+        if (fromIndex < toIndex) toIndex--;
+        if (fromIndex === toIndex) return;
+        executeCommand({
+          type: "reorderItem",
+          itemId,
+          itemType: "raster",
+          prevIndex: fromIndex,
+          newIndex: toIndex,
+        });
+        return;
+      }
       const fromIndex = state.rasters.findIndex((r) => r.id === itemId);
       let toIndex = state.rasters.findIndex((r) => r.id === targetId);
       if (fromIndex === -1 || toIndex === -1) return;
@@ -5176,6 +5312,19 @@ export const store = {
     let targetIndex: number;
     if (targetType === "path") {
       targetIndex = state.paths.findIndex((p) => p.id === targetId);
+    } else if (targetType === "raster") {
+      // Raster target: find the nearest path in the same parent group
+      const raster = state.rasters.find((r) => r.id === targetId);
+      if (!raster) return;
+      const siblingPaths = state.paths.filter((p) => p.parentId === raster.parentId);
+      if (siblingPaths.length === 0) {
+        // No sibling paths - just append at end
+        targetIndex = state.paths.length - 1;
+        if (targetIndex < 0) targetIndex = 0;
+      } else {
+        // Use the last sibling path as target
+        targetIndex = state.paths.findIndex((p) => p.id === siblingPaths[siblingPaths.length - 1].id);
+      }
     } else {
       // For a group target, find the first or last path in the group
       const groupPathIds = new Set(store.getDescendantPathIds(targetId));
@@ -5213,6 +5362,17 @@ export const store = {
         insertIndex = Math.min(insertIndex, pathsWithoutMoving.length);
       } else if (position === "after") {
         insertIndex++;
+      }
+    } else if (targetType === "raster") {
+      // For raster target, use the targetIndex we already computed
+      // Find the corresponding path in the filtered array
+      const targetPath = state.paths[targetIndex];
+      if (targetPath) {
+        insertIndex = pathsWithoutMoving.findIndex((p) => p.id === targetPath.id);
+        if (insertIndex === -1) insertIndex = pathsWithoutMoving.length;
+        else if (position === "after") insertIndex++;
+      } else {
+        insertIndex = pathsWithoutMoving.length;
       }
     } else {
       // For group target, find position relative to group's paths in the filtered array
@@ -6420,23 +6580,34 @@ export const store = {
       }
     }
 
-    // Apply the time reversal
+    // Apply the time reversal atomically per part
     const newParts = { ...clip.parts };
     const newSelectedKeyframes: { pathId: string; time: number }[] = [];
 
+    // Group selected keyframes by pathId
+    const selByPath = new Map<string, number[]>();
     for (const sel of state.selectedKeyframes) {
-      const originalAnim = prevAnimations.get(sel.pathId);
-      if (!originalAnim) continue;
-
       const selTime = Math.round(sel.time * 10000) / 10000;
-      const newTime = timeMapping.get(selTime) ?? sel.time;
+      if (!selByPath.has(sel.pathId)) selByPath.set(sel.pathId, []);
+      selByPath.get(sel.pathId)!.push(selTime);
+    }
 
-      newParts[sel.pathId] = changeKeyframeTime(
-        newParts[sel.pathId] ?? originalAnim,
-        sel.time,
-        newTime
-      );
-      newSelectedKeyframes.push({ pathId: sel.pathId, time: newTime });
+    for (const [pathId, selTimes] of selByPath) {
+      const originalAnim = prevAnimations.get(pathId) ?? [];
+      // Remap all selected keyframe times in one pass
+      const newAnim = originalAnim.map((kf) => {
+        const rounded = Math.round(kf.t * 10000) / 10000;
+        const newTime = selTimes.some((st) => Math.abs(st - rounded) < 0.0001)
+          ? (timeMapping.get(rounded) ?? kf.t)
+          : kf.t;
+        return { ...kf, t: newTime };
+      });
+      newAnim.sort((a, b) => a.t - b.t);
+      newParts[pathId] = newAnim;
+
+      for (const st of selTimes) {
+        newSelectedKeyframes.push({ pathId, time: timeMapping.get(st) ?? st });
+      }
     }
 
     // Execute as batch command for single undo
@@ -6955,6 +7126,11 @@ export const store = {
 
   togglePlayback: () => {
     state = { ...state, isPlaying: !state.isPlaying };
+    notify();
+  },
+
+  setPlaybackSpeed: (speed: number) => {
+    state = { ...state, playbackSpeed: speed };
     notify();
   },
 
@@ -7482,6 +7658,7 @@ export const store = {
       pathCounter: state.pathCounter,
       groupCounter: state.groupCounter,
       rasterCounter: state.rasterCounter,
+      cameras: state.cameras,
     };
   },
 
@@ -7501,6 +7678,7 @@ export const store = {
     pathCounter?: number;
     groupCounter?: number;
     rasterCounter?: number;
+    cameras?: Camera[];
   }, documentId?: string | null) => {
     // undefined = preserve existing, null = use file's id or generate new, string = use provided
     const id = documentId === undefined
@@ -7523,9 +7701,10 @@ export const store = {
     const pathIdSet = new Set(migratedPaths.map((p) => p.id));
     const groupIdSet = new Set((data.groups || []).map((g) => g.id));
     const rasterIdSet = new Set(migratedRasters.map((r) => r.id));
+    const cameraIdSet = new Set((data.cameras || []).map((c) => c.id));
     const savedSelection = loadSelection();
     const validSelection: Selection = {
-      pathIds: savedSelection.pathIds.filter((id) => pathIdSet.has(id) || groupIdSet.has(id) || rasterIdSet.has(id)),
+      pathIds: savedSelection.pathIds.filter((id) => pathIdSet.has(id) || groupIdSet.has(id) || rasterIdSet.has(id) || cameraIdSet.has(id)),
       points: [],
     };
     // Validate currentClipId exists in loaded document's clips
@@ -7542,6 +7721,7 @@ export const store = {
       paths: migratedPaths,
       groups: data.groups || [],
       rasters: migratedRasters,
+      cameras: (data.cameras || []).map((c: Camera) => ({ ...c, visible: c.visible ?? true })),
       snapConnections: data.snapConnections || [],
       animationClips: loadedClips,
       currentClipId: validCurrentClipId,
@@ -7554,6 +7734,8 @@ export const store = {
       showTransformPoints: state.showTransformPoints,
       // Restore valid selection
       selection: validSelection,
+      // Zoom to fit when loading from file (not from storage)
+      zoomToFitCounter: isFromStorage ? state.zoomToFitCounter : state.zoomToFitCounter + 1,
     };
     if (id) setCurrentDocumentId(id);
     saveSelection(validSelection);

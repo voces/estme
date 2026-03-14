@@ -497,6 +497,8 @@ export const Canvas = () => {
       // Raster image meshes
       rasterMeshes: Map<string, THREE.Mesh>;
       rasterTextures: Map<string, THREE.Texture>;
+      // Camera viewport meshes
+      cameraMeshes: Map<string, THREE.Line>;
       // Transform handles for selection bounding box
       transformHandles: {
         boundingBox: THREE.Line | null;
@@ -512,6 +514,7 @@ export const Canvas = () => {
 
   const paths = useStore((s) => s.paths);
   const rasters = useStore((s) => s.rasters);
+  const cameras = useStore((s) => s.cameras);
   const currentPath = useStore((s) => s.currentPath);
   const hoverPoint = useStore((s) => s.hoverPoint);
   const hoveredEdge = useStore((s) => s.hoveredEdge);
@@ -532,6 +535,7 @@ export const Canvas = () => {
   const playbackTime = useStore((s) => s.playbackTime);
   const instanceProperties = useStore((s) => s.instanceProperties);
   const mousePosition = useStore((s) => s.mousePosition);
+  const zoomToFitCounter = useStore((s) => s.zoomToFitCounter);
 
   // Get current animation clip
   const currentClip = currentClipId
@@ -780,6 +784,69 @@ export const Canvas = () => {
       }
     }
   }, [rasters, rasterTextureVersion]);
+
+  // Render camera viewport rectangles
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+
+    const visibleCameraIds = new Set(cameras.filter((c) => c.visible).map((c) => c.id));
+
+    // Remove meshes for cameras that no longer exist or are hidden
+    for (const [cameraId, line] of state.cameraMeshes) {
+      if (!visibleCameraIds.has(cameraId)) {
+        state.scene.remove(line);
+        line.geometry.dispose();
+        (line.material as THREE.Material).dispose();
+        state.cameraMeshes.delete(cameraId);
+      }
+    }
+
+    // Create or update meshes for each visible camera
+    for (const camera of cameras) {
+      if (!camera.visible) continue;
+      const isSelected = selection.pathIds.includes(camera.id);
+      let line = state.cameraMeshes.get(camera.id);
+
+      const x = camera.x;
+      const y = camera.y;
+      const s = camera.size;
+      const corners = [
+        new THREE.Vector3(x - s, y - s, 1),
+        new THREE.Vector3(x + s, y - s, 1),
+        new THREE.Vector3(x + s, y + s, 1),
+        new THREE.Vector3(x - s, y + s, 1),
+        new THREE.Vector3(x - s, y - s, 1), // Close the loop
+      ];
+
+      if (!line) {
+        const geometry = new THREE.BufferGeometry().setFromPoints(corners);
+        const material = new THREE.LineDashedMaterial({
+          color: isSelected ? 0x4fc3f7 : 0xaaaaaa,
+          dashSize: 6 / state.zoom,
+          gapSize: 4 / state.zoom,
+          transparent: true,
+          opacity: isSelected ? 1 : 0.6,
+        });
+        line = new THREE.Line(geometry, material);
+        line.computeLineDistances();
+        state.cameraMeshes.set(camera.id, line);
+        state.scene.add(line);
+      } else {
+        // Update geometry
+        const geometry = new THREE.BufferGeometry().setFromPoints(corners);
+        line.geometry.dispose();
+        line.geometry = geometry;
+        line.computeLineDistances();
+        // Update material
+        const mat = line.material as THREE.LineDashedMaterial;
+        mat.color.set(isSelected ? 0x4fc3f7 : 0xaaaaaa);
+        mat.opacity = isSelected ? 1 : 0.6;
+        mat.dashSize = 6 / state.zoom;
+        mat.gapSize = 4 / state.zoom;
+      }
+    }
+  }, [cameras, selection]);
 
   // Create a selection box mesh for box selection visualization
   const createSelectionBoxMesh = (start: Point, end: Point): THREE.Line => {
@@ -1681,6 +1748,7 @@ export const Canvas = () => {
       modelPreview: null,
       rasterMeshes: new Map(),
       rasterTextures: new Map(),
+      cameraMeshes: new Map(),
       transformHandles: {
         boundingBox: null,
         corners: [],
@@ -1902,6 +1970,58 @@ export const Canvas = () => {
     }
   }, [showGrid]);
 
+  // Zoom to fit all geometry when requested (e.g. after loading a file)
+  useEffect(() => {
+    if (zoomToFitCounter === 0) return; // Skip initial mount
+    const state = stateRef.current;
+    const container = containerRef.current;
+    if (!state || !container) return;
+
+    const storePaths = store.getState().paths;
+    if (storePaths.length === 0) return;
+
+    // Compute combined bounding box of all paths
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const path of storePaths) {
+      if (path.segments.length === 0) continue;
+      const b = getPathBounds(path);
+      minX = Math.min(minX, b.minX);
+      minY = Math.min(minY, b.minY);
+      maxX = Math.max(maxX, b.maxX);
+      maxY = Math.max(maxY, b.maxY);
+    }
+    if (!isFinite(minX)) return;
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const contentWidth = maxX - minX;
+    const contentHeight = maxY - minY;
+
+    const { clientWidth: w, clientHeight: h } = container;
+    const aspect = w / h;
+    const frustum = 5;
+    const margin = 0.8; // Use 80% of the view
+
+    // Determine zoom so content fits in both dimensions
+    const zoomForWidth = contentWidth / (2 * frustum * aspect * margin);
+    const zoomForHeight = contentHeight / (2 * frustum * margin);
+    const newZoom = Math.max(zoomForWidth, zoomForHeight, 0.01);
+
+    const halfWidth = frustum * aspect * newZoom;
+    const halfHeight = frustum * newZoom;
+    state.camera.left = centerX - halfWidth;
+    state.camera.right = centerX + halfWidth;
+    state.camera.top = centerY + halfHeight;
+    state.camera.bottom = centerY - halfHeight;
+    state.camera.updateProjectionMatrix();
+
+    state.zoom = newZoom;
+    store.setZoom(newZoom);
+    state.updateGrid();
+    state.updatePointScales();
+    saveCameraState(state.camera, newZoom);
+  }, [zoomToFitCounter]);
+
   // Mouse handlers
   useEffect(() => {
     const container = containerRef.current;
@@ -1981,6 +2101,11 @@ export const Canvas = () => {
     let dragThresholdMet = false;
     let dragStartTime = 0;
     let dragStartScreen: Point | null = null; // Screen-space start position for distance check
+    // Camera dragging state
+    let isDraggingCamera = false;
+    let dragCameraId: string | null = null;
+    let dragCameraPrevX = 0;
+    let dragCameraPrevY = 0;
 
     // Helper to find nearest control handle (respects active state)
     const findNearestHandle = (
@@ -2216,7 +2341,19 @@ export const Canvas = () => {
           }
         }
 
-        // Check corner handles
+        // Check corner handles (but not if a control point handle is at the same spot)
+        let hasHandleAtClick = false;
+        for (const id of selection.pathIds) {
+          const p = paths.find((pp) => pp.id === id);
+          if (p && p.visible && !p.locked) {
+            if (findNearestHandle(clickPoint, p, CONTROL_POINT_SIZE * state.zoom) ||
+                findNearestPointIndex(clickPoint, getPathPoints(p), VERTEX_SIZE * state.zoom) >= 0) {
+              hasHandleAtClick = true;
+              break;
+            }
+          }
+        }
+        if (!hasHandleAtClick)
         for (let i = 0; i < transformHandles.corners.length; i++) {
           const corner = transformHandles.corners[i];
           const cornerPos = corner.position;
@@ -2423,6 +2560,34 @@ export const Canvas = () => {
                 return;
               }
             }
+            // Check if we clicked on a camera rectangle
+            const { cameras: camsAnim } = store.getState();
+            const clickedCameraAnim = camsAnim.find((cam) => {
+              const s = cam.size;
+              return clickPoint.x >= cam.x - s && clickPoint.x <= cam.x + s &&
+                     clickPoint.y >= cam.y - s && clickPoint.y <= cam.y + s;
+            });
+            if (clickedCameraAnim) {
+              if (isShiftClick) {
+                store.toggleInSelection(clickedCameraAnim.id);
+              } else {
+                store.selectPath(clickedCameraAnim.id);
+              }
+              isDragging = true;
+              isDraggingCamera = true;
+              dragCameraId = clickedCameraAnim.id;
+              dragCameraPrevX = clickedCameraAnim.x;
+              dragCameraPrevY = clickedCameraAnim.y;
+              dragStart = clickPoint;
+              totalDx = 0;
+              totalDy = 0;
+              dragThresholdMet = false;
+              dragStartTime = Date.now();
+              dragStartScreen = { x: e.clientX, y: e.clientY };
+              e.preventDefault();
+              return;
+            }
+
             // Start box selection
             isBoxSelecting = true;
             boxSelectStart = clickPoint;
@@ -2973,6 +3138,35 @@ export const Canvas = () => {
             return;
           }
         }
+        // Check if we clicked on a camera rectangle
+        const { cameras: cams } = store.getState();
+        const clickedCamera = cams.find((cam) => {
+          const s = cam.size;
+          return clickPoint.x >= cam.x - s && clickPoint.x <= cam.x + s &&
+                 clickPoint.y >= cam.y - s && clickPoint.y <= cam.y + s;
+        });
+        if (clickedCamera) {
+          if (isShiftClick) {
+            store.toggleInSelection(clickedCamera.id);
+          } else {
+            store.selectPath(clickedCamera.id);
+          }
+          // Start dragging the camera
+          isDragging = true;
+          isDraggingCamera = true;
+          dragCameraId = clickedCamera.id;
+          dragCameraPrevX = clickedCamera.x;
+          dragCameraPrevY = clickedCamera.y;
+          dragStart = clickPoint;
+          totalDx = 0;
+          totalDy = 0;
+          dragThresholdMet = false;
+          dragStartTime = Date.now();
+          dragStartScreen = { x: e.clientX, y: e.clientY };
+          e.preventDefault();
+          return;
+        }
+
         // Start box selection
         isBoxSelecting = true;
         boxSelectStart = clickPoint;
@@ -3417,29 +3611,36 @@ export const Canvas = () => {
         const dx = point.x - dragStart.x;
         const dy = point.y - dragStart.y;
 
-        // Check if we're in animation mode
-        const { currentClipId: activeClipId } = store.getState();
-        if (activeClipId) {
-          // Animation mode: use transform-based translation
+        if (isDraggingCamera && dragCameraId) {
+          // Camera dragging: move camera position directly
           totalDx += dx;
           totalDy += dy;
-          if (isDraggingSelection) {
-            store.translateSelectionTransform(dx, dy);
-          } else {
-            store.translatePathTransform(dragPathId!, dx, dy);
-          }
+          store.setCameraPositionLive(dragCameraId, dx, dy);
         } else {
-          // Normal mode: geometry-based translation
-          if (isDraggingSelection) {
-            // Selection translation - always update store (throttles React renders internally)
+          // Check if we're in animation mode
+          const { currentClipId: activeClipId } = store.getState();
+          if (activeClipId) {
+            // Animation mode: use transform-based translation
             totalDx += dx;
             totalDy += dy;
-            store.translateSelectionLive(dx, dy);
+            if (isDraggingSelection) {
+              store.translateSelectionTransform(dx, dy);
+            } else {
+              store.translatePathTransform(dragPathId!, dx, dy);
+            }
           } else {
-            // Single path translation - always update store (throttles React renders internally)
-            totalDx += dx;
-            totalDy += dy;
-            store.translatePathLive(dragPathId!, dx, dy);
+            // Normal mode: geometry-based translation
+            if (isDraggingSelection) {
+              // Selection translation - always update store (throttles React renders internally)
+              totalDx += dx;
+              totalDy += dy;
+              store.translateSelectionLive(dx, dy);
+            } else {
+              // Single path translation - always update store (throttles React renders internally)
+              totalDx += dx;
+              totalDy += dy;
+              store.translatePathLive(dragPathId!, dx, dy);
+            }
           }
         }
         if (dragCenter) {
@@ -3751,7 +3952,10 @@ export const Canvas = () => {
             }
           }
         } else if (totalDx !== 0 || totalDy !== 0) {
-          if (activeClipId) {
+          if (isDraggingCamera && dragCameraId) {
+            // Commit camera position
+            store.commitCameraPosition(dragCameraId, dragCameraPrevX, dragCameraPrevY);
+          } else if (activeClipId) {
             // Animation mode: commit transform-based translation (with keyframes)
             if (isDraggingSelection && dragPrevAnimations) {
               store.commitTranslateSelectionTransform(dragPrevAnimations);
@@ -3811,6 +4015,11 @@ export const Canvas = () => {
       isRotating = false;
       isScaling = false;
       snappedToTarget = null;
+      // Reset camera drag state
+      isDraggingCamera = false;
+      dragCameraId = null;
+      dragCameraPrevX = 0;
+      dragCameraPrevY = 0;
       // Reset drag threshold state
       dragThresholdMet = false;
       dragStartTime = 0;

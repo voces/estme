@@ -1,0 +1,73 @@
+.waterfallPanel {
+  display: flex;
+  border-top: 1px solid #444;
+  height: 150px;
+  flex-shrink: 0;
+  background: #1a1a1a;
+}
+
+.waterfallLabels {
+  width: 150px;
+  flex-shrink: 0;
+  background: #222;
+  border-right: 1px solid #333;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+}
+
+.propToggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: #888;
+  cursor: pointer;
+  user-select: none;
+}
+
+.propToggle input[type="checkbox"] {
+  width: 12px;
+  height: 12px;
+  accent-color: #4488ff;
+}
+
+.propDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.propName {
+  font-family: monospace;
+}
+
+.emptyLabel {
+  font-size: 10px;
+  color: #555;
+  font-style: italic;
+}
+
+.waterfallChart {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.waterfallTooltip {
+  position: absolute;
+  background: #333;
+  color: #eee;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-family: monospace;
+  pointer-events: none;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  z-index: 10;
+  border: 1px solid #555;
+}

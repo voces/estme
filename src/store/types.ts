@@ -1,4 +1,4 @@
-import { AnchorMeta, Group, HandleType, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
+import { AnchorMeta, Camera, Group, HandleType, Path, PathTransform, Point, PointReference, Raster, SnapConnection, Tool } from "../types.ts";
 import { BooleanOperation } from "../pathBool.ts";
 import { AnimationClip, PartAnimation } from "../animation.ts";
 
@@ -72,6 +72,12 @@ export type Command =
   | { type: "setRasterSize"; id: string; prevWidth: number; prevHeight: number; newWidth: number; newHeight: number }
   | { type: "setRasterRenderOrder"; id: string; renderOrder: "front" | "back" }
   | { type: "reorderPaths"; prevPathIds: string[]; newPathIds: string[] }
+  // Camera commands
+  | { type: "addCamera"; camera: Camera }
+  | { type: "deleteCamera"; camera: Camera }
+  | { type: "setCameraName"; id: string; prevName: string; newName: string }
+  | { type: "setCameraPosition"; id: string; prevX: number; prevY: number; newX: number; newY: number }
+  | { type: "setCameraSize"; id: string; prevSize: number; newSize: number }
   // Snap connection commands
   | { type: "addSnapConnection"; connection: SnapConnection }
   | { type: "removeSnapConnection"; connection: SnapConnection }
@@ -180,6 +186,8 @@ export type EditorState = {
   groupCounter: number;
   // Raster naming counter
   rasterCounter: number;
+  // Portrait cameras
+  cameras: Camera[];
   // Snap connections between points
   snapConnections: SnapConnection[];
   // Pending boolean operation (when drawing a new path to apply against selection)
@@ -192,10 +200,14 @@ export type EditorState = {
   playbackTime: number;
   // Is animation playing?
   isPlaying: boolean;
+  // Playback speed multiplier (e.g. 0.25, 0.5, 1, 2, 4)
+  playbackSpeed: number;
   // Selected keyframe in timeline (for editing in Properties panel)
   selectedKeyframes: SelectedKeyframes;
   // Instance rendering properties (not part of document, stored separately in localStorage)
   instanceProperties: InstanceProperties;
+  // Incremented to request the Canvas to zoom-to-fit all geometry
+  zoomToFitCounter: number;
 };
 
 export const emptySelection: Selection = { pathIds: [], points: [] };

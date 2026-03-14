@@ -5,13 +5,15 @@
  * Much smaller than JSON.
  *
  * Format:
- * - Header: "EST\x03" (4 bytes) - magic + version 3
+ * - Header: "EST\x04" (4 bytes) - magic + version 4
  * - PathCount: u16
  * - GroupCount: u16
  * - ClipCount: u16
+ * - CameraCount: u16
  * - Paths[]
  * - Groups[]
  * - Clips[]
+ * - Cameras[]
  *
  * Path:
  * - flags: u8 (bit 0: playerMask, bit 1: hasParent, bit 2: hasTransformPoint, bit 3: hasVertexColors)
@@ -41,9 +43,14 @@
  *     - t: f16
  *     - flags: u8 (bit 0-4: has tx,ty,rot,scale,opacity)
  *     - values: f16 x popcount(flags)
+ *
+ * Camera:
+ * - x: f16 (center X)
+ * - y: f16 (center Y)
+ * - size: f16 (half-width of square viewport)
  */
 
-import { Path, Group, CubicSegment } from "./types.ts";
+import { Camera, Path, Group, CubicSegment } from "./types.ts";
 import { AnimationClip } from "./animation.ts";
 import { averageColors, getAnchorColor } from "./geometry.ts";
 
@@ -232,6 +239,7 @@ export function exportBinary(
   paths: Path[],
   groups: Group[],
   clips: AnimationClip[],
+  cameras: Camera[] = [],
 ): ArrayBuffer {
   const visiblePaths = paths.filter((p) => p.visible);
 
@@ -275,12 +283,13 @@ export function exportBinary(
   w.writeU8(0x45); // 'E'
   w.writeU8(0x53); // 'S'
   w.writeU8(0x54); // 'T'
-  w.writeU8(3);    // version
+  w.writeU8(4);    // version
 
   // Counts
   w.writeU16(visiblePaths.length);
   w.writeU16(usedGroups.length);
   w.writeU16(clips.length);
+  w.writeU16(cameras.length);
 
   // Paths
   for (const path of visiblePaths) {
@@ -397,6 +406,13 @@ export function exportBinary(
         if (flags & 16) w.writeF16(kf.opacity!);
       }
     }
+  }
+
+  // Cameras
+  for (const camera of cameras) {
+    w.writeF16(camera.x);
+    w.writeF16(camera.y);
+    w.writeF16(camera.size);
   }
 
   return w.getBuffer();

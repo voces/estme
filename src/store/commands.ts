@@ -1313,5 +1313,33 @@ export function applyCommand(
         ),
       };
     }
+    // Camera commands
+    case "addCamera": {
+      if (isUndo) {
+        return { ...state, cameras: state.cameras.filter((c) => c.id !== cmd.camera.id) };
+      } else {
+        return { ...state, cameras: [...state.cameras, cmd.camera] };
+      }
+    }
+    case "deleteCamera": {
+      if (isUndo) {
+        return { ...state, cameras: [...state.cameras, cmd.camera] };
+      } else {
+        return { ...state, cameras: state.cameras.filter((c) => c.id !== cmd.camera.id) };
+      }
+    }
+    case "setCameraName": {
+      const name = isUndo ? cmd.prevName : cmd.newName;
+      return { ...state, cameras: state.cameras.map((c) => c.id === cmd.id ? { ...c, name } : c) };
+    }
+    case "setCameraPosition": {
+      const x = isUndo ? cmd.prevX : cmd.newX;
+      const y = isUndo ? cmd.prevY : cmd.newY;
+      return { ...state, cameras: state.cameras.map((c) => c.id === cmd.id ? { ...c, x, y } : c) };
+    }
+    case "setCameraSize": {
+      const size = isUndo ? cmd.prevSize : cmd.newSize;
+      return { ...state, cameras: state.cameras.map((c) => c.id === cmd.id ? { ...c, size } : c) };
+    }
   }
 }

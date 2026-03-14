@@ -2,7 +2,7 @@
  * Import estb binary format back into editor format.
  */
 
-import { Path, Group, CubicSegment, Point, defaultAnchorMeta, defaultTransform, AnchorMeta } from "./types.ts";
+import { Camera, Path, Group, CubicSegment, Point, defaultAnchorMeta, defaultTransform, AnchorMeta } from "./types.ts";
 import { AnimationClip, UnifiedKeyframe } from "./animation.ts";
 import { BinaryReader, float16ToFloat } from "./exportBinary.ts";
 
@@ -50,7 +50,13 @@ const rgbToHex = (rgb: { r: number; g: number; b: number }): string => {
   return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
 };
 
-function parseEstb(buffer: ArrayBuffer): { paths: ParsedPath[]; groups: ParsedGroup[]; clips: ParsedClip[] } {
+type ParsedCamera = {
+  x: number;
+  y: number;
+  size: number;
+};
+
+function parseEstb(buffer: ArrayBuffer): { paths: ParsedPath[]; groups: ParsedGroup[]; clips: ParsedClip[]; cameras: ParsedCamera[] } {
   const r = new BinaryReader(buffer);
 
   // Read header
@@ -62,12 +68,13 @@ function parseEstb(buffer: ArrayBuffer): { paths: ParsedPath[]; groups: ParsedGr
   if (magic0 !== 0x45 || magic1 !== 0x53 || magic2 !== 0x54) {
     throw new Error("Invalid estb file: bad magic");
   }
-  if (version !== 3) throw new Error(`Unsupported estb version: ${version}`);
+  if (version !== 3 && version !== 4) throw new Error(`Unsupported estb version: ${version}`);
 
   // Read counts
   const pathCount = r.readU16();
   const groupCount = r.readU16();
   const clipCount = r.readU16();
+  const cameraCount = version >= 4 ? r.readU16() : 0;
 
   // Read paths
   const paths: ParsedPath[] = [];
@@ -163,19 +170,30 @@ function parseEstb(buffer: ArrayBuffer): { paths: ParsedPath[]; groups: ParsedGr
     clips.push({ name, duration, fps, parts });
   }
 
-  return { paths, groups, clips };
+  // Read cameras
+  const cameras: ParsedCamera[] = [];
+  for (let i = 0; i < cameraCount; i++) {
+    cameras.push({
+      x: r.readF16(),
+      y: r.readF16(),
+      size: r.readF16(),
+    });
+  }
+
+  return { paths, groups, clips, cameras };
 }
 
 export type ImportedDocument = {
   paths: Path[];
   groups: Group[];
+  cameras: Camera[];
   animationClips: AnimationClip[];
   pathCounter: number;
   groupCounter: number;
 };
 
 export function importBinary(buffer: ArrayBuffer, startPathCounter: number = 1, startGroupCounter: number = 1): ImportedDocument {
-  const { paths: parsedPaths, groups: parsedGroups, clips: parsedClips } = parseEstb(buffer);
+  const { paths: parsedPaths, groups: parsedGroups, clips: parsedClips, cameras: parsedCameras } = parseEstb(buffer);
 
   // Create IDs for groups first (since paths reference them)
   const groupIds: string[] = [];
@@ -269,9 +287,20 @@ export function importBinary(buffer: ArrayBuffer, startPathCounter: number = 1, 
     };
   });
 
+  // Create cameras
+  const cameras: Camera[] = parsedCameras.map((pc, i) => ({
+    id: crypto.randomUUID(),
+    name: `Camera ${i + 1}`,
+    x: pc.x,
+    y: pc.y,
+    size: pc.size,
+    visible: true,
+  }));
+
   return {
     paths,
     groups,
+    cameras,
     animationClips,
     pathCounter: startPathCounter + parsedPaths.length,
     groupCounter: startGroupCounter + parsedGroups.length,

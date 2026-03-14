@@ -3,6 +3,7 @@ import { store, useStore } from "./store/index.ts";
 import { AnimatableProperty, AnimationClip, createDefaultClip, propertyColors, ANIMATABLE_PROPERTIES, UnifiedKeyframe, PartAnimation, changeKeyframeTime } from "./animation.ts";
 import styles from "./Timeline.module.css";
 import { Group, Path } from "./types.ts";
+import { ValueWaterfall } from "./ValueWaterfall.tsx";
 
 const PROPERTY_LABELS: Record<AnimatableProperty, string> = {
   tx: "X",
@@ -75,6 +76,7 @@ export const Timeline = () => {
   const currentClipId = useStore((s) => s.currentClipId);
   const playbackTime = useStore((s) => s.playbackTime);
   const isPlaying = useStore((s) => s.isPlaying);
+  const playbackSpeed = useStore((s) => s.playbackSpeed);
   const paths = useStore((s) => s.paths);
   const groups = useStore((s) => s.groups);
   const selection = useStore((s) => s.selection);
@@ -86,6 +88,17 @@ export const Timeline = () => {
 
   // Build hierarchy tree
   const hierarchy = useMemo(() => buildHierarchy(paths, groups), [paths, groups]);
+
+  // First selected path/group with animation data (for waterfall chart)
+  const waterfallPartId = useMemo(() => {
+    if (!currentClip) return null;
+    for (const pathId of selection.pathIds) {
+      if (currentClip.parts[pathId] && currentClip.parts[pathId].length > 0) {
+        return pathId;
+      }
+    }
+    return null;
+  }, [currentClip, selection.pathIds]);
 
   // Track expanded items (both groups and paths for property expansion)
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
@@ -225,7 +238,7 @@ export const Timeline = () => {
       const dt = (now - lastTime) / 1000;
       lastTime = now;
 
-      let newTime = store.getState().playbackTime + dt;
+      let newTime = store.getState().playbackTime + dt * playbackSpeed;
       if (newTime >= currentClip.duration) {
         newTime = 0; // Loop
       }
@@ -236,7 +249,7 @@ export const Timeline = () => {
 
     animationId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animationId);
-  }, [isPlaying, currentClip]);
+  }, [isPlaying, currentClip, playbackSpeed]);
 
   const handleAddClip = useCallback(() => {
     const name = `clip_${clips.length + 1}`;
@@ -1282,6 +1295,19 @@ export const Timeline = () => {
         </div>
 
         <span className={styles.timeDisplay}>
+          <input
+            type="number"
+            className={styles.speedInput}
+            value={playbackSpeed}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              if (v > 0) store.setPlaybackSpeed(v);
+            }}
+            step={0.25}
+            min={0.01}
+            title="Playback speed multiplier"
+          />
+          x &nbsp;
           {playbackTime.toFixed(2)}s /{" "}
           <input
             type="number"
@@ -1354,6 +1380,16 @@ export const Timeline = () => {
             )}
           </div>
         </div>
+
+        {/* Value waterfall chart */}
+        {waterfallPartId && currentClip && currentClipId && (
+          <ValueWaterfall
+            clip={currentClip}
+            partId={waterfallPartId}
+            playbackTime={playbackTime}
+            clipId={currentClipId}
+          />
+        )}
       </div>
     </div>
   );

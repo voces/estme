@@ -42,6 +42,7 @@ export type Path = {
   transform: PathTransform;
   // Custom transform point (null = use dynamic center)
   transformPoint: Point | null;
+  notes?: string;
 };
 
 export type Group = {
@@ -51,6 +52,7 @@ export type Group = {
   collapsed: boolean; // UI state for hierarchy expand/collapse
   // Custom transform point (null = use dynamic center of children)
   transformPoint: Point | null;
+  notes?: string;
 };
 
 // Raster image (not exported in binary, stored in IndexedDB)
@@ -69,6 +71,18 @@ export type Raster = {
   transform: PathTransform; // translate, rotate, scale
   transformPoint: Point | null; // Custom rotation/scale center
   renderOrder: "front" | "back"; // Render in front of or behind paths
+  notes?: string;
+};
+
+// Portrait camera viewport
+export type Camera = {
+  id: string;
+  name: string;
+  x: number; // Center X in world coordinates
+  y: number; // Center Y in world coordinates
+  size: number; // Half-width of square viewport
+  visible: boolean; // Editor-only visibility (not exported)
+  notes?: string;
 };
 
 export type Tool = "select" | "line" | "blob";
