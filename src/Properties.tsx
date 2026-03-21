@@ -6,6 +6,7 @@ import {
   ANIMATABLE_PROPERTIES,
   AnimatableProperty,
   defaultPropertyValues,
+  getPropertyValue,
   PartAnimation,
   propertyColors,
   UnifiedKeyframe,
@@ -2143,6 +2144,27 @@ function UnifiedKeyframeProperties({
     }
   };
 
+  // Interpolate property value from surrounding keyframes (as if this keyframe didn't have it)
+  const handleInterpolate = (property: AnimatableProperty) => {
+    const clip = store.getState().animationClips.find((c) => c.id === clipId);
+    if (!clip) return;
+
+    for (const pathId of pathIds) {
+      const pathTime = pathTimeMap.get(pathId) ?? keyframe.t;
+      const partAnim = clip.parts[pathId] ?? [];
+
+      // Filter out the current keyframe, then use getPropertyValue to interpolate
+      const filtered = partAnim.filter((kf) => Math.abs(kf.t - pathTime) > 0.0001);
+      const value = getPropertyValue(filtered, property, pathTime);
+      store.setKeyframeProperty(clipId, pathId, property, pathTime, value);
+    }
+  };
+
+  // Check if interpolation is possible (needs both left and right keyframes with the property)
+  const canInterpolate = (property: AnimatableProperty): boolean => {
+    return hasAdjacentKeyframe(property, "left") && hasAdjacentKeyframe(property, "right");
+  };
+
   // Check if there's a keyframe with the property to the left/right
   const hasAdjacentKeyframe = (property: AnimatableProperty, direction: "left" | "right"): boolean => {
     const clip = store.getState().animationClips.find((c) => c.id === clipId);
@@ -2282,6 +2304,15 @@ function UnifiedKeyframeProperties({
                       style={{ opacity: hasAdjacentKeyframe(prop, "left") ? 1 : 0.3 }}
                     >
                       ←
+                    </button>
+                    <button
+                      className={styles.resetButton}
+                      onClick={() => handleInterpolate(prop)}
+                      disabled={!canInterpolate(prop)}
+                      title="Interpolate from surrounding keyframes"
+                      style={{ opacity: canInterpolate(prop) ? 1 : 0.3 }}
+                    >
+                      ⟠
                     </button>
                     <button
                       className={styles.resetButton}

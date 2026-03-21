@@ -317,7 +317,7 @@ export const ValueWaterfall = ({ clip, partId, playbackTime, clipId }: ValueWate
             className={styles.waterfallTooltip}
             style={{
               left: hoveredPoint.x,
-              top: hoveredPoint.y - 24,
+              top: hoveredPoint.y < 24 ? hoveredPoint.y + 12 : hoveredPoint.y - 24,
             }}
           >
             {formatValue(hoveredPoint.property, hoveredPoint.value)}

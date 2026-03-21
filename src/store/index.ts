@@ -7734,8 +7734,8 @@ export const store = {
       showTransformPoints: state.showTransformPoints,
       // Restore valid selection
       selection: validSelection,
-      // Zoom to fit when loading from file (not from storage)
-      zoomToFitCounter: isFromStorage ? state.zoomToFitCounter : state.zoomToFitCounter + 1,
+      // Zoom to fit when loading a document
+      zoomToFitCounter: state.zoomToFitCounter + 1,
     };
     if (id) setCurrentDocumentId(id);
     saveSelection(validSelection);

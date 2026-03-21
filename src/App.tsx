@@ -101,7 +101,7 @@ export const App = () => {
 
       if (isDraggingTimeline.current) {
         const appRect = appRef.current.getBoundingClientRect();
-        const maxHeight = appRect.height * 0.4; // Max 40% of screen
+        const maxHeight = appRect.height * 0.6; // Max 60% of screen
         const newHeight = appRect.bottom - e.clientY;
         const clampedHeight = Math.max(MIN_TIMELINE_HEIGHT, Math.min(maxHeight, newHeight));
         setTimelineHeight(clampedHeight);
