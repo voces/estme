@@ -24,6 +24,7 @@ export const Keys = {
   COPY: "c",
   CUT: "x",
   PASTE: "v",
+  DUPLICATE: "d",
 
   // Selection
   SELECT_ALL: "a",
@@ -79,6 +80,7 @@ export const KeyboardBindings = {
     copy: { key: Keys.COPY, ctrl: true, description: "Copy selection" },
     cut: { key: Keys.CUT, ctrl: true, description: "Cut selection" },
     paste: { key: Keys.PASTE, ctrl: true, description: "Paste clipboard" },
+    duplicate: { key: Keys.DUPLICATE, ctrl: true, description: "Duplicate selection" },
   },
 
   // Selection
@@ -157,6 +159,11 @@ export function isCut(e: KeyboardEvent): boolean {
 /** Check if event is paste (Ctrl+V) */
 export function isPaste(e: KeyboardEvent): boolean {
   return matchesKey(e, Keys.PASTE, { ctrl: true });
+}
+
+/** Check if event is duplicate (Ctrl+D) */
+export function isDuplicate(e: KeyboardEvent): boolean {
+  return matchesKey(e, Keys.DUPLICATE, { ctrl: true });
 }
 
 /** Check if event is select all (Ctrl+A) */

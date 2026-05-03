@@ -173,6 +173,10 @@ export type EditorState = {
   showAllControlPoints: boolean;
   showTransformPoints: boolean;
   showGrid: boolean;
+  // When true, boolean ops (subtract/intersect/etc.) carry per-anchor vertex colors
+  // from the source paths into the result, blending at intersection points.
+  // When false (default), the result uses a uniform fill from the surviving path.
+  blendBooleanColors: boolean;
   undoStack: Command[];
   redoStack: Command[];
   // Status bar info

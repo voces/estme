@@ -58,6 +58,14 @@ const loadShowGrid = (): boolean => {
   }
 };
 
+const loadBlendBooleanColors = (): boolean => {
+  try {
+    return localStorage.getItem("estme:blendBooleanColors") === "true";
+  } catch {
+    return false;
+  }
+};
+
 const loadTool = (): Tool => {
   try {
     const saved = localStorage.getItem("estme:tool");
@@ -195,6 +203,7 @@ const initialState: EditorState = {
   showAllControlPoints: loadShowAllControlPoints(),
   showTransformPoints: loadShowTransformPoints(),
   showGrid: loadShowGrid(),
+  blendBooleanColors: loadBlendBooleanColors(),
   undoStack: [],
   redoStack: [],
   mousePosition: null,
@@ -221,6 +230,61 @@ const listeners = new Set<() => void>();
 
 function notify() {
   listeners.forEach((l) => l());
+}
+
+function pointRefsEqual(a: PointReference, b: PointReference): boolean {
+  return a.pathId === b.pathId && a.segmentIndex === b.segmentIndex && a.handleType === b.handleType;
+}
+
+// Merge a set of new snap points into any existing connections that share a
+// point with them. Returns the updated connections array along with the
+// add/remove commands needed to record the change in the undo stack.
+// This ensures that transitively-snapped points (A↔B then B↔C) collapse into
+// a single group {A, B, C} rather than two separate connections.
+function mergeSnapPointsIntoConnections(
+  existing: SnapConnection[],
+  newPoints: PointReference[],
+): { newConnections: SnapConnection[]; commands: Command[] } {
+  const sharedConnIds = new Set<string>();
+  for (const point of newPoints) {
+    const conn = existing.find((c) => c.points.some((p) => pointRefsEqual(p, point)));
+    if (conn) sharedConnIds.add(conn.id);
+  }
+
+  if (sharedConnIds.size === 0) {
+    const added: SnapConnection = { id: crypto.randomUUID(), points: [...newPoints] };
+    return {
+      newConnections: [...existing, added],
+      commands: [{ type: "addSnapConnection", connection: added }],
+    };
+  }
+
+  // Collect unique points across all shared connections plus the new ones
+  const allPoints: PointReference[] = [];
+  for (const conn of existing) {
+    if (!sharedConnIds.has(conn.id)) continue;
+    for (const p of conn.points) {
+      if (!allPoints.some((q) => pointRefsEqual(q, p))) allPoints.push(p);
+    }
+  }
+  for (const p of newPoints) {
+    if (!allPoints.some((q) => pointRefsEqual(q, p))) allPoints.push(p);
+  }
+
+  const removed = existing.filter((c) => sharedConnIds.has(c.id));
+  const remaining = existing.filter((c) => !sharedConnIds.has(c.id));
+  const merged: SnapConnection = { id: crypto.randomUUID(), points: allPoints };
+
+  const commands: Command[] = removed.map((conn) => ({
+    type: "removeSnapConnection" as const,
+    connection: conn,
+  }));
+  commands.push({ type: "addSnapConnection", connection: merged });
+
+  return {
+    newConnections: [...remaining, merged],
+    commands,
+  };
 }
 
 // Throttled notify for live updates during drag - updates state immediately but batches React renders
@@ -355,6 +419,15 @@ export const store = {
     }
     notify();
   },
+  setBlendBooleanColors: (blendBooleanColors: boolean) => {
+    state = { ...state, blendBooleanColors };
+    try {
+      localStorage.setItem("estme:blendBooleanColors", String(blendBooleanColors));
+    } catch {
+      // Ignore localStorage errors
+    }
+    notify();
+  },
   setHoverPoint: (point: Point | null) => {
     state = { ...state, hoverPoint: point };
     notify();
@@ -481,7 +554,7 @@ export const store = {
         // First add the new path to get a complete list
         const allPaths = [...targetPaths, path];
         if (allPaths.length >= 2) {
-          const resultPaths = uniteMultiplePaths(allPaths, () => store.getNextPathName());
+          const resultPaths = uniteMultiplePaths(allPaths, () => store.getNextPathName(), state.blendBooleanColors);
           if (resultPaths.length > 0) {
             executeCommand({ type: "booleanOp", originalPaths: allPaths, resultPaths, operation: "unite" });
             return;
@@ -499,7 +572,7 @@ export const store = {
         for (const targetPath of targetPaths) {
           // Check if these paths intersect
           if (canBooleanOp([targetPath, path], pending.operation)) {
-            const resultPaths = booleanOperation(targetPath, path, pending.operation, () => store.getNextPathName());
+            const resultPaths = booleanOperation(targetPath, path, pending.operation, () => store.getNextPathName(), state.blendBooleanColors);
             if (resultPaths.length > 0) {
               commands.push({ type: "booleanOp", originalPaths: [targetPath], resultPaths, operation: pending.operation });
               anySuccess = true;
@@ -2404,15 +2477,15 @@ export const store = {
   commitMovePoint: (id: string, pointIndex: number, dx: number, dy: number, snapConnection?: { points: PointReference[] }) => {
     const moveCmd: Command = { type: "movePoint", id, pointIndex, dx, dy };
 
-    // If snapping, batch the move with the snap connection creation
+    // If snapping, batch the move with snap connection commands (merging into any
+    // pre-existing connections that share a point, so transitively-snapped points
+    // end up in a single group).
     if (snapConnection) {
-      const connId = crypto.randomUUID();
-      const snapCmd: Command = { type: "addSnapConnection", connection: { id: connId, points: snapConnection.points } };
-      // Apply the snap connection to state (the move is already applied via live updates)
+      const merge = mergeSnapPointsIntoConnections(state.snapConnections, snapConnection.points);
       state = {
         ...state,
-        snapConnections: [...state.snapConnections, { id: connId, points: snapConnection.points }],
-        undoStack: [...state.undoStack, { type: "batch", commands: [moveCmd, snapCmd] }],
+        snapConnections: merge.newConnections,
+        undoStack: [...state.undoStack, { type: "batch", commands: [moveCmd, ...merge.commands] }],
         redoStack: [],
         isDirty: true,
       };
@@ -2714,15 +2787,15 @@ export const store = {
   commitMoveHandle: (id: string, segmentIndex: number, handleType: HandleType, dx: number, dy: number, snapConnection?: { points: PointReference[] }, mirrorMove?: { segmentIndex: number; handleType: HandleType; dx: number; dy: number }) => {
     const moveCmd: Command = { type: "moveHandle", id, segmentIndex, handleType, dx, dy, mirrorMove };
 
-    // If snapping, batch the move with the snap connection creation
+    // If snapping, batch the move with snap connection commands (merging into any
+    // pre-existing connections that share a point, so transitively-snapped points
+    // end up in a single group).
     if (snapConnection) {
-      const connId = crypto.randomUUID();
-      const snapCmd: Command = { type: "addSnapConnection", connection: { id: connId, points: snapConnection.points } };
-      // Apply the snap connection to state (the move is already applied via live updates)
+      const merge = mergeSnapPointsIntoConnections(state.snapConnections, snapConnection.points);
       state = {
         ...state,
-        snapConnections: [...state.snapConnections, { id: connId, points: snapConnection.points }],
-        undoStack: [...state.undoStack, { type: "batch", commands: [moveCmd, snapCmd] }],
+        snapConnections: merge.newConnections,
+        undoStack: [...state.undoStack, { type: "batch", commands: [moveCmd, ...merge.commands] }],
         redoStack: [],
         isDirty: true,
       };
@@ -4732,7 +4805,7 @@ export const store = {
 
     // If we have 2+ paths that intersect, do immediate unite
     if (selectedPaths.length >= 2 && canBooleanOp(selectedPaths, "unite")) {
-      const resultPaths = uniteMultiplePaths(selectedPaths, () => store.getNextPathName());
+      const resultPaths = uniteMultiplePaths(selectedPaths, () => store.getNextPathName(), state.blendBooleanColors);
       if (resultPaths.length > 0) {
         executeCommand({ type: "booleanOp", originalPaths: selectedPaths, resultPaths, operation: "unite" });
         return;
@@ -4750,7 +4823,7 @@ export const store = {
 
     // If we have exactly 2 paths that intersect, do immediate intersect
     if (selectedPaths.length === 2 && canBooleanOp(selectedPaths, "intersect")) {
-      const resultPaths = booleanOperation(selectedPaths[0], selectedPaths[1], "intersect", () => store.getNextPathName());
+      const resultPaths = booleanOperation(selectedPaths[0], selectedPaths[1], "intersect", () => store.getNextPathName(), state.blendBooleanColors);
       if (resultPaths.length > 0) {
         // Batch the boolean op with snap connections for proper undo/redo
         const commands: Command[] = [
@@ -4777,7 +4850,7 @@ export const store = {
 
     // If we have exactly 2 paths that intersect, do immediate subtract
     if (selectedPaths.length === 2 && canBooleanOp(selectedPaths, "subtract")) {
-      const resultPaths = booleanOperation(selectedPaths[0], selectedPaths[1], "subtract", () => store.getNextPathName());
+      const resultPaths = booleanOperation(selectedPaths[0], selectedPaths[1], "subtract", () => store.getNextPathName(), state.blendBooleanColors);
       if (resultPaths.length > 0) {
         executeCommand({ type: "booleanOp", originalPaths: selectedPaths, resultPaths, operation: "subtract" });
         return;
@@ -4794,7 +4867,7 @@ export const store = {
 
     // If we have exactly 2 paths that intersect, do immediate exclude
     if (selectedPaths.length === 2 && canBooleanOp(selectedPaths, "exclude")) {
-      const resultPaths = booleanOperation(selectedPaths[0], selectedPaths[1], "exclude", () => store.getNextPathName());
+      const resultPaths = booleanOperation(selectedPaths[0], selectedPaths[1], "exclude", () => store.getNextPathName(), state.blendBooleanColors);
       if (resultPaths.length > 0) {
         // Batch the boolean op with snap connections for proper undo/redo
         const commands: Command[] = [

@@ -12,6 +12,7 @@ import {
   isCopy,
   isCut,
   isPaste,
+  isDuplicate,
   isEscape,
   isDelete,
   isSelectAll,
@@ -165,6 +166,20 @@ function screenToWorld(
       (camera.top + camera.bottom) / 2,
   };
 }
+
+// Convert a screen-space pixel distance to world units at the current zoom.
+function pixelsToWorld(
+  px: number,
+  camera: THREE.OrthographicCamera,
+  container: HTMLElement,
+): number {
+  const rect = container.getBoundingClientRect();
+  if (rect.width === 0) return px;
+  return (px * (camera.right - camera.left)) / rect.width;
+}
+
+// On-screen pull radius for shift-snap, in CSS pixels.
+const SNAP_PIXEL_RADIUS = 12;
 
 // Snap point with identity info
 type SnapPoint = {
@@ -3451,7 +3466,8 @@ export const Canvas = () => {
             dragHandleType,
             showAllControlPoints
           );
-          const snapped = findNearestSnapPoint(targetPos, snapPointsWithInfo);
+          const snapThreshold = pixelsToWorld(SNAP_PIXEL_RADIUS, state.camera, container);
+          const snapped = findNearestSnapPoint(targetPos, snapPointsWithInfo, snapThreshold);
           if (snapped) {
             // Snap to the nearest point
             newTotalDx = snapped.point.x - dragHandleOriginalPos.x;
@@ -3497,7 +3513,8 @@ export const Canvas = () => {
           };
           // Get snap points from current state with identity info
           const snapPointsWithInfo = getSnapPointsForAnchorWithInfo(currentPaths, dragPathId, dragPointIndex);
-          const snapped = findNearestSnapPoint(targetPos, snapPointsWithInfo);
+          const snapThreshold = pixelsToWorld(SNAP_PIXEL_RADIUS, state.camera, container);
+          const snapped = findNearestSnapPoint(targetPos, snapPointsWithInfo, snapThreshold);
           if (snapped) {
             // Snap to the nearest point
             newTotalDx = snapped.point.x - dragPointOriginalPos.x;
@@ -4512,6 +4529,18 @@ export const Canvas = () => {
         if (!currentPath) {
           e.preventDefault();
           store.pasteFromClipboard();
+        }
+      }
+      // Ctrl+D / Cmd+D for duplicate (copy + paste in one shot)
+      if (isDuplicate(e)) {
+        const { currentPath, selection } = store.getState();
+        const hasSelection = selection.pathIds.length > 0 || selection.points.length > 0;
+        if (!currentPath && hasSelection) {
+          e.preventDefault();
+          (async () => {
+            await store.copyToClipboard();
+            await store.pasteFromClipboard();
+          })();
         }
       }
       // Ctrl+A / Cmd+A for select all

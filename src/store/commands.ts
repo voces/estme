@@ -933,9 +933,12 @@ export function applyCommand(
     }
     case "booleanOp": {
       if (isUndo) {
-        // Remove result paths and restore original paths
+        // Remove result paths and restore original paths at the position of the first result path
         const resultIds = new Set(cmd.resultPaths.map((p) => p.id));
-        const newPaths = state.paths.filter((p) => !resultIds.has(p.id)).concat(cmd.originalPaths);
+        const insertAt = state.paths.findIndex((p) => resultIds.has(p.id));
+        const filtered = state.paths.filter((p) => !resultIds.has(p.id));
+        const idx = insertAt < 0 ? filtered.length : insertAt;
+        const newPaths = [...filtered.slice(0, idx), ...cmd.originalPaths, ...filtered.slice(idx)];
         return {
           ...state,
           paths: newPaths,
@@ -943,9 +946,13 @@ export function applyCommand(
           selection: { pathIds: cmd.originalPaths.map((p) => p.id), points: [] },
         };
       } else {
-        // Remove original paths and add result paths
+        // Remove original paths and insert result paths at the position of the first original
+        // so they keep their place in the hierarchy instead of jumping to the top.
         const originalIds = new Set(cmd.originalPaths.map((p) => p.id));
-        const newPaths = state.paths.filter((p) => !originalIds.has(p.id)).concat(cmd.resultPaths);
+        const insertAt = state.paths.findIndex((p) => originalIds.has(p.id));
+        const filtered = state.paths.filter((p) => !originalIds.has(p.id));
+        const idx = insertAt < 0 ? filtered.length : insertAt;
+        const newPaths = [...filtered.slice(0, idx), ...cmd.resultPaths, ...filtered.slice(idx)];
         return {
           ...state,
           paths: newPaths,

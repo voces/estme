@@ -85,6 +85,7 @@ export const MenuBar = () => {
   const documentId = useStore((s) => s.documentId);
   const isDirty = useStore((s) => s.isDirty);
   const isLoadingDocument = useStore((s) => s.isLoadingDocument);
+  const blendBooleanColors = useStore((s) => s.blendBooleanColors);
 
   // Load the current document on initial mount
   useEffect(() => {
@@ -722,6 +723,26 @@ export const MenuBar = () => {
                 onClick={() => { store.flipSelectionVertical(); setOpenMenu(null); }}
               >
                 <span>Flip Vertical</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div
+          className={`${styles.menuItem} ${openMenu === "settings" ? styles.open : ""}`}
+          onClick={() => toggleMenu("settings")}
+        >
+          Settings
+          {openMenu === "settings" && (
+            <div className={styles.dropdown}>
+              <div
+                className={styles.dropdownItem}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  store.setBlendBooleanColors(!blendBooleanColors);
+                }}
+              >
+                <span>{blendBooleanColors ? "✓ " : "  "}Blend Vertex Colors on Boolean Ops</span>
               </div>
             </div>
           )}

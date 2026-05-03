@@ -295,6 +295,141 @@ function isValidPath(paperPath: paper.Path): boolean {
   return true;
 }
 
+// Find the closest pair of anchors between an outer ring and a hole
+function findClosestAnchorPair(
+  outer: Path,
+  hole: Path
+): { outerIdx: number; holeIdx: number } {
+  let bestDist = Infinity;
+  let bestOuter = 0;
+  let bestHole = 0;
+  for (let i = 0; i < outer.segments.length; i++) {
+    const op = outer.segments[i].p0;
+    for (let j = 0; j < hole.segments.length; j++) {
+      const hp = hole.segments[j].p0;
+      const dx = op.x - hp.x;
+      const dy = op.y - hp.y;
+      const d = dx * dx + dy * dy;
+      if (d < bestDist) {
+        bestDist = d;
+        bestOuter = i;
+        bestHole = j;
+      }
+    }
+  }
+  return { outerIdx: bestOuter, holeIdx: bestHole };
+}
+
+// Splice a hole into an outer Path via a zero-gap "keyhole" bridge.
+// We pick the closest pair of anchors, then insert a straight bridge segment
+// from outer to hole, the hole's segments (kept in original winding so the
+// hole carves out area), and a return bridge back to the outer anchor.
+// The two bridge edges are coincident, so the result is a single closed
+// non-self-intersecting polygon that tessellates as a donut.
+function bridgeHoleIntoOuter(outer: Path, hole: Path): Path {
+  if (hole.segments.length === 0) return outer;
+
+  const segments = [...outer.segments];
+  const anchorMeta = [...outer.anchorMeta];
+
+  const { outerIdx, holeIdx } = findClosestAnchorPair(outer, hole);
+  const outerAnchor = segments[outerIdx].p0;
+  const holeAnchor = hole.segments[holeIdx].p0;
+
+  // Rotate hole arrays so they start at holeIdx
+  const rotatedHoleSegs = [
+    ...hole.segments.slice(holeIdx),
+    ...hole.segments.slice(0, holeIdx),
+  ];
+  const rotatedHoleMeta = [
+    ...hole.anchorMeta.slice(holeIdx),
+    ...hole.anchorMeta.slice(0, holeIdx),
+  ];
+
+  // Straight-line bridge segments (handles collapsed onto endpoints)
+  const bridgeIn: CubicSegment = {
+    p0: { ...outerAnchor },
+    c0: { ...outerAnchor },
+    c1: { ...holeAnchor },
+    p1: { ...holeAnchor },
+  };
+  const bridgeOut: CubicSegment = {
+    p0: { ...holeAnchor },
+    c0: { ...holeAnchor },
+    c1: { ...outerAnchor },
+    p1: { ...outerAnchor },
+  };
+
+  const bridgeInMeta: AnchorMeta = { ...anchorMeta[outerIdx] };
+  const bridgeOutMeta: AnchorMeta = { ...rotatedHoleMeta[0] };
+
+  // Insert: ... outer[outerIdx-1], bridgeIn, rotatedHole..., bridgeOut, outer[outerIdx], ...
+  segments.splice(outerIdx, 0, bridgeIn, ...rotatedHoleSegs, bridgeOut);
+  anchorMeta.splice(outerIdx, 0, bridgeInMeta, ...rotatedHoleMeta, bridgeOutMeta);
+
+  return { ...outer, segments, anchorMeta };
+}
+
+// Convert a Paper.js result to our Path format, bridging any holes (negative-area
+// children) into their containing outer ring as keyhole-style donuts. Use this
+// for subtract-style operations where a fully-enclosed cutter would otherwise
+// be dropped by the standard hole-filtering conversion.
+function fromPaperItemBridged(
+  item: paper.PathItem,
+  fill: string,
+  opacity: number,
+  nameGenerator: () => string,
+  originalVertices?: OriginalVertex[],
+  sourcePaths?: Path[],
+  defaultMirrorAngle: boolean = false
+): Path[] {
+  if (!(item instanceof paper.CompoundPath)) {
+    return fromPaperItem(item, fill, opacity, nameGenerator, false, originalVertices, sourcePaths, defaultMirrorAngle);
+  }
+
+  const outers: paper.Path[] = [];
+  const holes: paper.Path[] = [];
+  for (const child of item.children) {
+    if (!(child instanceof paper.Path)) continue;
+    if (!isValidPath(child)) continue;
+    if (child.area > 0) outers.push(child);
+    else holes.push(child);
+  }
+
+  if (holes.length === 0) {
+    return fromPaperItem(item, fill, opacity, nameGenerator, false, originalVertices, sourcePaths, defaultMirrorAngle);
+  }
+
+  // Group each hole with its containing outer (point-in-shape test in paper.js space)
+  const outerToHoles = new Map<paper.Path, paper.Path[]>();
+  for (const o of outers) outerToHoles.set(o, []);
+  for (const hole of holes) {
+    const testPoint = hole.firstSegment.point;
+    for (const o of outers) {
+      if (o.contains(testPoint)) {
+        outerToHoles.get(o)!.push(hole);
+        break;
+      }
+    }
+  }
+
+  const result: Path[] = [];
+  for (const o of outers) {
+    const oholes = outerToHoles.get(o)!;
+    const outerPath = fromPaperPath(o, fill, opacity, nameGenerator(), originalVertices, sourcePaths, defaultMirrorAngle);
+    let bridged = outerPath;
+    // Keep each hole in its native (reversed) winding so the bridged path
+    // carves the hole out via opposite winding around the keyhole.
+    for (const h of oholes) {
+      const holePath = fromPaperPath(h, fill, opacity, nameGenerator(), originalVertices, sourcePaths, defaultMirrorAngle);
+      bridged = bridgeHoleIntoOuter(bridged, holePath);
+    }
+    result.push(bridged);
+  }
+
+  return result;
+}
+
 // Convert a Paper.js CompoundPath or Path to our Path format(s)
 // For exclude operation, we want all valid paths (including those with negative area)
 // For other operations, we filter out holes (negative area = counter-clockwise winding)
@@ -379,19 +514,24 @@ export function canBooleanOp(paths: Path[], operation: BooleanOperation): boolea
   return hasIntersection;
 }
 
-// Perform a boolean operation on two paths
+// Perform a boolean operation on two paths.
+// `blendColors`: when true, per-anchor vertex colors are carried over from the
+// source paths into the result (blending at intersection points). When false,
+// the result uses a uniform fill from path1 with no per-anchor color overrides.
 export function booleanOperation(
   path1: Path,
   path2: Path,
   operation: BooleanOperation,
-  nameGenerator: () => string
+  nameGenerator: () => string,
+  blendColors: boolean = false
 ): Path[] {
   const paper1 = toPaperPath(path1);
   const paper2 = toPaperPath(path2);
 
-  // Collect original vertices for color/metadata preservation
-  const sourcePaths = [path1, path2];
-  const originalVertices = collectOriginalVertices(sourcePaths);
+  // Only collect originals when color blending is enabled; otherwise the result
+  // gets a uniform fill (no per-anchor colors) which is the cleaner default.
+  const sourcePaths = blendColors ? [path1, path2] : undefined;
+  const originalVertices = sourcePaths ? collectOriginalVertices(sourcePaths) : undefined;
 
   let result: paper.PathItem;
 
@@ -411,9 +551,12 @@ export function booleanOperation(
   }
 
   // Use the first path's fill color and opacity
-  // For exclude, include all paths (the XOR result has multiple disjoint regions)
+  // For subtract, bridge any fully-enclosed cutter into the outer as a keyhole donut.
+  // For exclude, include all paths (the XOR result has multiple disjoint regions).
   const includeHoles = operation === "exclude";
-  const paths = fromPaperItem(result, path1.fill, path1.opacity, nameGenerator, includeHoles, originalVertices, sourcePaths);
+  const paths = operation === "subtract"
+    ? fromPaperItemBridged(result, path1.fill, path1.opacity, nameGenerator, originalVertices, sourcePaths)
+    : fromPaperItem(result, path1.fill, path1.opacity, nameGenerator, includeHoles, originalVertices, sourcePaths);
 
   // Clean up Paper.js objects
   paper1.remove();
@@ -423,8 +566,13 @@ export function booleanOperation(
   return paths;
 }
 
-// Unite multiple paths into one (or more, if result is compound)
-export function uniteMultiplePaths(inputPaths: Path[], nameGenerator: () => string): Path[] {
+// Unite multiple paths into one (or more, if result is compound).
+// See booleanOperation for the meaning of `blendColors`.
+export function uniteMultiplePaths(
+  inputPaths: Path[],
+  nameGenerator: () => string,
+  blendColors: boolean = false,
+): Path[] {
   if (inputPaths.length === 0) return [];
   if (inputPaths.length === 1) {
     // Single path - copy with preserved metadata
@@ -439,8 +587,8 @@ export function uniteMultiplePaths(inputPaths: Path[], nameGenerator: () => stri
     }];
   }
 
-  // Collect original vertices for color/metadata preservation
-  const originalVertices = collectOriginalVertices(inputPaths);
+  const sourcePaths = blendColors ? inputPaths : undefined;
+  const originalVertices = sourcePaths ? collectOriginalVertices(sourcePaths) : undefined;
 
   let result = toPaperPath(inputPaths[0]);
   const fill = inputPaths[0].fill;
@@ -454,7 +602,7 @@ export function uniteMultiplePaths(inputPaths: Path[], nameGenerator: () => stri
     result = newResult as paper.Path;
   }
 
-  const resultPaths = fromPaperItem(result, fill, opacity, nameGenerator, false, originalVertices, inputPaths);
+  const resultPaths = fromPaperItem(result, fill, opacity, nameGenerator, false, originalVertices, sourcePaths);
   result.remove();
 
   return resultPaths;
@@ -1236,8 +1384,9 @@ export function subtractBlobFromPaths(
     const subtracted = paperTarget.subtract(blob);
     paperTarget.remove();
 
-    // Pass defaultMirrorAngle: true since blob paths have smoothed handles
-    const results = fromPaperItem(subtracted, targetPath.fill, targetPath.opacity, nameGenerator, false, undefined, undefined, true);
+    // Pass defaultMirrorAngle: true since blob paths have smoothed handles.
+    // Use bridged conversion so an eraser stroke fully inside a shape carves a hole.
+    const results = fromPaperItemBridged(subtracted, targetPath.fill, targetPath.opacity, nameGenerator, undefined, undefined, true);
     subtracted.remove();
     allResults.push(...results);
   }
